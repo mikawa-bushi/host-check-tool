@@ -1,0 +1,9 @@
+[検出] systemd journal ディレクトリ「{{ evidence.path }}」のサイズが {{ "%.2f"|format(evidence.size_gb) }} GB — 警告閾値 {{ evidence.warn_gb }} GB を超過
+[根拠] dir_samples の最新サンプル ({{ evidence.latest_ts_str }}) におけるサイズ: {{ "%.2f"|format(evidence.size_gb) }} GB。設定閾値 `rules.journal_size_warn_gb` = {{ evidence.warn_gb }} GB を {{ "%.2f"|format(evidence.size_gb - evidence.warn_gb) }} GB 超過。
+[暫定対処] `sudo journalctl --vacuum-size=500M` を実行して journal サイズを即座に削減できます。または `sudo journalctl --vacuum-time=7d` で古いエントリを削除できます。
+[恒久対処] `/etc/systemd/journald.conf` に以下を追記して journal の最大サイズを制限してください:
+  [Journal]
+  SystemMaxUse=500M
+  RuntimeMaxUse=100M
+設定後 `sudo systemctl restart systemd-journald` で反映されます。
+[影響予測] journal が肥大し続けるとディスク容量を圧迫します。`/var` パーティションが満杯になるとシステム全体のログ記録が停止し、障害追跡が困難になります。

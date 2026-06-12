@@ -1,0 +1,5 @@
+[検出] 慢性メモリ圧迫を検出 — psi_mem_max が {{ evidence.psi_threshold }} を超えた日が {{ evidence.n_pressure_days }} / {{ evidence.n_total_days }} 日 ({{ (evidence.recurrence_fraction * 100) | round(0) | int }}%) で反復しており、観測期間内の swap_out 総量は {{ (evidence.swap_out_total_bytes // 1024 // 1024) }} MB です (ピーク psi_mem_max={{ evidence.peak_psi_mem_max }})
+[根拠] sys_rollup_1m の psi_mem_max 系列を日単位でグループ化し、detect_recurrence で反復率を算出: {{ evidence.recurrence_fraction }} ({{ evidence.n_pressure_days }} / {{ evidence.n_total_days }} 日)。swap_out_sum 合計 {{ evidence.swap_out_total_bytes }} バイト > 0。psi_mem_max 超過イベント数: {{ evidence.pressure_event_count }} 件。
+[暫定対処] `free -h` でメモリ使用量を確認してください。消費量の大きいプロセスを特定し、不要なサービスを停止または再起動して一時的にメモリを解放してください。`vmstat 1 10` で si/so 列を観察すると swap 活動の継続状況を確認できます。
+[恒久対処] (1) `ps -eo pid,comm,rss --sort=-rss | head -20` で常時高 RSS なプロセスを特定しメモリリークがないか確認してください。(2) ワークロードに対してメモリが不足している場合はメモリ増設を検討してください。(3) `/proc/sys/vm/swappiness` を下げることでスワップへの転出を遅らせられますが、根本的には物理メモリの確保が必要です。
+[影響予測] 慢性的なメモリ圧迫が継続すると、ページフォルトによる応答遅延が常態化します。圧力が高まると OOM Killer が起動し、重要なプロセスが強制終了されるリスクがあります。`sar -B 1 10` で pgscank/pgsteal の値を定期的に監視してください。

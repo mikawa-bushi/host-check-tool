@@ -1,0 +1,5 @@
+[検出] CPU 飽和 (PSI) を検出 — psi_cpu_some10 が {{ evidence.psi_threshold }}% 超の状態が {{ evidence.duration_minutes }}分間継続 (ピーク {{ evidence.peak_psi_cpu_some10 }}%){% if evidence.top_processes %}。上位プロセス: {{ evidence.top_processes | join(", ") }}{% endif %}
+[根拠] sys_samples の psi_cpu_some10 系列を1分バケツに集計し、{{ evidence.psi_threshold }}% 超が連続 {{ evidence.duration_minutes }}分継続。spike_events から集計した上位プロセス: {% if evidence.top_processes %}{{ evidence.top_processes | join("、") }}{% else %}(該当スパイクイベントなし){% endif %}。スパイクイベント数: {{ evidence.spike_event_count }} 件。
+[暫定対処] `top -b -n 1 | head -20` または `ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -20` で CPU 消費プロセスを特定してください。`cat /proc/pressure/cpu` で現在の PSI 値を確認できます。高負荷プロセスが特定できた場合は `nice -n 10 <command>` または `renice +10 -p <PID>` で優先度を下げることを検討してください。
+[恒久対処] (1) CPU バウンドな処理は並列化・分散化を検討してください。(2) `systemctl list-timers` でバッチジョブが重なっていないか確認し、スケジュールを分散させてください。(3) ワークロードがシステムのコア数を常に上回っている場合はスケールアウト (ホスト追加) またはスケールアップ (CPU 増強) が必要です。(4) `sar -u ALL 1 60` で長期傾向を把握してください。
+[影響予測] psi_cpu_some10 が高い状態ではタスクの実行待ちが積み上がり、応答レイテンシが増大します。飽和が継続すると CPU バウンドのサービスが SLA を満たせなくなります。スパイクがさらに長時間化すると他の問題 (タイムアウト、デッドロック) を誘発する可能性があります。

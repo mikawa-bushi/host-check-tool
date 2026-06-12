@@ -1,0 +1,5 @@
+[検出] マウントポイント「{{ evidence.mountpoint }}」のディスクが約 {{ "%.1f"|format(evidence.days_left) }}日後に満杯になる予測 (現在使用量 {{ evidence.used_gb|round(1) }} GB / 合計 {{ evidence.total_gb|round(1) }} GB)
+[根拠] disk_samples の used 系列に対する線形外挿: 1日あたり {{ "%.0f"|format(evidence.daily_growth_bytes / 1024 / 1024) }} MB ({{ "%.2f"|format(evidence.daily_growth_bytes / 1024 / 1024 / 1024) }} GB/日) の増加。残り容量 {{ "%.1f"|format((evidence.total_bytes - evidence.used_bytes) / 1024 / 1024 / 1024) }} GB。
+[暫定対処] `du -sh {{ evidence.mountpoint }}/*` で肥大しているディレクトリを確認してください。不要なログ・一時ファイルを削除することで時間を稼げます。`sudo journalctl --vacuum-size=500M` も有効です。
+[恒久対処] ディスク増加の根本原因を特定して対処してください: (1) ログローテーションの設定確認 (`/etc/logrotate.conf`)、(2) アプリケーションの一時ファイル蓄積の解消、(3) パーティション拡張またはストレージ追加の検討。
+[影響予測] 残り {{ "%.1f"|format(evidence.days_left) }}日以内に書き込みエラーが発生し始め、データベース破損・サービス停止・ログ欠落が起こる可能性があります。{% if evidence.days_left < 7 %} 緊急対応が必要です。{% endif %}

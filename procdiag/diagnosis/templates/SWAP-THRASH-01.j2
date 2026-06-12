@@ -1,0 +1,5 @@
+[検出] スワップスラッシングを検出 — swap_in と swap_out が {{ evidence.thrash_event_count }} サンプルで同時発生し、psi_mem_full10 最大 {{ evidence.peak_psi_mem_full10 }}% ({{ evidence.duration_minutes }}分間)。ページの双方向入れ替えによりシステムが著しく低速化しています
+[根拠] sys_samples の swap_in > 0 かつ swap_out > 0 かつ psi_mem_full10 > 0 が同一サンプルで同時発生: {{ evidence.thrash_event_count }} 件。swap_in 累計 {{ evidence.swap_in_total_pages }} ページ、swap_out 累計 {{ evidence.swap_out_total_pages }} ページ。期間: {{ evidence.duration_minutes }}分間。
+[暫定対処] 即座に `free -h` でメモリ残量を確認してください。`ps -eo pid,comm,rss --sort=-rss | head -10` で最大消費プロセスを特定し、不要なものを停止してください。緊急の場合は `sudo sync && sudo sysctl vm.drop_caches=3` でページキャッシュを解放できますが、一時的な措置です。
+[恒久対処] スラッシングは物理メモリが根本的に不足しているサインです。(1) メモリ増設が最も確実な解決策です。(2) 大量メモリを消費するプロセスの設定を見直してください (例: JVM の -Xmx、データベースのバッファプールサイズ)。(3) `vmstat 1` で si/so 列を長期モニタリングして発生パターンを把握してください。
+[影響予測] スラッシング中はシステム全体のスループットが数十〜数百分の1に低下します。psi_mem_full10 が高い状態では全タスクが I/O 待ちになり、最終的に OOM Killer が起動してプロセスが強制終了されます。現在の状況は緊急対応が必要なレベルです。

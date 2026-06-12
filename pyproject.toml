@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "host-check-tool"
+version = "0.1.0"
+description = "Local-first Linux host resource diagnosis (procdiag): record CPU/memory/disk over time, then explain what to fix."
+license = "MIT"
+packages = [{ include = "procdiag" }]
+include = [
+    "procdiag/diagnosis/templates/*",
+    "procdiag/report/templates/*",
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+psutil = "^7.0"
+pydantic = "^2.7"
+jinja2 = "^3.1"
+click = "^8.1"
+
+[tool.poetry.scripts]
+procdiag = "procdiag.cli:main"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+black = "^24.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_proc: 実マシンの /proc に対して実行するスモークテスト",
+    "e2e: record→check→report を通しで実行する統合テスト",
+]

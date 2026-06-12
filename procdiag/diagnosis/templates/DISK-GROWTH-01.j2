@@ -1,0 +1,5 @@
+[検出] ディレクトリ「{{ evidence.path }}」のサイズが急増 — 日次増分 {{ "%.0f"|format(evidence.daily_growth_mb) }} MB/日 (閾値 {{ evidence.threshold_mb }} MB/日){% if evidence.mountpoint %} (マウントポイント: {{ evidence.mountpoint }}){% endif %}
+[根拠] dir_samples の観測期間 {{ evidence.observation_days }} 日間における増分: 開始 {{ "%.1f"|format(evidence.start_gb) }} GB → 終了 {{ "%.1f"|format(evidence.end_gb) }} GB。日次増分 {{ "%.0f"|format(evidence.daily_growth_mb) }} MB/日は閾値 {{ evidence.threshold_mb }} MB/日を超過。
+[暫定対処] `du -sh {{ evidence.path }}/*` でサブディレクトリごとのサイズを確認し、肥大しているファイルを特定してください。不要なファイルを削除または圧縮してください。
+[恒久対処] (1) ログローテーション設定 (`/etc/logrotate.d/`) を見直して保持日数を調整。(2) アプリケーションの出力先を別パーティションに変更してルートディスクを保護。(3) 定期クリーンアップジョブ (cron) を設定。(4) 継続増加が見込まれる場合はストレージ拡張を計画してください。
+[影響予測] このまま増加が続くと{% if evidence.mountpoint %}マウントポイント {{ evidence.mountpoint }} の{% endif %}ディスク容量が枯渇し、サービス停止・ログ欠落・データ破損が発生する可能性があります。

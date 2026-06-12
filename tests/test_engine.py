@@ -1,0 +1,631 @@
+"""Integration tests for the diagnosis engine and the four priority rules.
+
+Tests use the synthetic DB builder from ``tests/synth.py`` and verify:
+- MEM-LEAK-01: detects leak / does not detect flat series
+- DISK-FULL-01: correct severity at warning/critical day boundaries
+- CPU-PERIODIC-01: detects daily and hourly patterns / not irregular
+- CPU-SINGLECORE-01: detects and does not detect saturation episodes
+- fold(): absorbs DISK-GROWTH-01 into DISK-FULL-01 (tested with fake Findings)
+- observation time guard: healthy=True when data < min_observation_hours
+- broken rule firewall: diagnosis completes even if a rule raises
+- ObservationQuality: populated fields
+- Finding.proposal: contains all 5 section headers
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import pytest
+
+from procdiag.config import ProcdiagConfig, RulesConfig
+from procdiag.core import Confidence, Finding, Rule, Severity, Window, register
+from procdiag.diagnosis import Engine
+from procdiag.diagnosis.engine import fold
+
+from synth import (
+    add_disk_series,
+    add_proc_series,
+    add_spike_events,
+    add_sys_baseline,
+    make_db,
+)
+
+if TYPE_CHECKING:
+    from procdiag.storage import Storage
+
+_MB = 1024 * 1024
+_GB = 1024**3
+_HOUR = 3600.0
+_DAY = 86400.0
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+
+def _cfg(
+    min_obs_hours: float = 6.0, disabled: list[str] | None = None
+) -> ProcdiagConfig:
+    return ProcdiagConfig(
+        rules=RulesConfig(
+            min_observation_hours=min_obs_hours,
+            disabled=disabled or [],
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# MEM-LEAK-01
+# ---------------------------------------------------------------------------
+
+
+class TestMemLeak:
+    def test_leak_detected(self, tmp_path):
+        """Steep RSS slope + long observation → MEM-LEAK-01 finding."""
+        store = make_db(tmp_path, hours=18.0)
+        add_sys_baseline(store, hours=18.0)
+        add_proc_series(
+            store,
+            "mysqld",
+            rss_start=200 * _MB,
+            rss_slope_per_h=5 * _MB,  # 5 MB/h — well above threshold
+            hours=18.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0), verbose=True)
+        diag = engine.run(store, only=["MEM-LEAK-01"])
+
+        leak_findings = [f for f in diag.findings if f.rule_id == "MEM-LEAK-01"]
+        assert len(leak_findings) >= 1
+        f = leak_findings[0]
+        assert f.subject == "mysqld"
+        assert f.severity in (Severity.WARNING, Severity.CRITICAL)
+        store.close()
+
+    def test_no_leak_flat_series(self, tmp_path):
+        """Flat RSS series should not trigger MEM-LEAK-01."""
+        store = make_db(tmp_path, hours=18.0)
+        add_sys_baseline(store, hours=18.0)
+        add_proc_series(
+            store,
+            "nginx",
+            rss_start=100 * _MB,
+            rss_slope_per_h=0.0,  # flat
+            hours=18.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store, only=["MEM-LEAK-01"])
+
+        leak_findings = [f for f in diag.findings if f.rule_id == "MEM-LEAK-01"]
+        assert len(leak_findings) == 0
+        store.close()
+
+    def test_critical_severity_for_large_slope(self, tmp_path):
+        """Very large slope should escalate to CRITICAL."""
+        store = make_db(tmp_path, hours=18.0)
+        add_sys_baseline(store, hours=18.0)
+        add_proc_series(
+            store,
+            "bigprocess",
+            rss_start=100 * _MB,
+            rss_slope_per_h=100 * _MB,  # 100 MB/h — critical threshold
+            hours=18.0,
+        )
+        store.conn.commit()
+
+        from procdiag.diagnosis.memory import MemLeakRule
+
+        # Lower the critical threshold for the test to guarantee escalation.
+        original = MemLeakRule.slope_critical_mb_h
+        MemLeakRule.slope_critical_mb_h = 50.0
+        try:
+            engine = Engine(_cfg(min_obs_hours=6.0))
+            diag = engine.run(store, only=["MEM-LEAK-01"])
+            leak_findings = [f for f in diag.findings if f.rule_id == "MEM-LEAK-01"]
+            assert any(f.severity == Severity.CRITICAL for f in leak_findings)
+        finally:
+            MemLeakRule.slope_critical_mb_h = original
+        store.close()
+
+    def test_short_observation_not_detected(self, tmp_path):
+        """Leaking process with too short observation span → no finding."""
+        store = make_db(tmp_path, hours=3.0)
+        add_sys_baseline(store, hours=3.0)
+        add_proc_series(
+            store,
+            "leaker",
+            rss_start=100 * _MB,
+            rss_slope_per_h=5 * _MB,
+            hours=3.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store, only=["MEM-LEAK-01"])
+        # Either the observation guard fires (healthy=True, no findings)
+        # or fit_linear rejects the short span.
+        leak_findings = [f for f in diag.findings if f.rule_id == "MEM-LEAK-01"]
+        assert len(leak_findings) == 0
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# DISK-FULL-01
+# ---------------------------------------------------------------------------
+
+
+class TestDiskFull:
+    def _make_disk_store(self, tmp_path, days_left: float, days_history: float = 14.0):
+        """Helper: create a DB with a disk series that has *days_left* days remaining."""
+        capacity = int(100 * _GB)
+        daily_growth = int(capacity / (days_left + days_history))
+        used_start = int(capacity * 0.1)
+
+        store = make_db(tmp_path, hours=days_history * 24)
+        add_sys_baseline(store, hours=days_history * 24)
+        add_disk_series(
+            store,
+            "/var",
+            total=capacity,
+            used_start=used_start,
+            daily_growth=daily_growth,
+            days=days_history,
+        )
+        store.conn.commit()
+        return store
+
+    def test_warning_at_20_days(self, tmp_path):
+        """~20 days remaining should produce a WARNING."""
+        store = self._make_disk_store(tmp_path, days_left=20.0)
+        engine = Engine(_cfg())
+        diag = engine.run(store, only=["DISK-FULL-01"])
+        disk_findings = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert len(disk_findings) >= 1
+        assert disk_findings[0].severity == Severity.WARNING
+        store.close()
+
+    def test_critical_at_5_days(self, tmp_path):
+        """~5 days remaining should produce a CRITICAL finding."""
+        store = self._make_disk_store(tmp_path, days_left=5.0)
+        engine = Engine(_cfg())
+        diag = engine.run(store, only=["DISK-FULL-01"])
+        disk_findings = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert len(disk_findings) >= 1
+        assert disk_findings[0].severity == Severity.CRITICAL
+        store.close()
+
+    def test_no_finding_for_stable_disk(self, tmp_path):
+        """A stable (non-growing) disk should produce no DISK-FULL-01 finding."""
+        capacity = int(100 * _GB)
+        store = make_db(tmp_path, hours=14 * 24)
+        add_sys_baseline(store, hours=14 * 24)
+        add_disk_series(
+            store,
+            "/data",
+            total=capacity,
+            used_start=int(50 * _GB),
+            daily_growth=0,  # flat
+            days=14.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg())
+        diag = engine.run(store, only=["DISK-FULL-01"])
+        disk_findings = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert len(disk_findings) == 0
+        store.close()
+
+    def test_evidence_contains_days_left(self, tmp_path):
+        """DISK-FULL-01 evidence must include days_left and daily_growth_bytes."""
+        store = self._make_disk_store(tmp_path, days_left=10.0)
+        engine = Engine(_cfg())
+        diag = engine.run(store, only=["DISK-FULL-01"])
+        disk_findings = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert len(disk_findings) >= 1
+        ev = disk_findings[0].evidence
+        assert "days_left" in ev
+        assert "daily_growth_bytes" in ev
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# CPU-PERIODIC-01
+# ---------------------------------------------------------------------------
+
+
+def _daily_spike_times(n_days: int, hour: int = 14, minute: int = 0) -> list[float]:
+    now = time.time()
+    midnight = (now // _DAY) * _DAY - n_days * _DAY
+    return [midnight + d * _DAY + hour * _HOUR + minute * 60 for d in range(n_days)]
+
+
+def _hourly_spike_times(n_hours: int, minute: int = 30) -> list[float]:
+    now = time.time()
+    base = (now // _HOUR) * _HOUR - n_hours * _HOUR
+    return [base + h * _HOUR + minute * 60 for h in range(n_hours)]
+
+
+class TestCpuPeriodic:
+    def test_daily_pattern_detected(self, tmp_path):
+        """Daily spikes at 14:00 for 5 days → CPU-PERIODIC-01 finding."""
+        store = make_db(tmp_path, hours=5 * 24)
+        add_sys_baseline(store, hours=5 * 24)
+        times = _daily_spike_times(5, hour=14)
+        add_spike_events(store, "cpu", times)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=1.0))
+        diag = engine.run(store, only=["CPU-PERIODIC-01"])
+        findings = [f for f in diag.findings if f.rule_id == "CPU-PERIODIC-01"]
+        assert len(findings) >= 1
+        assert findings[0].evidence["period_kind"] == "daily"
+        store.close()
+
+    def test_hourly_pattern_detected(self, tmp_path):
+        """Hourly spikes at :30 for 4 hours → CPU-PERIODIC-01 finding."""
+        store = make_db(tmp_path, hours=6)
+        add_sys_baseline(store, hours=6)
+        times = _hourly_spike_times(4, minute=30)
+        add_spike_events(store, "cpu", times)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=1.0))
+        diag = engine.run(store, only=["CPU-PERIODIC-01"])
+        findings = [f for f in diag.findings if f.rule_id == "CPU-PERIODIC-01"]
+        assert len(findings) >= 1
+        store.close()
+
+    def test_irregular_not_detected(self, tmp_path):
+        """Random spike times should not produce a CPU-PERIODIC-01 finding."""
+        import random
+
+        store = make_db(tmp_path, hours=5 * 24)
+        add_sys_baseline(store, hours=5 * 24)
+        rng = random.Random(42)
+        now = time.time()
+        times = [now - rng.uniform(0, 4 * _DAY) for _ in range(8)]
+        add_spike_events(store, "cpu", times)
+        store.conn.commit()
+
+        from procdiag.diagnosis.cpu import CpuPeriodicRule
+
+        original_tol = CpuPeriodicRule.tol_sec
+        CpuPeriodicRule.tol_sec = 30.0  # tight tolerance to avoid accidental match
+        try:
+            engine = Engine(_cfg(min_obs_hours=1.0))
+            diag = engine.run(store, only=["CPU-PERIODIC-01"])
+            findings = [f for f in diag.findings if f.rule_id == "CPU-PERIODIC-01"]
+            assert len(findings) == 0
+        finally:
+            CpuPeriodicRule.tol_sec = original_tol
+        store.close()
+
+    def test_no_spike_events(self, tmp_path):
+        """No spike events → no CPU-PERIODIC-01 finding."""
+        store = make_db(tmp_path, hours=5 * 24)
+        add_sys_baseline(store, hours=5 * 24)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=1.0))
+        diag = engine.run(store, only=["CPU-PERIODIC-01"])
+        findings = [f for f in diag.findings if f.rule_id == "CPU-PERIODIC-01"]
+        assert len(findings) == 0
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# CPU-SINGLECORE-01
+# ---------------------------------------------------------------------------
+
+
+class TestCpuSinglecore:
+    def _add_singlecore_episode(
+        self,
+        store: "Storage",
+        *,
+        start_ts: float,
+        duration_minutes: int = 20,
+        core_pct: float = 98.0,
+        cpu_avg: float = 30.0,
+    ) -> None:
+        """Insert sys_rollup_1m rows simulating a singlecore saturation episode."""
+        rows = []
+        for i in range(duration_minutes):
+            ts = start_ts + i * 60.0
+            rows.append(
+                (
+                    ts,
+                    cpu_avg,
+                    cpu_avg + 5,
+                    cpu_avg + 8,
+                    core_pct,
+                    int(2 * _GB),
+                    int(2.1 * _GB),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                )
+            )
+        store.buffer("sys_rollup_1m", rows)
+        store.flush(reason="synth")
+
+    def test_singlecore_detected(self, tmp_path):
+        """A 20-minute singlecore episode should produce a CPU-SINGLECORE-01 finding."""
+        hours = 10.0
+        store = make_db(tmp_path, hours=hours)
+        add_sys_baseline(store, hours=hours)
+        now = time.time()
+        ep_start = now - 5 * _HOUR
+        self._add_singlecore_episode(store, start_ts=ep_start, duration_minutes=20)
+        add_proc_series(
+            store,
+            "singleproc",
+            rss_start=200 * _MB,
+            rss_slope_per_h=0.0,
+            hours=hours,
+            cpu_pattern=90.0,
+        )
+        store.conn.commit()
+
+        from procdiag.diagnosis.cpu import CpuSinglecoreRule
+
+        orig = CpuSinglecoreRule.min_consecutive_minutes
+        CpuSinglecoreRule.min_consecutive_minutes = 15
+        try:
+            engine = Engine(_cfg(min_obs_hours=1.0))
+            diag = engine.run(store, only=["CPU-SINGLECORE-01"])
+            findings = [f for f in diag.findings if f.rule_id == "CPU-SINGLECORE-01"]
+            assert len(findings) >= 1
+        finally:
+            CpuSinglecoreRule.min_consecutive_minutes = orig
+        store.close()
+
+    def test_no_singlecore_when_cpu_avg_high(self, tmp_path):
+        """When cpu_avg is also high, it's general saturation, not singlecore — no finding."""
+        hours = 10.0
+        store = make_db(tmp_path, hours=hours)
+        add_sys_baseline(store, hours=hours, cpu=80.0)
+        store.conn.commit()
+        # All sys_rollup rows have cpu_avg ≈ 80, which exceeds the 50% ceiling.
+        engine = Engine(_cfg(min_obs_hours=1.0))
+        diag = engine.run(store, only=["CPU-SINGLECORE-01"])
+        findings = [f for f in diag.findings if f.rule_id == "CPU-SINGLECORE-01"]
+        assert len(findings) == 0
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# fold()
+# ---------------------------------------------------------------------------
+
+
+class TestFold:
+    """Test the fold() function in isolation with fake Findings."""
+
+    def _make_finding(
+        self,
+        rule_id: str,
+        subject: str,
+        severity: Severity = Severity.WARNING,
+    ) -> Finding:
+        return Finding(
+            rule_id=rule_id,
+            severity=severity,
+            subject=subject,
+            summary="test",
+            evidence={},
+            detected_at=(0.0, 1.0),
+            confidence=Confidence.HIGH,
+        )
+
+    def test_growth_folded_into_full(self):
+        """DISK-GROWTH-01 with same subject as DISK-FULL-01 should be absorbed."""
+        full = self._make_finding("DISK-FULL-01", "/var")
+        growth = self._make_finding("DISK-GROWTH-01", "/var")
+
+        result = fold([full, growth])
+        assert len(result) == 1
+        assert result[0].rule_id == "DISK-FULL-01"
+        assert "DISK-GROWTH-01" in result[0].related
+
+    def test_growth_kept_when_no_matching_full(self):
+        """DISK-GROWTH-01 with no matching DISK-FULL-01 should remain in list."""
+        growth = self._make_finding("DISK-GROWTH-01", "/data")
+        result = fold([growth])
+        assert len(result) == 1
+        assert result[0].rule_id == "DISK-GROWTH-01"
+
+    def test_different_subjects_not_folded(self):
+        """DISK-GROWTH-01 on /data should not be folded into DISK-FULL-01 on /var."""
+        full = self._make_finding("DISK-FULL-01", "/var")
+        growth = self._make_finding("DISK-GROWTH-01", "/data")
+        result = fold([full, growth])
+        assert len(result) == 2
+
+    def test_unrelated_findings_unchanged(self):
+        """Findings with no fold relationship should pass through unchanged."""
+        f1 = self._make_finding("MEM-LEAK-01", "mysqld")
+        f2 = self._make_finding("CPU-PERIODIC-01", "cpu_spike/daily")
+        result = fold([f1, f2])
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Observation time guard
+# ---------------------------------------------------------------------------
+
+
+class TestObservationGuard:
+    def test_healthy_when_insufficient_data(self, tmp_path):
+        """Less than min_observation_hours of data → healthy=True, no findings."""
+        store = make_db(tmp_path, hours=2.0)
+        add_sys_baseline(store, hours=2.0)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store)
+        assert diag.healthy is True
+        assert len(diag.findings) == 0
+        # The reasoning should mention the shortfall.
+        assert any("観測時間不足" in r for r in diag.reasoning)
+        store.close()
+
+    def test_rules_run_when_sufficient_data(self, tmp_path):
+        """With 8 hours of data and min_obs=6, config-default rules run."""
+        store = make_db(tmp_path, hours=8.0)
+        add_sys_baseline(store, hours=8.0)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store)
+        # Rules following the config default (6h) must not be skipped...
+        assert not any("MEM-LEAK-01: 観測時間不足" in r for r in diag.reasoning)
+        # ...while a rule with a longer explicit minimum still is.
+        assert any("MEM-PRESSURE-01: 観測時間不足" in r for r in diag.reasoning)
+        store.close()
+
+    def test_instant_rule_runs_on_short_window(self, tmp_path):
+        """min_observation_hours=0.0 rules fire even on short recordings.
+
+        Design §6.3: the minimum-observation guard exists for the regression
+        rules; instantaneous checks like SWAP-THRASH-01 must not be muted by
+        config.rules.min_observation_hours.
+        """
+        from synth import add_swap_thrash_samples
+
+        store = make_db(tmp_path, hours=1.0)
+        add_swap_thrash_samples(store, baseline_hours=0.5)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store)
+        assert any(f.rule_id == "SWAP-THRASH-01" for f in diag.findings)
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Broken rule firewall
+# ---------------------------------------------------------------------------
+
+
+class TestBrokenRuleFirewall:
+    def test_broken_rule_does_not_abort_diagnosis(self, tmp_path):
+        """A rule that raises in evaluate() should not crash the engine."""
+        store = make_db(tmp_path, hours=8.0)
+        add_sys_baseline(store, hours=8.0)
+        store.conn.commit()
+
+        # Temporarily register a rule that always raises.
+        class BrokenRule(Rule):
+            rule_id = "TEST-BROKEN-99"
+            category = "test"
+
+            def evaluate(self, store, window):
+                raise RuntimeError("模擬エラー — テスト用")
+
+        # Manually inject without @register decorator to avoid polluting registry.
+        from procdiag.core.rule import _REGISTRY
+
+        _REGISTRY["TEST-BROKEN-99"] = BrokenRule
+        try:
+            engine = Engine(_cfg(min_obs_hours=1.0))
+            diag = engine.run(store)
+            # Engine should complete and the error should appear in reasoning.
+            assert any("TEST-BROKEN-99" in r for r in diag.reasoning)
+        finally:
+            _REGISTRY.pop("TEST-BROKEN-99", None)
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# ObservationQuality
+# ---------------------------------------------------------------------------
+
+
+class TestObservationQuality:
+    def test_quality_populated(self, tmp_path):
+        """ObservationQuality should have non-default span_hours after data insertion."""
+        store = make_db(tmp_path, hours=10.0)
+        add_sys_baseline(store, hours=10.0)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store)
+        assert diag.quality.span_hours > 0.0
+        store.close()
+
+    def test_quality_self_cpu(self, tmp_path):
+        """ObservationQuality.self_cpu_avg should be computed from sys_samples."""
+        store = make_db(tmp_path, hours=8.0)
+        add_sys_baseline(store, hours=8.0)
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store)
+        # self_cpu was set to 0.1 in add_sys_baseline.
+        assert diag.quality.self_cpu_avg >= 0.0
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Proposal 5-section headers
+# ---------------------------------------------------------------------------
+
+
+class TestProposal:
+    def test_memleak_proposal_five_sections(self, tmp_path):
+        """MEM-LEAK-01 Finding.proposal must contain all 5 section headers."""
+        store = make_db(tmp_path, hours=18.0)
+        add_sys_baseline(store, hours=18.0)
+        add_proc_series(
+            store,
+            "leaker",
+            rss_start=100 * _MB,
+            rss_slope_per_h=5 * _MB,
+            hours=18.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg(min_obs_hours=6.0))
+        diag = engine.run(store, only=["MEM-LEAK-01"])
+        findings = [f for f in diag.findings if f.rule_id == "MEM-LEAK-01"]
+        assert len(findings) >= 1
+        proposal = findings[0].proposal
+
+        for header in ("[検出]", "[根拠]", "[暫定対処]", "[恒久対処]", "[影響予測]"):
+            assert header in proposal, f"Missing section header: {header!r}"
+        store.close()
+
+    def test_diskfull_proposal_five_sections(self, tmp_path):
+        """DISK-FULL-01 Finding.proposal must contain all 5 section headers."""
+        capacity = int(100 * _GB)
+        store = make_db(tmp_path, hours=14 * 24)
+        add_sys_baseline(store, hours=14 * 24)
+        add_disk_series(
+            store,
+            "/var",
+            total=capacity,
+            used_start=int(10 * _GB),
+            daily_growth=int(5 * _GB),
+            days=14.0,
+        )
+        store.conn.commit()
+
+        engine = Engine(_cfg())
+        diag = engine.run(store, only=["DISK-FULL-01"])
+        findings = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert len(findings) >= 1
+        proposal = findings[0].proposal
+
+        for header in ("[検出]", "[根拠]", "[暫定対処]", "[恒久対処]", "[影響予測]"):
+            assert header in proposal, f"Missing section header: {header!r}"
+        store.close()

@@ -1,0 +1,5 @@
+[検出] プロセス「{{ evidence.process_name }}」でメモリリーク疑い — RSS が {{ "%.1f"|format(evidence.slope_mb_per_h) }} MB/時 の速度で増加中 (観測時間 {{ "%.1f"|format(evidence.span_hours) }}時間、R²={{ "%.3f"|format(evidence.r2) }})
+[根拠] proc_rollup_1m の rss_avg に対する線形回帰: slope={{ "%.2f"|format(evidence.slope_mb_per_h) }} MB/h、R²={{ "%.3f"|format(evidence.r2) }}、サンプル数={{ evidence.n }}、観測期間={{ "%.1f"|format(evidence.span_hours) }}時間。R²>0.9 かつ継続的な増加傾向。
+[暫定対処] sudo systemctl restart {{ evidence.process_name }} でプロセスを再起動してメモリを解放してください。または kill -TERM <PID> で安全に停止後、サービスを再開してください。
+[恒久対処] 開発チームに「rss_avg の時系列グラフ({{ "%.1f"|format(evidence.span_hours) }}時間分)」を提供し、原因コードの特定を依頼してください。{% if evidence.get('is_python') %} Python プロセスの場合: py-spy を使ってスタックトレース・メモリプロファイルを取得できます。`sudo pip install py-spy && py-spy dump --pid <PID>` を試してください。{% endif %}
+[影響予測] 現在の増加率が継続すると、{% if evidence.days_to_oom is not none %}{{ "%.1f"|format(evidence.days_to_oom) }}日後{% else %}不明な期間{% endif %}でシステムのメモリが枯渇し、OOM Killer によるプロセス強制終了またはシステム停止が発生する可能性があります。
