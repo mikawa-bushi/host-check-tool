@@ -8,6 +8,11 @@ on:
     branches:
       - '*'  # Run on all branches for PRs
 
+# The auto-format fallback job commits and pushes; the default GITHUB_TOKEN
+# is read-only on this repo, so grant write explicitly.
+permissions:
+  contents: write
+
 jobs:
   black-check:
     runs-on: ubuntu-latest
