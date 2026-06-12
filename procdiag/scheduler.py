@@ -121,6 +121,12 @@ class TierScheduler:
                     job.next_t = now + interval
                 else:
                     job.next_t += interval
+                    # Skip periods that already passed entirely: replaying
+                    # them back-to-back would record near-duplicate samples
+                    # and break differential meters (cpu_percent windows of
+                    # a few ms).  A missed tick stays missed.
+                    while job.next_t <= now:
+                        job.next_t += interval
 
                 # Execute the job — never let one failure kill the loop.
                 try:

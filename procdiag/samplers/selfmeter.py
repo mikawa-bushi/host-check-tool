@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 _WINDOW_SEC = 60.0
 # How many seconds of continuous within-budget time triggers a restore.
 _RESTORE_PATIENCE_SEC = 600.0  # 10 minutes
+# Floor below which sample() returns the cached reading instead of calling
+# cpu_percent again.  interval=None mode divides CPU time by the wall time
+# since the *previous* call, so two calls a few ms apart (collect → update,
+# or a scheduler catch-up burst) would report absurd values like 600%.
+_MIN_SAMPLE_INTERVAL_SEC = 0.2
 
 
 class SelfMeter:
@@ -69,6 +74,10 @@ class SelfMeter:
         # Prevent re-emitting the same event on consecutive ticks.
         self._throttled: bool = False
 
+        # Cache for the tiny-interval floor (see _MIN_SAMPLE_INTERVAL_SEC).
+        self._last_sample: Optional[Tuple[float, int]] = None
+        self._last_sample_mono: float = 0.0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -79,9 +88,22 @@ class SelfMeter:
         ``cpu_pct`` is the CPU usage since the previous call (psutil interval=None
         differential mode).  The first call after ``__init__`` always returns
         0.0 because ``__init__`` already primed the counter.
+
+        Calls spaced closer than ``_MIN_SAMPLE_INTERVAL_SEC`` return the cached
+        reading: with interval=None the percentage is computed over the wall
+        time since the previous call, and a near-zero window right after a busy
+        collect cycle would amplify into nonsense (hundreds of percent).
         """
+        now = time.monotonic()
+        if (
+            self._last_sample is not None
+            and now - self._last_sample_mono < _MIN_SAMPLE_INTERVAL_SEC
+        ):
+            return self._last_sample
         cpu = self._proc.cpu_percent(interval=None)
         rss = self._proc.memory_info().rss
+        self._last_sample = (cpu, rss)
+        self._last_sample_mono = now
         return cpu, rss
 
     def update(self, mono_now: float) -> Optional[str]:
@@ -123,9 +145,11 @@ class SelfMeter:
         if over:
             self._under_budget_since = None
             if not self._throttled:
-                # Ratchet up the throttle factor.
-                new_factor = self._factor * self._cfg.throttle_factor
-                self._factor = min(new_factor, self._cfg.throttle_max_interval)
+                # Ratchet up the throttle factor.  The 60-second *interval*
+                # ceiling (throttle_max_interval) is applied by the recorder
+                # where the base interval is known; the factor itself only
+                # grows once per throttle episode.
+                self._factor = self._factor * self._cfg.throttle_factor
                 self._throttled = True
                 self._over_budget_since = mono_now
                 return "throttle_down"

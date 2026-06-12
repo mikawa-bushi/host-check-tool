@@ -90,6 +90,15 @@ class ProcessSampler(Sampler):
         self._resolve_proc = resolve_proc
         # PID -> psutil.Process object cache.
         self._pid_cache: dict[int, psutil.Process] = {}
+        # PID -> (name, proc_id): name/cmdline are immutable per process, so
+        # re-reading them every tick costs ~1/3 of the scan (M8 measurement).
+        # PID reuse within one 10s tick window is accepted, same as the
+        # cpu_percent diff baseline.
+        self._identity: dict[int, tuple[str, int]] = {}
+        # PIDs whose io_counters raised AccessDenied: privileges don't change
+        # over a process lifetime, so skip the failing read (and its exception
+        # cost — one per process per tick when running non-root) from then on.
+        self._io_denied_pids: set[int] = set()
         # Previous I/O counter values for delta computation.
         # keyed by (proc_id, pid)
         self._prev_io: dict[tuple[int, int], tuple[int, int]] = {}
@@ -128,15 +137,19 @@ class ProcessSampler(Sampler):
         for pid in list(self._pid_cache):
             if pid not in live_pids:
                 del self._pid_cache[pid]
+                self._identity.pop(pid, None)
+                self._io_denied_pids.discard(pid)
 
         for pid, proc in list(self._pid_cache.items()):
+            identity = self._identity.get(pid)
             try:
                 with proc.oneshot():
-                    name: str = proc.name()
-                    try:
-                        cmdline: list[str] = proc.cmdline()
-                    except (psutil.AccessDenied, psutil.ZombieProcess):
-                        cmdline = []
+                    if identity is None:
+                        name: str = proc.name()
+                        try:
+                            cmdline: list[str] = proc.cmdline()
+                        except (psutil.AccessDenied, psutil.ZombieProcess):
+                            cmdline = []
 
                     # cpu_percent: returns None / 0.0 on first call for this
                     # Process object.  We store None on first tick.
@@ -160,20 +173,28 @@ class ProcessSampler(Sampler):
 
                     # I/O counters — AccessDenied is expected for
                     # processes owned by other users when running non-root.
+                    # A once-denied PID stays denied, so skip the read (the
+                    # missing-rate counters still tick for the quality report).
                     self.io_total += 1
                     io_read_delta: Optional[int] = None
                     io_write_delta: Optional[int] = None
-                    try:
-                        io = proc.io_counters()
-                        cur_r = io.read_bytes
-                        cur_w = io.write_bytes
-                    except (psutil.AccessDenied, AttributeError):
+                    if pid in self._io_denied_pids:
                         self.io_denied += 1
                         cur_r = None
                         cur_w = None
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        cur_r = None
-                        cur_w = None
+                    else:
+                        try:
+                            io = proc.io_counters()
+                            cur_r = io.read_bytes
+                            cur_w = io.write_bytes
+                        except (psutil.AccessDenied, AttributeError):
+                            self.io_denied += 1
+                            self._io_denied_pids.add(pid)
+                            cur_r = None
+                            cur_w = None
+                        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                            cur_r = None
+                            cur_w = None
 
                     try:
                         status: str = proc.status()
@@ -183,6 +204,8 @@ class ProcessSampler(Sampler):
             except psutil.NoSuchProcess:
                 # Process died between the pid listing and oneshot.
                 del self._pid_cache[pid]
+                self._identity.pop(pid, None)
+                self._io_denied_pids.discard(pid)
                 continue
             except psutil.AccessDenied:
                 # Can't inspect the process at all — skip it.
@@ -195,12 +218,17 @@ class ProcessSampler(Sampler):
             if status == "zombie":
                 zombie_count += 1
 
-            # Normalise cmdline and resolve process registry ID.
-            hash12, sample = normalize_cmdline(
-                cmdline,
-                replace_digits=ctx.config.sampling.cmdline_normalize,
-            )
-            proc_id = self._resolve_proc(name, hash12, sample, ts)
+            # Normalise cmdline and resolve the registry ID once per PID;
+            # later ticks reuse the cached identity.
+            if identity is None:
+                hash12, sample = normalize_cmdline(
+                    cmdline,
+                    replace_digits=ctx.config.sampling.cmdline_normalize,
+                )
+                proc_id = self._resolve_proc(name, hash12, sample, ts)
+                self._identity[pid] = (name, proc_id)
+            else:
+                _, proc_id = identity
 
             # cpu_pct: mark as None when raw_cpu is 0.0 and the PID was
             # just added to the cache (first call always returns 0.0).

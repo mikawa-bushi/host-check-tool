@@ -441,11 +441,13 @@ class Recorder:
         sched.add("t2a_cgroup", sc.cgroup_interval, self._job_cgroup)
 
         # T2b interval is a callable so the selfmeter factor is evaluated
-        # each scheduling cycle.
+        # each scheduling cycle.  The widened interval is capped at the
+        # design ceiling (§4.8: 上限60秒) regardless of the factor.
         if self._selfmeter is not None:
+            max_interval = self._config.budget.throttle_max_interval
             sched.add(
                 "t2b_process",
-                lambda: sc.process_interval * self._selfmeter.factor,
+                lambda: min(sc.process_interval * self._selfmeter.factor, max_interval),
                 self._job_process,
             )
         else:
