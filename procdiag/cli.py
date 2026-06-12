@@ -807,6 +807,87 @@ def service_install(
 
 
 # ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    type=click.Path(),
+    help="設定ファイルのパス (既定: ./config.py)。",
+)
+@click.option(
+    "--db",
+    "db_path",
+    default=None,
+    type=click.Path(),
+    help="記録先 DB ファイルのパス (config の db_path を上書き)。",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="出力フォーマット (既定: text)。",
+)
+def doctor(
+    config_path: Optional[str],
+    db_path: Optional[str],
+    fmt: str,
+) -> None:
+    """記録開始前にホストの観測能力を診断します。
+
+    終了コード: 0=すべて ok/info / 2=degraded あり
+    """
+    from .config import load_config
+    from .doctor import run_doctor
+
+    cfg = load_config(Path(config_path) if config_path else None)
+    if db_path:
+        cfg = cfg.model_copy(update={"db_path": db_path})
+
+    checks = run_doctor(cfg)
+
+    if fmt == "json":
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "name": c.name,
+                        "label": c.label,
+                        "status": c.status,
+                        "detail": c.detail,
+                    }
+                    for c in checks
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        _STATUS_SYMBOL = {"ok": "✔", "degraded": "⚠", "info": "ℹ"}
+        for c in checks:
+            sym = _STATUS_SYMBOL.get(c.status, "?")
+            click.echo(f"{sym} [{c.label}] {c.detail}")
+
+        degraded_count = sum(1 for c in checks if c.status == "degraded")
+        click.echo("")
+        if degraded_count:
+            click.echo(
+                f"⚠ {degraded_count} 件の降格があります。"
+                "記録は可能ですが該当データは欠損します"
+            )
+        else:
+            click.echo("✔ すべての観測能力が利用可能です")
+
+    degraded = any(c.status == "degraded" for c in checks)
+    sys.exit(2 if degraded else 0)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

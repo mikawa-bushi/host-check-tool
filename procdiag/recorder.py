@@ -398,6 +398,106 @@ class Recorder:
             except Exception:
                 logger.exception("保持ポリシー実行例外")
 
+            # DB size guard — run immediately after retention so freed pages
+            # are already gone before we compute the size.
+            try:
+                ret = self._config.retention
+                max_bytes: int | None = (
+                    int(ret.db_max_size_mb * 1024 * 1024)
+                    if ret.db_max_size_mb is not None
+                    else None
+                )
+                min_free_bytes: int | None = int(ret.min_free_disk_mb * 1024 * 1024)
+                self._storage.enforce_size_budget(
+                    max_bytes=max_bytes,
+                    min_free_bytes=min_free_bytes,
+                )
+            except Exception:
+                logger.exception("DBサイズガード実行例外")
+
+    def _job_pss_precheck(self) -> None:
+        """PSS pre-check job: update pss_targets on the process sampler.
+
+        Reads the last 6 hours of proc_rollup_1m, fits a line to each
+        process's rss_avg series, and writes the top-5 leaking candidates
+        (slope > 1 MB/h and r2 > 0.8) back to the process sampler's
+        pss_targets attribute.  Uses hasattr to remain a no-op when the
+        injected sampler does not expose pss_targets (e.g. fake samplers
+        in test_recorder.py).
+        """
+        from .diagnosis.trend import fit_linear  # local import
+
+        sampler = self._samplers.get("process")
+        if sampler is None or not hasattr(sampler, "pss_targets"):
+            return
+
+        _PSS_PRECHECK_MIN_POINTS = 60
+        _PSS_PRECHECK_MIN_SPAN_HOURS = 2.0
+        _PSS_PRECHECK_SLOPE_THRESHOLD_MB_H = 1.0
+        _PSS_PRECHECK_R2_THRESHOLD = 0.8
+        _PSS_PRECHECK_WINDOW_HOURS = 6.0
+        _BYTES_PER_MB = 1024 * 1024
+        _PSS_MAX_TARGETS = 5
+
+        now = time.time()
+        since = now - _PSS_PRECHECK_WINDOW_HOURS * 3600.0
+
+        try:
+            proc_rows = self._storage.rows(
+                "proc_rollup_1m",
+                since=since,
+                until=now,
+            )
+        except Exception:
+            logger.exception("PSS事前チェック: proc_rollup_1m 読み取り例外")
+            return
+
+        # Group rss_avg by proc_id.
+        rss_by_proc: dict[int, list[tuple[float, float]]] = {}
+        for row in proc_rows:
+            pid = row["proc_id"]
+            rss = row["rss_avg"]
+            ts = row["ts_min"]
+            if rss is not None:
+                rss_by_proc.setdefault(pid, []).append((ts, float(rss)))
+
+        candidates: list[tuple[float, int]] = []  # (slope_mb_h, proc_id)
+        for proc_id, series in rss_by_proc.items():
+            fit = fit_linear(
+                series,
+                min_points=_PSS_PRECHECK_MIN_POINTS,
+                min_span_hours=_PSS_PRECHECK_MIN_SPAN_HOURS,
+            )
+            if fit is None:
+                continue
+            if fit.r2 < _PSS_PRECHECK_R2_THRESHOLD:
+                continue
+            slope_mb_h = fit.slope_per_hour / _BYTES_PER_MB
+            if slope_mb_h < _PSS_PRECHECK_SLOPE_THRESHOLD_MB_H:
+                continue
+            candidates.append((slope_mb_h, proc_id))
+
+        candidates.sort(reverse=True)
+        new_targets = {proc_id for _, proc_id in candidates[:_PSS_MAX_TARGETS]}
+
+        old_targets: set[int] = set(sampler.pss_targets)
+        if new_targets != old_targets:
+            # Build human-readable label for ops_events.
+            labels: list[str] = []
+            for _, pid in candidates[:_PSS_MAX_TARGETS]:
+                try:
+                    reg = self._storage.conn.execute(
+                        "SELECT name FROM proc_registry WHERE proc_id = ?", (pid,)
+                    ).fetchone()
+                    name = reg["name"] if reg else f"proc_{pid}"
+                except Exception:
+                    name = f"proc_{pid}"
+                labels.append(f"proc_id={pid} name={name}")
+            detail = "; ".join(labels) if labels else "(なし)"
+            self._storage.record_event("pss_scrutiny", detail)
+
+        sampler.pss_targets = new_targets
+
     def _on_gap(self, delay: float, job_name: str) -> None:
         """Record a gap event when a job fires more than 3× its interval late."""
         detail = f"{delay:.1f}s ジョブ{job_name}"
@@ -456,6 +556,10 @@ class Recorder:
         sched.add("t3_disk", sc.disk_interval, self._job_disk)
         sched.add("t3_dir", sc.dir_scan_interval, self._job_dir_scan)
         sched.add("flush", self._flush_interval, self._job_flush)
+
+        # PSS pre-check job: only register when pss_precheck_interval > 0.
+        if sc.pss_precheck_interval > 0:
+            sched.add("pss_precheck", sc.pss_precheck_interval, self._job_pss_precheck)
 
         # Register signal handlers (main thread only).
         self._register_signals()

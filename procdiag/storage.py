@@ -20,6 +20,7 @@ Key design choices that mirror netdiag:
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import time
 from collections import defaultdict
@@ -538,6 +539,109 @@ class Storage:
                 rollup_deleted += cur.rowcount
 
         return {"raw_deleted": raw_deleted, "rollup_deleted": rollup_deleted}
+
+    def enforce_size_budget(
+        self,
+        *,
+        max_bytes: Optional[int],
+        min_free_bytes: Optional[int],
+    ) -> Dict[str, Any]:
+        """Enforce DB size and free-disk constraints with a deterministic ladder.
+
+        Checks the current DB size (main file + WAL) and available disk space.
+        If either limit is exceeded the method applies a sequence of retention
+        tightenings — each step is evaluated before the next is attempted.
+        A single VACUUM is run at the end if any steps were taken.
+
+        Parameters
+        ----------
+        max_bytes:
+            Maximum allowed DB size in bytes.  ``None`` skips the DB-size
+            check (min_free_bytes alone governs).
+        min_free_bytes:
+            Minimum required free disk space in bytes.  ``None`` skips the
+            free-space check.
+
+        Returns
+        -------
+        dict with keys:
+            ``triggered`` (bool), ``steps`` (list[str]),
+            ``size_before`` (int), ``size_after`` (int).
+        """
+
+        # Compute current DB size (main file + WAL).
+        def _db_size() -> int:
+            total = 0
+            try:
+                total += self.path.stat().st_size
+            except OSError:
+                pass
+            wal = Path(str(self.path) + "-wal")
+            try:
+                total += wal.stat().st_size
+            except OSError:
+                pass
+            return total
+
+        # Check if we are currently over budget.
+        def _over_budget() -> bool:
+            if max_bytes is not None and _db_size() > max_bytes:
+                return True
+            if min_free_bytes is not None:
+                try:
+                    free = shutil.disk_usage(self.path.parent).free
+                except OSError:
+                    free = 0
+                if free < min_free_bytes:
+                    return True
+            return False
+
+        size_before = _db_size()
+        if not _over_budget():
+            return {"triggered": False}
+
+        steps: List[str] = []
+
+        # Deterministic ladder — raw first (3 steps), then rollup (2 steps).
+        # Each step applies retention() and re-evaluates the budget; we stop
+        # as soon as we are back within limits.
+        # rollup retention stays at the existing "90d" default while we
+        # tighten raw; raw stays at "6h" (lower bound) while we tighten rollup.
+        ladder: List[Tuple[str, str, str]] = [
+            ("raw_24h", "24h", "90d"),
+            ("raw_12h", "12h", "90d"),
+            ("raw_6h", "6h", "90d"),
+            ("rollup_30d", "6h", "30d"),
+            ("rollup_14d", "6h", "14d"),
+        ]
+
+        for step_name, raw_arg, rollup_arg in ladder:
+            if not _over_budget():
+                break
+            try:
+                self.retention(raw_arg, rollup_arg)
+            except Exception:
+                pass
+            after = _db_size()
+            detail = f"{step_name}: DB={after // (1024 * 1024)}MB"
+            self.record_event("db_guard", detail)
+            steps.append(step_name)
+
+        # Single VACUUM to reclaim freed pages (rare — budget exceeded only
+        # when the automated retention has not yet run for a long time).
+        try:
+            self.conn.execute("VACUUM")
+            self.conn.commit()
+        except Exception:
+            pass
+
+        size_after = _db_size()
+        return {
+            "triggered": True,
+            "steps": steps,
+            "size_before": size_before,
+            "size_after": size_after,
+        }
 
     def record_event(self, kind: str, detail: str = "") -> None:
         """Insert one row into ``ops_events`` immediately (no buffering)."""

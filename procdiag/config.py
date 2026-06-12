@@ -60,6 +60,8 @@ class SamplingConfig(BaseModel):
     dir_scan_interval: float = 3600.0  # T3 watch_dirs
     watch_dirs: list[WatchDir] = Field(default_factory=list)
     cmdline_normalize: bool = True
+    # PSS pre-check interval (seconds). 0 disables the job.
+    pss_precheck_interval: float = 3600.0
 
     @field_validator(
         "system_interval",
@@ -72,6 +74,13 @@ class SamplingConfig(BaseModel):
     def _positive_interval(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"サンプリング間隔は正の数でなければなりません: {v}")
+        return v
+
+    @field_validator("pss_precheck_interval")
+    @classmethod
+    def _non_negative_pss_interval(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"pss_precheck_interval は0以上でなければなりません: {v}")
         return v
 
 
@@ -128,6 +137,10 @@ class RetentionConfig(BaseModel):
 
     raw: str = "48h"
     rollup: str = "90d"
+    # DB size guard. None disables the size check.
+    db_max_size_mb: Optional[float] = 2048.0
+    # Minimum free disk space before the guard triggers (MB).
+    min_free_disk_mb: float = 512.0
 
     @field_validator("raw", "rollup")
     @classmethod
@@ -136,6 +149,20 @@ class RetentionConfig(BaseModel):
             parse_duration(v)
         except ValueError as e:
             raise ValueError(f"保持期間の形式が不正です: {e}") from e
+        return v
+
+    @field_validator("db_max_size_mb")
+    @classmethod
+    def _positive_or_none_max_size(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError(f"db_max_size_mb は正の数でなければなりません: {v}")
+        return v
+
+    @field_validator("min_free_disk_mb")
+    @classmethod
+    def _positive_min_free(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"min_free_disk_mb は正の数でなければなりません: {v}")
         return v
 
 
@@ -149,7 +176,15 @@ class RulesConfig(BaseModel):
     min_observation_hours: float = 6.0
     journal_size_warn_gb: float = 4.0
 
-    @field_validator("min_observation_hours", "journal_size_warn_gb")
+    @field_validator("min_observation_hours")
+    @classmethod
+    def _non_negative_hours(cls, v: float) -> float:
+        # 0 = no minimum: instantaneous rules (and tests) may waive the guard.
+        if v < 0:
+            raise ValueError(f"min_observation_hours は0以上でなければなりません: {v}")
+        return v
+
+    @field_validator("journal_size_warn_gb")
     @classmethod
     def _positive_float(cls, v: float) -> float:
         if v <= 0:
@@ -213,16 +248,17 @@ config = ProcdiagConfig(
     db_path="./procdiag.db",
 
     sampling=SamplingConfig(
-        system_interval=1.0,       # Tier1: システム全体 + PSI (秒)
-        cgroup_interval=5.0,       # Tier2a: cgroup統計 (秒)
-        process_interval=10.0,     # Tier2b: プロセス走査 (秒)
-        disk_interval=60.0,        # Tier3: ディスク使用量 (秒)
-        dir_scan_interval=3600.0,  # Tier3: ディレクトリサイズ走査 (秒)
+        system_interval=1.0,          # Tier1: システム全体 + PSI (秒)
+        cgroup_interval=5.0,          # Tier2a: cgroup統計 (秒)
+        process_interval=10.0,        # Tier2b: プロセス走査 (秒)
+        disk_interval=60.0,           # Tier3: ディスク使用量 (秒)
+        dir_scan_interval=3600.0,     # Tier3: ディレクトリサイズ走査 (秒)
         watch_dirs=[
             # WatchDir(path="/var/log", time_budget_sec=10),
             # WatchDir(path="/opt/myapp/data"),
         ],
-        cmdline_normalize=True,    # 数字引数をプレースホルダに置換してプロセス台帳爆発を防ぐ
+        cmdline_normalize=True,       # 数字引数をプレースホルダに置換してプロセス台帳爆発を防ぐ
+        pss_precheck_interval=3600.0, # PSS精査候補の事前チェック間隔 (秒)。0で無効
     ),
 
     trigger=TriggerConfig(
@@ -241,8 +277,10 @@ config = ProcdiagConfig(
     ),
 
     retention=RetentionConfig(
-        raw="48h",   # 生サンプルの保持期間
-        rollup="90d", # 1分ロールアップの保持期間
+        raw="48h",             # 生サンプルの保持期間
+        rollup="90d",          # 1分ロールアップの保持期間
+        db_max_size_mb=2048.0, # DB最大サイズ (MB)。None で無効
+        min_free_disk_mb=512.0, # 最低空きディスク容量 (MB)
     ),
 
     rules=RulesConfig(

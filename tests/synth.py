@@ -845,3 +845,141 @@ def add_cg_io_series(
     store.buffer("cg_samples", rows)
     store.flush(reason="synth")
     return cg_id
+
+
+# ---------------------------------------------------------------------------
+# V2-A helpers — OOM-KILL-01
+# ---------------------------------------------------------------------------
+
+
+def add_oom_scenario(
+    store: Storage,
+    *,
+    name: str = "victim",
+    die_at_hours: float,
+    total_hours: float,
+    rss_bytes: int,
+    crisis: bool = True,
+    start_ts: Optional[float] = None,
+) -> int:
+    """Insert proc_samples and sys_samples that simulate an OOM-killed process.
+
+    Generates proc_samples for the process from *start_ts* up to
+    ``start_ts + die_at_hours * 3600`` seconds, and sys_samples from
+    *start_ts* up to ``start_ts + total_hours * 3600`` seconds.  The
+    sys_samples continue past the process's last sample so that
+    OOM-KILL-01 can observe the gap (recording continued after the process
+    disappeared).
+
+    If *crisis* is True, the sys_samples immediately before the process's
+    final sample contain elevated ``psi_mem_full10`` (>= 1.0) and a reduced
+    ``mem_available`` to satisfy OOM-KILL-01's memory-crisis conditions.
+
+    Returns the assigned ``proc_id`` for the victim process.
+
+    Parameters
+    ----------
+    store:
+        Target storage instance.
+    name:
+        Process name for the victim.
+    die_at_hours:
+        Hours after *start_ts* at which the process stops being recorded.
+    total_hours:
+        Total hours of sys_samples to insert (must be > die_at_hours so
+        that a gap exists).
+    rss_bytes:
+        RSS in bytes for the victim process (constant, used as the "last
+        RSS" that OOM-KILL-01 compares against mem_total).
+    crisis:
+        If True, insert psi_mem_full10=2.0 and mem_available near zero in
+        the 3-minute window before die_at_hours.
+    start_ts:
+        Start timestamp (POSIX seconds).  Defaults to
+        ``time.time() - total_hours * 3600``.
+    """
+    if start_ts is None:
+        start_ts = time.time() - total_hours * 3600.0
+
+    die_ts = start_ts + die_at_hours * 3600.0
+
+    # --- Register the victim process ---
+    proc_id = store.proc_id_for(
+        name=name,
+        cmdline_hash=f"oom_{name}",
+        cmdline_sample=f"/usr/bin/{name}",
+        ts=start_ts,
+    )
+    store.conn.commit()
+
+    # --- proc_samples: one sample per minute up to die_ts ---
+    n_proc_minutes = int(die_at_hours * 60)
+    proc_rows: list[tuple] = []
+    for i in range(n_proc_minutes):
+        ts = start_ts + i * 60.0
+        proc_rows.append(
+            (
+                ts,
+                proc_id,
+                2000 + proc_id,  # synthetic pid
+                5.0,  # cpu_pct
+                rss_bytes,  # rss — constant for simplicity
+                None,  # pss
+                4,  # num_threads
+                50,  # num_fds
+                None,  # io_read_delta
+                None,  # io_write_delta
+            )
+        )
+    if proc_rows:
+        store.buffer("proc_samples", proc_rows)
+        store.flush(reason="synth")
+
+    # --- sys_samples: one sample per minute over the full total_hours ---
+    # Typical memory: 8 GB total.
+    mem_total = int(8 * _GB)
+    n_sys_minutes = int(total_hours * 60)
+    sys_rows: list[tuple] = []
+    rng = random.Random(name.__hash__() & 0xFFFF)
+
+    for i in range(n_sys_minutes):
+        ts = start_ts + i * 60.0
+        # Determine if this sample is in the crisis window (3 min before die).
+        in_crisis = crisis and (die_ts - 180.0 <= ts <= die_ts)
+
+        if in_crisis:
+            psi_full = 2.0  # above the 1.0 threshold
+            mem_avail = int(mem_total * 0.01)  # near-zero
+            swap_out = 0
+        else:
+            psi_full = 0.0
+            mem_avail = int(mem_total * 0.75 + rng.gauss(0, 10 * _MB))
+            swap_out = 0
+
+        mem_used = mem_total - mem_avail
+        sys_rows.append(
+            (
+                ts,
+                10.0 + rng.gauss(0, 1),  # cpu_total
+                12.0,  # cpu_max_core
+                mem_used,  # mem_used
+                mem_avail,  # mem_available
+                0,  # swap_used
+                0,  # swap_in
+                swap_out,  # swap_out
+                0.1,  # load1
+                0.0,  # psi_cpu_some10
+                0.0,  # psi_mem_some10
+                psi_full,  # psi_mem_full10
+                0.0,  # psi_io_some10
+                0.0,  # psi_io_full10
+                0,  # disk_read_bytes
+                0,  # disk_write_bytes
+                0.1,  # self_cpu
+                int(50 * _MB),  # self_rss
+            )
+        )
+
+    store.buffer("sys_samples", sys_rows)
+    store.flush(reason="synth")
+    return proc_id

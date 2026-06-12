@@ -130,7 +130,7 @@ class MemLeakRule(Rule):
                 else Severity.WARNING
             )
 
-            # Confidence from R² × observation time.
+            # Confidence from R² × observation time (baseline).
             if fit.r2 >= 0.95 and fit.span_hours >= 12.0:
                 confidence = Confidence.HIGH
             elif fit.r2 >= 0.90 and fit.span_hours >= self.min_observation_hours:
@@ -178,6 +178,36 @@ class MemLeakRule(Rule):
                 "is_python": is_python,
                 "days_to_oom": days_to_oom,
             }
+
+            # PSS-based confidence promotion / demotion (EXT-02).
+            # Requires at least 12 PSS samples in proc_samples.
+            pss_series = store.series(
+                "proc_samples",
+                "pss",
+                subject_col="proc_id",
+                subject=proc_id,
+                since=window.start_ts,
+                until=window.end_ts,
+            )
+            _PSS_SLOPE_HIGH_MB_H = 0.5
+            _PSS_SLOPE_FLAT_MB_H = 0.1
+            _PSS_MIN_POINTS = 12
+            if len(pss_series) >= _PSS_MIN_POINTS:
+                pss_fit = fit_linear(
+                    pss_series,
+                    min_points=_PSS_MIN_POINTS,
+                    min_span_hours=0.0,
+                )
+                if pss_fit is not None:
+                    pss_slope_mb_h = pss_fit.slope_per_hour / _BYTES_PER_MB
+                    if pss_fit.r2 > 0.8 and pss_slope_mb_h > _PSS_SLOPE_HIGH_MB_H:
+                        confidence = Confidence.HIGH
+                        evidence["pss_slope_mb_per_h"] = round(pss_slope_mb_h, 3)
+                    elif pss_slope_mb_h <= _PSS_SLOPE_FLAT_MB_H:
+                        confidence = Confidence.LOW
+                        evidence["pss_note"] = (
+                            "PSSでは増加が確認できず (共有メモリ/キャッシュの可能性)"
+                        )
 
             summary = (
                 f"{process_name}: RSS +{slope_mb_h:.1f} MB/h で単調増加"

@@ -46,6 +46,7 @@ procdiag report --out report.html --json report.json
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 |
 | `procdiag report` | HTML + JSON レポートを一括生成 |
 | `procdiag status` | 記録期間・サンプル数・自己負荷を表示 |
+| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
 | `procdiag explain [RULE\|sampler]` | ルールまたはサンプラーの詳細を表示 |
 | `procdiag list-rules` | 登録済みルールを一覧表示 |
 | `procdiag list-samplers` | 登録済みサンプラーを Tier 別に一覧表示 |

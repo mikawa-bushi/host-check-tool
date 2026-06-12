@@ -77,6 +77,7 @@ procdiag report --out report.html --json report.json
 | `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する |
 | `procdiag report` | HTML + JSON レポートを一括生成する (`check` のラッパー) |
 | `procdiag status` | 記録期間・サンプル数・自己負荷の概況を表示する |
+| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/journal/センサ/DB空き) を診断する。降格ありで exit 2 |
 | `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する |
 | `procdiag list-rules` | 登録済みルールをカテゴリ別に一覧表示する |
 | `procdiag list-samplers` | 登録済みサンプラーを Tier 別に一覧表示する |
@@ -244,12 +245,20 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 | `DISK-FULL-01` | io_disk | disk_samples を線形外挿し、容量到達までの残り日数を算出 |
 | `DISK-GROWTH-01` | io_disk | dir_samples の増分ランキングで増加源を特定 (DISK-FULL に折りたたみ) |
 | `DISK-JOURNAL-01` | io_disk | journald のサイズ超過を検出し SystemMaxUse 設定を提案 |
+| `OOM-KILL-01` | crash | プロセス台帳の途絶×直前のメモリ危機の相関で OOM kill を検出。journal 読取可なら確証度を昇格 |
 | `FD-LEAK-01` | leak | fds_max の線形回帰で fd リークと ulimit 到達予測日数を算出 |
 | `THREAD-LEAK-01` | leak | threads_max の単調増加を検出 |
 | `ZOMBIE-01` | leak | ゾンビ近似プロセス数の増加傾向を検出 (confidence=low の近似検出) |
 
 最低観測時間はルールごとに異なる (瞬時型 0h 〜 日次反復型 24h)。線形回帰系ルールの
-既定 6 時間は `config.rules.min_observation_hours` で一括調整できる。
+既定 6 時間は `config.rules.min_observation_hours` で一括調整できる (0 で無効)。
+
+record 常駐中は毎時の軽量プレチェックがリーク疑いプロセス (最大5件) を選び、
+smaps_rollup から PSS を自動精査する — MEM-LEAK-01 は PSS でも増加が確認できた場合に
+確証度を high へ昇格し、PSS が横ばいなら「共有メモリの可能性」として low へ下げる。
+また記録 DB 自身の容量 (`retention.db_max_size_mb`、既定 2GB) と置き場の空きを監視し、
+超過時は保持期間を段階短縮して ops_events に記録する — 診断ツールが
+DISK-FULL の原因になることを構造的に防ぐ。
 
 ---
 

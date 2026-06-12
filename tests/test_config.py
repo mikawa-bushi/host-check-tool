@@ -88,8 +88,13 @@ def test_invalid_retention_rollup_raises():
 
 
 def test_negative_min_observation_hours_raises():
-    with pytest.raises(Exception, match="正"):
+    with pytest.raises(Exception, match="0以上"):
         RulesConfig(min_observation_hours=-1.0)
+
+
+def test_zero_min_observation_hours_allowed():
+    # 0 = no minimum: instantaneous rules / tests may waive the global guard.
+    assert RulesConfig(min_observation_hours=0.0).min_observation_hours == 0.0
 
 
 def test_negative_watch_dir_budget_raises():
