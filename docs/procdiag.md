@@ -3,8 +3,9 @@
 `procdiag` は**事後診断**ツール。リアルタイムダッシュボードではなく、
 **一定期間かけて記録し、決定論的なルールで改善提案を生成する**。
 
-`network-check-tool / netdiag` の兄弟ツールとして、netdiag が「どのネットワーク層が壊れているか」
-を診断するのと対称的に、procdiag は「**なぜこの PC が重い・落ちる・ディスクが満杯か**」を診断する。
+答える問いは「**なぜこの PC が重い・落ちる・ディスクが満杯か**」。
+Glances/netdata 等のリアルタイム監視とも、py-spy 等のコードプロファイラとも異なり、
+運用レベル (プロセス・サービス・ディスク) の原因切り分けと改善提案に徹する。
 
 ```bash
 # インストール
@@ -276,18 +277,3 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
   AccessDenied が確定した PID の io_counters 読取をスキップすることで
   101 → 82 µs/プロセス (−19 %) を達成
 
----
-
-## netdiag との対応表 (設計アナロジー)
-
-| netdiag | procdiag |
-|---|---|
-| `Probe` (1 回の問い) | `Sampler` (継続的な記録) |
-| `layer` (L1〜L7) | `tier` (T1/T2a/T2b/T3) |
-| `CheckResult` (事実) | `sys_samples` 等 (時系列の事実) |
-| `Hypothesis` (原因仮説) | `Finding` |
-| `Diagnosis` | `Diagnosis` |
-| `StateMachine` (デバウンス) | `SpikeTrigger` (デバウンス+ストーム集約) |
-| `netdiag watch` (常駐) | `procdiag record` (常駐) |
-| `RUNBOOKS` (手順テンプレ) | Jinja2 提案テンプレート |
-| `entry_points netdiag.probes` | `entry_points procdiag.rules` |

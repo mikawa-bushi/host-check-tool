@@ -1,5 +1,4 @@
 # procdiag 設定例 — 工場エッジPC / ラインサーバー向け
-# (netdiag の examples/office.yaml に相当する現場テンプレート)
 #
 # 使い方: このファイルを記録対象マシンに config.py として置き、
 #   procdiag record --config config.py

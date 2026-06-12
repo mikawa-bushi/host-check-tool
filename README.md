@@ -1,19 +1,19 @@
 # host-check-tool
 
 This package ships **`procdiag`** — a local-first Linux host-resource diagnosis
-tool that is the sibling of
-[network-check-tool / netdiag](https://github.com/mikawa-bushi/network-check-tool).
+tool. **「なぜこの PC が重い・落ちる・ディスクが満杯か」**に答える。
 
-| | network-check-tool | **host-check-tool** |
-|---|---|---|
-| 配布物名 (PyPI) | `network-check-tool` | `host-check-tool` |
-| 主役 CLI | `netdiag` | **`procdiag`** |
-| 問いの分担 | 「どの層が壊れていて、なぜか」 | 「なぜこの PC が重い・落ちる・ディスクが満杯か」 |
-| 根拠 | ネットワーク層のプローブ | CPU/メモリ/ディスクの時系列記録 |
+CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録し、**決定論的な検出ルール**に
+基づいて運用レベルの改善提案を日本語レポートとして出力する。リアルタイム監視
+ダッシュボードではなく**「記録 → 診断 → 提案」の事後診断ワークフロー**であり、
+工場のエッジ PC・ラインサーバーなど IT 人材が常駐しない環境を主用途とする。
 
-`netdiag` がその場で測るのに対して、`procdiag` は**一定期間かけて記録し、
-後から診断する**。ファクトリ・エッジ PC など IT 人材が常駐しない環境での
-事後診断・改善提案を主用途とする。
+- **オフライン・閉域網ファースト** — 外部通信ゼロ。レポートは CDN 参照なしの単一 HTML
+- **3 コマンドで動く** — `pip install` → `procdiag init` → `procdiag record`
+- **決定論的な診断** — 13 の検出ルール × テンプレートで提案を生成 (LLM 非依存)。
+  出力は機械可読 (JSON) で、外部での活用は利用者に委ねる
+- **観測者効果の最小化と透明性** — 自身のオーバーヘッドを計測・報告し、
+  予算超過時は自動減速する
 
 ![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
@@ -64,7 +64,8 @@ procdiag check  --only MEM-LEAK-01,DISK-FULL-01
 
 ## 終了コード
 
-`procdiag check` (alias: `procdiag advise`) の終了コードは netdiag と統一:
+`procdiag check` (alias: `procdiag advise`) はスクリプト・CI に組み込めるよう
+終了コードで結果を返す:
 
 | コード | 意味 |
 |---|---|
