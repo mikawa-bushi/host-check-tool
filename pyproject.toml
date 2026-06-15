@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "host-check-tool"
-version = "0.2.2"
+version = "0.2.3"
 description = "Local-first Linux host resource diagnosis (procdiag): record CPU/memory/disk over time, then explain what to fix."
 authors = ["hardwork9047 <tomatosimple1104@gmail.com>"]
 readme = "README.md"

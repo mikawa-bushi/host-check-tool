@@ -31,6 +31,11 @@ from .core.util import parse_duration
 
 SCHEMA_VERSION = 1
 
+# Minimum seconds between ``last_seen`` rewrites for the same cgroup unit.
+# ``last_seen`` is metadata that nothing reads for logic, so the per-tick
+# UPDATE is throttled to bound the write rate during long recordings.
+_CG_LAST_SEEN_THROTTLE_SEC = 60.0
+
 # ---------------------------------------------------------------------------
 # DDL — verbatim from design doc §5.2
 # ---------------------------------------------------------------------------
@@ -282,6 +287,16 @@ class Storage:
         # key -> (id, last_seen_ts)
         self._proc_cache: Dict[Tuple[str, str], int] = {}
         self._cg_cache: Dict[str, int] = {}
+        # Last ts at which each cgroup unit's last_seen was actually written
+        # (write path only) — used to throttle the per-tick UPDATE.
+        self._cg_last_seen_written: Dict[str, float] = {}
+
+        # Query result cache, enabled only for read-only sessions so multiple
+        # rules over the same window share a single scan.  ``None`` disables it
+        # on the writable recorder connection (its data changes per tick).
+        self._rows_cache: Optional[Dict[tuple, List[sqlite3.Row]]] = (
+            {} if read_only else None
+        )
 
     # ------------------------------------------------------------------
     # Write path (recorder-only)
@@ -711,7 +726,19 @@ class Storage:
         where: Optional[str] = None,
         params: tuple = (),
     ) -> List[sqlite3.Row]:
-        """Return raw rows from *table* with optional time and custom filters."""
+        """Return raw rows from *table* with optional time and custom filters.
+
+        On a read-only Storage the result is cached by query arguments so that
+        several rules sharing the same window do not each re-scan the table.
+        The returned list is a shared read-only view — callers must not mutate
+        it (``sqlite3.Row`` itself is immutable).
+        """
+        cache_key = (table, since, until, where, params)
+        if self._rows_cache is not None:
+            cached = self._rows_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         # Rollup tables use ts_min; registry/meta tables have no timestamp column,
         # so time filtering and ordering do not apply to them.
         _rollup_tables = {"sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m"}
@@ -739,7 +766,10 @@ class Storage:
         if ts_col is not None:
             q += f" ORDER BY {ts_col}"
 
-        return self.conn.execute(q, p).fetchall()
+        result = self.conn.execute(q, p).fetchall()
+        if self._rows_cache is not None:
+            self._rows_cache[cache_key] = result
+        return result
 
     def counts(self) -> Dict[str, Any]:
         """Return per-table row counts and the DB file size in bytes."""
@@ -811,12 +841,22 @@ class Storage:
         return proc_id
 
     def cg_id_for(self, unit_path: str, ts: float) -> int:
-        """Upsert a cgroup unit into ``cgroup_registry`` and return ``cg_id``."""
+        """Upsert a cgroup unit into ``cgroup_registry`` and return ``cg_id``.
+
+        ``last_seen`` is refreshed at most once per
+        ``_CG_LAST_SEEN_THROTTLE_SEC`` seconds per unit to bound the write rate
+        on long recordings (the column is metadata that nothing reads for logic).
+        """
         if unit_path in self._cg_cache:
-            self.conn.execute(
-                "UPDATE cgroup_registry SET last_seen=? WHERE unit_path=?",
-                (ts, unit_path),
-            )
+            # Throttle the last_seen rewrite: it is metadata nothing reads for
+            # logic, so there is no need to UPDATE on every tick for every unit.
+            last_written = self._cg_last_seen_written.get(unit_path, 0.0)
+            if ts - last_written >= _CG_LAST_SEEN_THROTTLE_SEC:
+                self.conn.execute(
+                    "UPDATE cgroup_registry SET last_seen=? WHERE unit_path=?",
+                    (ts, unit_path),
+                )
+                self._cg_last_seen_written[unit_path] = ts
             return self._cg_cache[unit_path]
 
         self.conn.execute(
@@ -830,6 +870,7 @@ class Storage:
         ).fetchone()
         cg_id: int = row["cg_id"]
         self._cg_cache[unit_path] = cg_id
+        self._cg_last_seen_written[unit_path] = ts
         return cg_id
 
     # ------------------------------------------------------------------

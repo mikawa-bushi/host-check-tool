@@ -342,3 +342,49 @@ def test_cg_unit_path_returns_registered_path(tmp_db):
 
 def test_cg_unit_path_falls_back_for_unknown_id(tmp_db):
     assert tmp_db.cg_unit_path(99999) == "99999"
+
+
+# ---------------------------------------------------------------------------
+# read-only rows() query cache + cgroup last_seen throttle (issue #3 §2)
+# ---------------------------------------------------------------------------
+
+
+def test_readonly_rows_are_cached(tmp_path):
+    db = tmp_path / "cache.db"
+    with Storage(db) as store:
+        store.buffer("sys_samples", [_sys_row(1.0), _sys_row(2.0)])
+        store.flush()
+    with Storage(db, read_only=True) as ro:
+        first = ro.rows("sys_samples")
+        second = ro.rows("sys_samples")
+        # A read-only Storage caches identical queries → same object returned,
+        # so multiple rules sharing a window do not re-scan the table.
+        assert first is second
+        assert len(first) == 2
+        # A different query is a separate cache entry.
+        assert ro.rows("sys_samples", since=1.5) is not first
+
+
+def test_readwrite_rows_are_not_cached(tmp_db):
+    tmp_db.buffer("sys_samples", [_sys_row(1.0)])
+    tmp_db.flush()
+    # A writable Storage must not cache: its data changes over the session.
+    assert tmp_db.rows("sys_samples") is not tmp_db.rows("sys_samples")
+
+
+def test_cg_last_seen_update_is_throttled(tmp_db):
+    unit = "system.slice/throttle.service"
+
+    def _last_seen():
+        return tmp_db.conn.execute(
+            "SELECT last_seen FROM cgroup_registry WHERE unit_path = ?", (unit,)
+        ).fetchone()["last_seen"]
+
+    tmp_db.cg_id_for(unit, 1000.0)
+    assert _last_seen() == 1000.0
+    # Within the throttle window: last_seen is not rewritten every tick.
+    tmp_db.cg_id_for(unit, 1010.0)
+    assert _last_seen() == 1000.0
+    # Past the throttle window: last_seen advances.
+    tmp_db.cg_id_for(unit, 1100.0)
+    assert _last_seen() == 1100.0

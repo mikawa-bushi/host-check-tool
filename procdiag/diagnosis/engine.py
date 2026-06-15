@@ -335,17 +335,15 @@ class Engine:
         )
         gap_seconds = sum(_parse_gap_delay_seconds(r["detail"]) for r in gap_rows)
 
-        # Self CPU from sys_samples.
-        sys_rows = store.rows(
-            "sys_samples",
-            since=window.start_ts,
-            until=window.end_ts,
-        )
-        self_cpu_values = [r["self_cpu"] for r in sys_rows if r["self_cpu"] is not None]
-        self_cpu_avg = (
-            sum(self_cpu_values) / len(self_cpu_values) if self_cpu_values else 0.0
-        )
-        self_cpu_max = max(self_cpu_values) if self_cpu_values else 0.0
+        # Self CPU from sys_samples — aggregated in SQL so a long recording is
+        # not materialised into Python just to compute avg/max.
+        cpu_agg = store.conn.execute(
+            "SELECT AVG(self_cpu) AS avg, MAX(self_cpu) AS max FROM sys_samples "
+            "WHERE ts >= ? AND ts <= ? AND self_cpu IS NOT NULL",
+            (window.start_ts, window.end_ts),
+        ).fetchone()
+        self_cpu_avg = cpu_agg["avg"] if cpu_agg and cpu_agg["avg"] is not None else 0.0
+        self_cpu_max = cpu_agg["max"] if cpu_agg and cpu_agg["max"] is not None else 0.0
 
         # Throttle events.
         throttle_rows = store.rows(

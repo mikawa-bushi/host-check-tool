@@ -705,6 +705,44 @@ class TestExtraRules:
 # ---------------------------------------------------------------------------
 
 
+class TestQualitySelfCpuAggregate:
+    """_build_quality computes self_cpu avg/max via SQL aggregation."""
+
+    def test_self_cpu_avg_and_max_from_sql(self, tmp_path):
+        from procdiag.storage import TABLE_COLUMNS
+
+        cols = TABLE_COLUMNS["sys_samples"]
+
+        def _row(ts: float, self_cpu: float) -> tuple:
+            d: dict = {c: 0 for c in cols}
+            d["ts"] = ts
+            d["mem_used"] = 1_000_000
+            d["mem_available"] = 1_000_000
+            d["self_cpu"] = self_cpu
+            return tuple(d[c] for c in cols)
+
+        store = make_db(tmp_path)
+        store.buffer(
+            "sys_samples",
+            [_row(1000.0, 0.0), _row(1060.0, 2.0), _row(1120.0, 4.0)],
+        )
+        store.flush()
+
+        diag = Engine(_cfg(min_obs_hours=0.0)).run(store)
+        # avg = (0 + 2 + 4) / 3 = 2.0 ; max = 4.0
+        assert diag.quality.self_cpu_avg == pytest.approx(2.0)
+        assert diag.quality.self_cpu_max == pytest.approx(4.0)
+        store.close()
+
+    def test_self_cpu_defaults_to_zero_when_no_samples(self, tmp_path):
+        # AVG/MAX over zero rows return NULL → must fall back to 0.0.
+        store = make_db(tmp_path)  # empty: no sys_samples
+        diag = Engine(_cfg(min_obs_hours=0.0)).run(store)
+        assert diag.quality.self_cpu_avg == 0.0
+        assert diag.quality.self_cpu_max == 0.0
+        store.close()
+
+
 class TestGapSecondsAggregation:
     """ObservationQuality.gap_seconds must be the sum of delay seconds."""
 

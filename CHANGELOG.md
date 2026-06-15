@@ -2,6 +2,14 @@
 
 本プロジェクトの主な変更点を記録します。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、[セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 
+## [0.2.3] - 2026-06-14
+
+### Changed
+- 性能改善（結果不変） (#3)。
+  - read-only セッションで `Storage.rows()` の結果をクエリ単位でキャッシュし、複数ルールが同一ウィンドウを共有（テーブルの重複スキャン解消）。
+  - 観測品質の self_cpu 平均/最大を全行ロードから SQL 集計に変更。
+  - cgroup `last_seen` の UPDATE をユニット毎 60 秒に間引き（記録時の定常書き込みを削減）。
+
 ## [0.2.2] - 2026-06-14
 
 ### Changed
