@@ -37,5 +37,13 @@ Thumbs.db
 *.swp
 *.swo
 
-# Claude Code (local-only settings)
-.claude/settings.local.json
+# AI assistant configs (local-only; not tracked in this repo)
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.windsurf/
+.agent/
+.agents/
