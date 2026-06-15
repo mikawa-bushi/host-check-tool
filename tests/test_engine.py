@@ -14,6 +14,7 @@ Tests use the synthetic DB builder from ``tests/synth.py`` and verify:
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -628,4 +629,96 @@ class TestProposal:
 
         for header in ("[検出]", "[根拠]", "[暫定対処]", "[恒久対処]", "[影響予測]"):
             assert header in proposal, f"Missing section header: {header!r}"
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# extra_rules wiring (issue #1 §1-2)
+# ---------------------------------------------------------------------------
+
+
+class TestExtraRules:
+    """``config.rules.extra_rules`` import paths must actually be loaded."""
+
+    def test_extra_rule_module_is_loaded_and_runs(self, tmp_path, monkeypatch):
+        mod = tmp_path / "procdiag_extra_rule_under_test.py"
+        mod.write_text(
+            "from procdiag.core import (\n"
+            "    Confidence, Finding, Rule, Severity, register,\n"
+            ")\n"
+            "\n"
+            "@register\n"
+            "class _ExtraRuleUnderTest(Rule):\n"
+            "    rule_id = 'TEST-EXTRA-01'\n"
+            "    category = 'test'\n"
+            "    title = 'extra rule under test'\n"
+            "    min_observation_hours = 0.0\n"
+            "    def evaluate(self, store, window):\n"
+            "        return [Finding(\n"
+            "            rule_id=self.rule_id, severity=Severity.INFO,\n"
+            "            subject='x', summary='extra rule ran', evidence={},\n"
+            "            detected_at=(window.start_ts, window.end_ts),\n"
+            "            confidence=Confidence.LOW,\n"
+            "        )]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        from procdiag.core.rule import _REGISTRY
+
+        try:
+            store = make_db(tmp_path)
+            cfg = ProcdiagConfig(
+                rules=RulesConfig(
+                    extra_rules=["procdiag_extra_rule_under_test"],
+                    min_observation_hours=0.0,
+                )
+            )
+            engine = Engine(cfg, verbose=True)
+            diag = engine.run(store, only=["TEST-EXTRA-01"])
+            assert any(f.rule_id == "TEST-EXTRA-01" for f in diag.findings)
+            store.close()
+        finally:
+            # Keep the global registry AND the module cache clean so re-running
+            # this test in the same process re-imports and re-registers the rule.
+            _REGISTRY.pop("TEST-EXTRA-01", None)
+            monkeypatch.delitem(
+                sys.modules, "procdiag_extra_rule_under_test", raising=False
+            )
+
+    def test_invalid_extra_rule_path_does_not_crash(self, tmp_path):
+        store = make_db(tmp_path)
+        cfg = ProcdiagConfig(
+            rules=RulesConfig(
+                extra_rules=["nonexistent_pkg.totally.missing"],
+                min_observation_hours=0.0,
+            )
+        )
+        engine = Engine(cfg, verbose=True)
+        diag = engine.run(store)  # must not raise
+        assert any("nonexistent_pkg.totally.missing" in r for r in diag.reasoning)
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# gap_seconds aggregation (issue #1 §4-2)
+# ---------------------------------------------------------------------------
+
+
+class TestGapSecondsAggregation:
+    """ObservationQuality.gap_seconds must be the sum of delay seconds."""
+
+    def test_gap_seconds_sums_delays_not_event_count(self, tmp_path):
+        store = make_db(tmp_path)
+        # recorder._on_gap writes detail as "<delay>s ジョブ<name>".
+        store.record_event("gap", "12.5s ジョブt2b_process")
+        store.record_event("gap", "7.0s ジョブt2a_cgroup")
+        store.record_event("gap", "30.0s ジョブt1_system")
+
+        engine = Engine(_cfg(min_obs_hours=0.0))
+        diag = engine.run(store)
+
+        # If the code counted events instead of summing seconds this would be
+        # 3.0.  Correct behaviour: 12.5 + 7.0 + 30.0 = 49.5 seconds.
+        assert diag.quality.gap_seconds == pytest.approx(49.5)
         store.close()

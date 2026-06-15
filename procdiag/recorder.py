@@ -500,6 +500,8 @@ class Recorder:
 
     def _on_gap(self, delay: float, job_name: str) -> None:
         """Record a gap event when a job fires more than 3× its interval late."""
+        # The leading "<delay>s" token is parsed back by
+        # engine._parse_gap_delay_seconds to compute ObservationQuality.gap_seconds.
         detail = f"{delay:.1f}s ジョブ{job_name}"
         self._storage.record_event("gap", detail)
 

@@ -98,7 +98,7 @@ class ObservationQuality:
     """
 
     span_hours: float = 0.0
-    gap_seconds: float = 0.0
+    gap_seconds: float = 0.0  # total recorder gap (job-late) delay in seconds
     missing_io_pct: float = 0.0  # fraction of proc rows where io_counters was NULL
     self_cpu_avg: float = 0.0
     self_cpu_max: float = 0.0

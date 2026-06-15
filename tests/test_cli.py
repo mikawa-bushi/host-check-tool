@@ -660,3 +660,45 @@ class TestExportRows:
         with Storage(db_with_rollup, read_only=True) as store:
             with pytest.raises(ValueError, match="不明なフォーマット"):
                 export_rows(store, table="sys_rollup_1m", fmt="xml", out=buf)
+
+
+# ---------------------------------------------------------------------------
+# check --format html — charts must render (issue #1 §1-1)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckHtmlCharts:
+    """`check --format html` must build charts from the live DB connection.
+
+    Regression guard for the bug where ``build_charts(store)`` ran after the
+    ``with Storage(...)`` block had already closed the connection, so every
+    chart silently rendered as 'データなし'.
+    """
+
+    def test_check_html_renders_chart_data(self, runner, db_with_data):
+        result = runner.invoke(
+            cli, ["check", "--db", str(db_with_data), "--format", "html"]
+        )
+        assert result.exit_code == 0, result.output
+        html = result.output
+        # A populated series renders an SVG <polyline>; an empty one renders
+        # the 'データなし: <label>' placeholder.  The bug produced the latter.
+        assert "<polyline" in html
+        assert "データなし: CPU使用率" not in html
+
+    def test_check_html_matches_report_charts(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "report.html"
+        res_report = runner.invoke(
+            cli, ["report", "--db", str(db_with_data), "--out", str(out)]
+        )
+        assert res_report.exit_code == 0, res_report.output
+        report_html = out.read_text(encoding="utf-8")
+
+        res_check = runner.invoke(
+            cli, ["check", "--db", str(db_with_data), "--format", "html"]
+        )
+        assert res_check.exit_code == 0, res_check.output
+
+        # Both paths must draw charts; previously only `report` did.
+        assert "<polyline" in report_html
+        assert "<polyline" in res_check.output

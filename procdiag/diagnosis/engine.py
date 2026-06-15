@@ -20,6 +20,7 @@ differences from the netdiag engine:
 
 from __future__ import annotations
 
+import re
 import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -37,6 +38,7 @@ from ..core import (
     all_rules,
 )
 from ..config import ProcdiagConfig
+from ..plugins import load_extra_rules
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -78,6 +80,24 @@ def _make_jinja_env() -> Environment:
         autoescape=False,
         keep_trailing_newline=True,
     )
+
+
+# Leading "<delay>s" token in a gap event's detail (see recorder._on_gap).
+_GAP_DELAY_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)s")
+
+
+def _parse_gap_delay_seconds(detail: Optional[str]) -> float:
+    """Extract the leading ``<delay>s`` seconds value from a gap event detail.
+
+    ``recorder._on_gap`` formats the detail as ``"<delay>s ジョブ<name>"``.
+    Returns ``0.0`` when *detail* is missing or does not start with that token,
+    so an unparseable row contributes nothing to the gap total rather than
+    raising.
+    """
+    if not detail:
+        return 0.0
+    m = _GAP_DELAY_RE.match(detail)
+    return float(m.group(1)) if m else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +166,9 @@ class Engine:
 
         Steps:
 
+        0. Load ``config.rules.extra_rules`` modules so their ``@register``
+           decorators fire before rule selection (load failures are recorded
+           in ``reasoning`` and never abort the diagnosis).
         1. Determine the observation window from the DB.
         2. Run each rule (with try/except firewall). A rule is skipped while
            the window is shorter than its minimum observation time: rules that
@@ -159,6 +182,10 @@ class Engine:
         6. Build ObservationQuality from DB statistics.
         """
         reasoning: list[str] = []
+
+        # --- Step 0: load user-supplied extra rule modules ---
+        # Their @register decorators must fire before select()/all_rules().
+        self._load_extra_rules(reasoning)
 
         # --- Step 1: determine window ---
         window = self._determine_window(store, reasoning)
@@ -240,6 +267,21 @@ class Engine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _load_extra_rules(self, reasoning: list[str]) -> None:
+        """Import ``config.rules.extra_rules`` so their @register decorators fire.
+
+        Load failures are recorded in *reasoning* (surfaced by ``--verbose`` and
+        always present in the JSON report) and never abort the diagnosis.
+        """
+        extra = self.config.rules.extra_rules
+        if not extra:
+            return
+        for name, ok, msg in load_extra_rules(extra):
+            if not ok:
+                reasoning.append(f"追加ルール {name} の読み込みに失敗しました: {msg}")
+            elif self.verbose:
+                reasoning.append(f"追加ルール {name} を読み込みました")
+
     def _determine_window(self, store: "Storage", reasoning: list[str]) -> Window:
         """Derive the observation window from the DB's earliest/latest data."""
         # Try sys_samples first (raw), then fall back to rollup.
@@ -285,12 +327,13 @@ class Engine:
         """Assemble ObservationQuality from DB statistics."""
         span_hours = window.span_hours
 
-        # Gap total from ops_events.
+        # Gap total from ops_events: sum the delay seconds recorded in each
+        # gap event's detail ("<delay>s ジョブ<name>"), not the event count.
         gap_rows = store.rows(
             "ops_events",
             where="kind = 'gap'",
         )
-        gap_seconds = float(len(gap_rows))  # each gap row represents one gap event
+        gap_seconds = sum(_parse_gap_delay_seconds(r["detail"]) for r in gap_rows)
 
         # Self CPU from sys_samples.
         sys_rows = store.rows(

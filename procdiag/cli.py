@@ -214,14 +214,19 @@ def check(
     only_list = [s.strip() for s in only.split(",")] if only else None
     skip_list = [s.strip() for s in skip.split(",")] if skip else None
 
+    charts = None
     with Storage(resolved_db, read_only=True) as store:
         engine = Engine(cfg, verbose=verbose)
         diag = engine.run(store, only=only_list, skip=skip_list)
+        if fmt == "html":
+            # Build charts while the DB connection is still open — doing this
+            # after the `with` block would read a closed connection and yield
+            # empty charts (the report command builds them in-block too).
+            charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
 
     if fmt == "json":
         text = report_mod.render_json(diag)
     elif fmt == "html":
-        charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
         text = report_mod.render_html(
             diag, charts, hostname_label=cfg.report.hostname_label
         )
