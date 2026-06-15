@@ -42,7 +42,8 @@ def parse_duration(s: str) -> float:
 def humanize_bytes(n: Optional[int]) -> str:
     """Format a byte count as a human-readable string.
 
-    Returns ``"—"`` for ``None``.  Uses SI-style suffixes (KB = 1000 bytes).
+    Returns ``"—"`` for ``None``.  Uses a binary (1024) base so the numbers
+    line up with ``df -h`` / ``free -h`` (which label powers of 1024 as K/M/G).
 
     Examples::
 
@@ -59,10 +60,10 @@ def humanize_bytes(n: Optional[int]) -> str:
     else:
         sign = ""
     for unit, threshold in [
-        ("TB", 1_000_000_000_000),
-        ("GB", 1_000_000_000),
-        ("MB", 1_000_000),
-        ("KB", 1_000),
+        ("TB", 1024**4),
+        ("GB", 1024**3),
+        ("MB", 1024**2),
+        ("KB", 1024),
     ]:
         if n >= threshold:
             return f"{sign}{n / threshold:.1f}{unit}"

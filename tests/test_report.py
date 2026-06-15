@@ -570,3 +570,26 @@ class TestBuildChartsRobustness:
             # A non-DB error must propagate, not be silently swallowed.
             with pytest.raises(ValueError):
                 build_charts(ro)
+
+
+# ---------------------------------------------------------------------------
+# render_html hostname resolution (issue #6 §5-1)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderHtmlHostname:
+    def test_meta_hostname_used_in_title(self) -> None:
+        html = render_html(_healthy_diag(), meta_hostname="factory-pc-01")
+        assert "factory-pc-01" in html
+
+    def test_hostname_label_takes_priority(self) -> None:
+        html = render_html(
+            _healthy_diag(),
+            hostname_label="L3ライン制御PC",
+            meta_hostname="factory-pc-01",
+        )
+        assert "L3ライン制御PC" in html
+
+    def test_default_title_when_neither(self) -> None:
+        html = render_html(_healthy_diag())
+        assert "procdiag レポート" in html

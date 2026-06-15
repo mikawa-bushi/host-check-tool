@@ -9,7 +9,7 @@ factory environments.
 Public API (called by cli.py / T08):
     render_terminal(diag, *, color=True, verbose=False) -> str
     render_json(diag) -> str
-    render_html(diag, charts=None, *, hostname_label=None) -> str
+    render_html(diag, charts=None, *, hostname_label=None, meta_hostname=None) -> str
     build_charts(store, *, since=None) -> ChartData
 
 ChartData is a dataclass whose fields hold (ts, value) series for the main
@@ -547,6 +547,7 @@ def render_html(
     charts: "ChartData | None" = None,
     *,
     hostname_label: str | None = None,
+    meta_hostname: str | None = None,
 ) -> str:
     """Render a self-contained HTML report.
 
@@ -564,8 +565,7 @@ def render_html(
     def esc(s: object) -> str:
         return _html_lib.escape(str(s))
 
-    # Determine title
-    meta_hostname: str | None = None
+    # Determine title: explicit label > recorded meta hostname > default.
     title = hostname_label or meta_hostname or "procdiag レポート"
 
     # --- ① サマリ ---

@@ -271,7 +271,8 @@ def test_parse_duration_invalid(bad):
 
 
 def test_humanize_bytes_mb():
-    assert humanize_bytes(1_234_567) == "1.2MB"
+    # 1.5e6 / 1024**2 = 1.43 (binary) vs 1.5 (SI) — discriminates the base.
+    assert humanize_bytes(1_500_000) == "1.4MB"
 
 
 def test_humanize_bytes_zero():
@@ -283,7 +284,14 @@ def test_humanize_bytes_none():
 
 
 def test_humanize_bytes_gb():
-    assert humanize_bytes(2_500_000_000) == "2.5GB"
+    # Binary (1024) base to match df -h / free -h: 2.5e9 / 1024**3 ≈ 2.33.
+    assert humanize_bytes(2_500_000_000) == "2.3GB"
+
+
+def test_humanize_bytes_binary_base():
+    assert humanize_bytes(1024**3) == "1.0GB"
+    assert humanize_bytes(1024**2) == "1.0MB"
+    assert humanize_bytes(1024) == "1.0KB"
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +356,21 @@ def test_normalize_cmdline_empty():
 def test_normalize_cmdline_hash_length():
     h, _ = normalize_cmdline(["some", "command"])
     assert len(h) == 12
+
+
+# ---------------------------------------------------------------------------
+# diagnosis.memory._is_python_process (issue #6 §5-2)
+# ---------------------------------------------------------------------------
+
+
+def test_is_python_process_matches_only_python():
+    from procdiag.diagnosis.memory import _is_python_process
+
+    assert _is_python_process("python")
+    assert _is_python_process("python3")
+    assert _is_python_process("Python3.11")
+    # The old "py" substring heuristic wrongly matched these:
+    assert not _is_python_process("copy")
+    assert not _is_python_process("scapy")
+    assert not _is_python_process("happy")
+    assert not _is_python_process("pypy")

@@ -181,6 +181,11 @@ def record(
 )
 @click.option("--verbose", is_flag=True, help="推論過程を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
+@click.option(
+    "--exit-zero-on-info",
+    is_flag=True,
+    help="info のみの Finding のとき終了コード 0 を返す (既定は 2)。CI 向け。",
+)
 def check(
     db_path: Optional[str],
     config_path: Optional[str],
@@ -190,6 +195,7 @@ def check(
     output: Optional[str],
     verbose: bool,
     no_color: bool,
+    exit_zero_on_info: bool,
 ) -> None:
     """記録済みデータに診断ルールを実行し、改善提案を出力します。
 
@@ -215,6 +221,7 @@ def check(
     skip_list = [s.strip() for s in skip.split(",")] if skip else None
 
     charts = None
+    meta_hostname: Optional[str] = None
     with Storage(resolved_db, read_only=True) as store:
         engine = Engine(cfg, verbose=verbose)
         diag = engine.run(store, only=only_list, skip=skip_list)
@@ -223,12 +230,18 @@ def check(
             # after the `with` block would read a closed connection and yield
             # empty charts (the report command builds them in-block too).
             charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
+            # Also read while the connection is open; only the html renderer
+            # uses it (stays None for json/text, which never call render_html).
+            meta_hostname = store.meta().get("hostname")
 
     if fmt == "json":
         text = report_mod.render_json(diag)
     elif fmt == "html":
         text = report_mod.render_html(
-            diag, charts, hostname_label=cfg.report.hostname_label
+            diag,
+            charts,
+            hostname_label=cfg.report.hostname_label,
+            meta_hostname=meta_hostname,
         )
     else:
         color = sys.stdout.isatty() and not no_color
@@ -240,13 +253,16 @@ def check(
     else:
         click.echo(text)
 
-    # Exit codes: 0=healthy, 1=critical/warning found, 2=info only.
-    if diag.healthy:
-        sys.exit(0)
+    # Exit codes: 0=healthy / 1=critical or warning / 2=info-only findings.
+    # --exit-zero-on-info collapses the info-only case to 0 for CI pipelines.
     has_warn_or_critical = any(
         f.severity.value in ("warning", "critical") for f in diag.findings
     )
-    sys.exit(1 if has_warn_or_critical else 2)
+    if has_warn_or_critical:
+        sys.exit(1)
+    if diag.findings and not exit_zero_on_info:
+        sys.exit(2)
+    sys.exit(0)
 
 
 # Register ``advise`` as a hidden alias for ``check`` (design doc §3).
@@ -313,9 +329,13 @@ def report(
         engine = Engine(cfg)
         diag = engine.run(store)
         charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
+        meta_hostname = store.meta().get("hostname")
 
     html_text = report_mod.render_html(
-        diag, charts, hostname_label=cfg.report.hostname_label
+        diag,
+        charts,
+        hostname_label=cfg.report.hostname_label,
+        meta_hostname=meta_hostname,
     )
     Path(html_out).write_text(html_text, encoding="utf-8")
     click.echo(f"HTML レポートを書き出しました: {html_out}")

@@ -53,6 +53,16 @@ _MEM_LEAK_SLOPE_CRITICAL_MB_H: float = 50.0
 _MEM_LEAK_MIN_R2: float = 0.9
 
 
+def _is_python_process(name: str) -> bool:
+    """Return True when *name* looks like a CPython interpreter.
+
+    Matches ``python`` / ``python3`` / ``python3.11`` etc. but not unrelated
+    names that merely contain ``py`` (``copy``, ``scapy``, ``pypy``), which the
+    old substring heuristic wrongly flagged for a py-spy suggestion.
+    """
+    return name.lower().startswith("python")
+
+
 @register
 class MemLeakRule(Rule):
     """Detect per-process memory leaks via linear regression on RSS rollups.
@@ -155,7 +165,7 @@ class MemLeakRule(Rule):
                         )
 
             # Detect if the process is Python-based.
-            is_python = "python" in process_name.lower() or "py" in process_name.lower()
+            is_python = _is_python_process(process_name)
 
             evidence = {
                 "proc_id": proc_id,

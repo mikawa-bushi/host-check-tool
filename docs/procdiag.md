@@ -112,6 +112,8 @@ procdiag report --out report.html --json report.json
 | `1` | critical / warning の Finding あり |
 | `2` | info レベルの Finding のみ |
 
+CI で info を失敗扱いにしたくない場合は `procdiag check --exit-zero-on-info` を使うと、info のみのときに `0` を返す（`1` / `0` の判定は変わらない）。
+
 ---
 
 ## セキュリティ運用上の注意（設定ファイル）

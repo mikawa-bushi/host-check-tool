@@ -2,6 +2,19 @@
 
 本プロジェクトの主な変更点を記録します。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、[セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 
+## [0.3.0] - 2026-06-14
+
+### Changed
+- **終了コードの挙動変更** (#6): `procdiag check` が info レベルのみの Finding のとき、終了コード **2** を返すようになった（従来は誤って 0 を返しており、ドキュメント記載の「2 = info のみ」が到達不能だった）。CI で従来どおり 0 を期待する場合は新オプション `--exit-zero-on-info` を付ける。warning/critical は引き続き 1、問題なしは 0。
+- `humanize_bytes`（`status` 等のサイズ表示）を SI(1000) から **binary(1024)** 基数に変更し、`df -h` / `free -h` と数値が一致するようにした (#6)。
+
+### Added
+- `procdiag check --exit-zero-on-info`: info のみのとき終了コード 0 を返す CI 向けオプション (#6)。
+
+### Fixed
+- HTML レポートのタイトルが、`report.hostname_label` 未設定時に記録済みの `meta.hostname` を使うようになった（従来は常に既定タイトル）。複数ホストのレポートを区別しやすくなる (#6)。
+- メモリリーク提案の「Python プロセス」判定を厳格化（`startswith("python")`）。`copy` / `scapy` / `pypy` などへの誤マッチで py-spy 提案が出る問題を解消 (#6)。
+
 ## [0.2.4] - 2026-06-14
 
 ### Fixed

@@ -702,3 +702,42 @@ class TestCheckHtmlCharts:
         # Both paths must draw charts; previously only `report` did.
         assert "<polyline" in report_html
         assert "<polyline" in res_check.output
+
+
+# ---------------------------------------------------------------------------
+# check --exit-zero-on-info (issue #6 §5-3)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckExitZeroOnInfo:
+    def _info_only_db(self, tmp_path) -> Path:
+        from synth import add_dir_series, add_sys_baseline
+
+        _mb = 1024 * 1024
+        _gb = 1024 * _mb
+        db = tmp_path / "info.db"
+        with Storage(db) as store:
+            add_sys_baseline(store, hours=72.0)
+            # 150 MB/day is in the INFO band (100–200 MB/day) for DISK-GROWTH-01.
+            add_dir_series(
+                store,
+                "/var/log/grow",
+                start=10 * _gb,
+                daily_growth=150 * _mb,
+                days=3.0,
+            )
+        return db
+
+    def test_info_only_exits_2_by_default(self, runner, tmp_path):
+        db = self._info_only_db(tmp_path)
+        result = runner.invoke(cli, ["check", "--db", str(db)])
+        assert result.exit_code == 2, result.output
+
+    def test_exit_zero_on_info_flag_returns_0(self, runner, tmp_path):
+        db = self._info_only_db(tmp_path)
+        result = runner.invoke(cli, ["check", "--db", str(db), "--exit-zero-on-info"])
+        assert result.exit_code == 0, result.output
+
+    def test_flag_shown_in_help(self, runner):
+        result = runner.invoke(cli, ["check", "--help"])
+        assert "--exit-zero-on-info" in result.output
