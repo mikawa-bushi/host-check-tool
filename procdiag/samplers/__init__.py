@@ -13,10 +13,10 @@ wired up directly by the :class:`~procdiag.recorder.Recorder`.
 """
 
 from . import (  # noqa: F401  (imported for @register_sampler side-effects)
-    system,
     cgroup,
-    process,
     disk,
+    process,
+    system,
 )
 
 __all__ = ["system", "cgroup", "process", "disk"]

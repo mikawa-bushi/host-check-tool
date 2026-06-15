@@ -17,12 +17,13 @@ from __future__ import annotations
 # Import order does not matter (rules are independent), but all four must be
 # listed so that leak.py (currently an empty stub) is also imported once
 # Phase 4 adds rules to it.
-
-from . import cpu  # noqa: F401 — registers CPU-PERIODIC-01, CPU-SINGLECORE-01
-from . import crash  # noqa: F401 — registers OOM-KILL-01
-from . import io_disk  # noqa: F401 — registers DISK-FULL-01
-from . import leak  # noqa: F401 — stub; will register FD/THREAD/ZOMBIE rules
-from . import memory  # noqa: F401 — registers MEM-LEAK-01
+from . import (
+    cpu,  # noqa: F401 — registers CPU-PERIODIC-01, CPU-SINGLECORE-01
+    crash,  # noqa: F401 — registers OOM-KILL-01
+    io_disk,  # noqa: F401 — registers DISK-FULL-01
+    leak,  # noqa: F401 — stub; will register FD/THREAD/ZOMBIE rules
+    memory,  # noqa: F401 — registers MEM-LEAK-01
+)
 
 # -- public re-exports -------------------------------------------------------
 from .engine import Engine, fold

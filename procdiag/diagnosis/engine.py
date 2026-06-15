@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 
 from jinja2 import Environment, FileSystemLoader, UndefinedError
 
+from ..config import ProcdiagConfig
 from ..core import (
     Confidence,
     Diagnosis,
@@ -37,7 +38,6 @@ from ..core import (
     Window,
     all_rules,
 )
-from ..config import ProcdiagConfig
 from ..plugins import load_extra_rules
 
 if TYPE_CHECKING:

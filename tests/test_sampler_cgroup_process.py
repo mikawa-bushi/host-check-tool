@@ -21,7 +21,7 @@ import os
 import time
 from pathlib import Path
 from typing import Callable
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import psutil
 import pytest

@@ -20,7 +20,7 @@ import pytest
 
 from procdiag.config import TriggerConfig
 from procdiag.core.sampler import SystemSnapshot
-from procdiag.samplers.trigger import SpikeDecision, SpikeTrigger, _STORM_WINDOW_SEC
+from procdiag.samplers.trigger import _STORM_WINDOW_SEC, SpikeDecision, SpikeTrigger
 
 # ---------------------------------------------------------------------------
 # Helpers

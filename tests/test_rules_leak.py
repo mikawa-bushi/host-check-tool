@@ -11,17 +11,16 @@ Uses the synthetic DB builder from ``tests/synth.py`` and verifies:
 from __future__ import annotations
 
 import pytest
-
-from procdiag.config import ProcdiagConfig, RulesConfig
-from procdiag.core import Confidence, Severity
-from procdiag.diagnosis import Engine
-
 from synth import (
     add_proc_series,
     add_sys_baseline,
     add_zombie_series,
     make_db,
 )
+
+from procdiag.config import ProcdiagConfig, RulesConfig
+from procdiag.core import Confidence, Severity
+from procdiag.diagnosis import Engine
 
 _MB = 1024 * 1024
 

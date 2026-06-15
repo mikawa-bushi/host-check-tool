@@ -21,7 +21,7 @@ import csv
 import json
 from typing import IO, Any
 
-from .storage import Storage, TABLE_COLUMNS
+from .storage import TABLE_COLUMNS, Storage
 
 
 def export_rows(

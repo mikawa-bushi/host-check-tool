@@ -21,12 +21,6 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
-
-from procdiag.config import ProcdiagConfig, RulesConfig
-from procdiag.core import Confidence, Finding, Rule, Severity, Window, register
-from procdiag.diagnosis import Engine
-from procdiag.diagnosis.engine import fold
-
 from synth import (
     add_disk_series,
     add_proc_series,
@@ -34,6 +28,11 @@ from synth import (
     add_sys_baseline,
     make_db,
 )
+
+from procdiag.config import ProcdiagConfig, RulesConfig
+from procdiag.core import Confidence, Finding, Rule, Severity, Window, register
+from procdiag.diagnosis import Engine
+from procdiag.diagnosis.engine import fold
 
 if TYPE_CHECKING:
     from procdiag.storage import Storage

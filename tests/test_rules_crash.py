@@ -19,13 +19,12 @@ import time
 from unittest.mock import patch
 
 import pytest
+from synth import add_oom_scenario, make_db
 
 from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Confidence, Severity, Window
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.crash import OomKillRule, _read_oom_journal
-
-from synth import add_oom_scenario, make_db
 
 _MB = 1024 * 1024
 _GB = 1024**3

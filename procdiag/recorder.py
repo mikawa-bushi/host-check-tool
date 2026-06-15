@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, Optional
 from .config import ProcdiagConfig
 from .core.sampler import RunContext, Sampler
 from .scheduler import TierScheduler
-from .storage import Storage, TABLE_COLUMNS
+from .storage import TABLE_COLUMNS, Storage
 
 try:
     from . import __version__ as _VERSION
@@ -144,10 +144,10 @@ class Recorder:
         bound to the live Storage instance so they can resolve unit/process IDs
         without holding a reference to the storage object themselves.
         """
-        from .samplers.system import SystemSampler  # type: ignore[import]
         from .samplers.cgroup import CgroupSampler  # type: ignore[import]
-        from .samplers.process import ProcessSampler  # type: ignore[import]
         from .samplers.disk import DiskSampler  # type: ignore[import]
+        from .samplers.process import ProcessSampler  # type: ignore[import]
+        from .samplers.system import SystemSampler  # type: ignore[import]
 
         return {
             "system": SystemSampler(),

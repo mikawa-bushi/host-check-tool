@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from procdiag.config import ProcdiagConfig
 from procdiag.core.result import (
     Confidence,
     Diagnosis,
@@ -12,12 +13,12 @@ from procdiag.core.result import (
     Severity,
     Window,
 )
-from procdiag.core.rule import Rule, _REGISTRY, all_rules, get_rule, register
+from procdiag.core.rule import _REGISTRY, Rule, all_rules, get_rule, register
 from procdiag.core.sampler import (
+    _SAMPLER_REGISTRY,
     RunContext,
     SampleBatch,
     Sampler,
-    _SAMPLER_REGISTRY,
     all_samplers,
     get_sampler,
     register_sampler,
@@ -28,7 +29,6 @@ from procdiag.core.util import (
     normalize_cmdline,
     parse_duration,
 )
-from procdiag.config import ProcdiagConfig
 
 # ---------------------------------------------------------------------------
 # Severity / Finding.to_dict

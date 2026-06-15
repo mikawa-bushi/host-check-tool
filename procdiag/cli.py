@@ -125,10 +125,9 @@ def record(
     duration: Optional[str], config_path: Optional[str], db_path: Optional[str]
 ) -> None:
     """CPU・メモリ・ディスクを記録します (フォアグラウンド)。Ctrl-C で安全に停止します。"""
-    from .recorder import Recorder  # T05 — deferred
-
     from .config import load_config
     from .core.util import parse_duration
+    from .recorder import Recorder  # T05 — deferred
 
     cfg = load_config(Path(config_path) if config_path else None)
     if db_path:
@@ -201,10 +200,9 @@ def check(
 
     終了コード: 0=問題なし / 1=critical・warning あり / 2=info のみ
     """
-    from .diagnosis.engine import Engine  # T06 — deferred
     from . import report as report_mod  # T07 — deferred
-
     from .config import load_config
+    from .diagnosis.engine import Engine  # T06 — deferred
     from .storage import Storage
 
     cfg = load_config(Path(config_path) if config_path else None)
@@ -309,10 +307,9 @@ def report(
     json_out: Optional[str],
 ) -> None:
     """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
-    from .diagnosis.engine import Engine  # T06 — deferred
     from . import report as report_mod  # T07 — deferred
-
     from .config import load_config
+    from .diagnosis.engine import Engine  # T06 — deferred
     from .storage import Storage
 
     cfg = load_config(Path(config_path) if config_path else None)
@@ -365,8 +362,8 @@ def report(
 def status(db_path: Optional[str], fmt: str) -> None:
     """記録済み DB の概況 (期間、サンプル数、自己負荷) を表示します。"""
     from .config import load_config
-    from .storage import Storage
     from .core.util import humanize_bytes, humanize_duration
+    from .storage import Storage
 
     cfg = load_config()
     resolved_db = db_path or cfg.db_path
@@ -812,7 +809,7 @@ def service_install(
 
     systemctl は実行しません。有効化コマンドを画面に表示します。
     """
-    from .service import install_unit, UNIT_NAME
+    from .service import UNIT_NAME, install_unit
 
     unit_path = install_unit(
         config_path=config_path,

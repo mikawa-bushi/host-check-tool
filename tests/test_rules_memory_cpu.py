@@ -11,11 +11,6 @@ from __future__ import annotations
 import time
 
 import pytest
-
-from procdiag.config import ProcdiagConfig, RulesConfig
-from procdiag.core import Confidence, Severity, Window
-from procdiag.diagnosis import Engine
-
 from synth import (
     add_cpu_saturation_samples,
     add_mem_pressure_days,
@@ -23,6 +18,10 @@ from synth import (
     add_sys_baseline,
     make_db,
 )
+
+from procdiag.config import ProcdiagConfig, RulesConfig
+from procdiag.core import Confidence, Severity, Window
+from procdiag.diagnosis import Engine
 
 _MB = 1024 * 1024
 _GB = 1024**3
