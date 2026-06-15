@@ -1,0 +1,65 @@
+# push 前のローカル・セキュリティ/品質ゲート（コピー用バンドル）。
+#
+#   導入:     pre-commit install      # commit と pre-push の両フックを設定
+#   全体実行: pre-commit run --all-files
+#
+# 注意: ローカルフックは `git commit/push --no-verify` で回避できます。確実な担保が
+#       必要なら、同じ gitleaks を GitHub Actions の必須チェックにする「CI バック
+#       ストップ」を併用してください。
+#
+# black/ruff の rev は導入先リポジトリの CI バージョンに合わせて調整してください。
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  # --- 秘密情報スキャン（PyPI/AWS/GCP トークン・GitHub PAT・秘密鍵 等を検出） ---
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  # --- 汎用の安全フック（いずれも検査のみでファイルは書き換えない） ---
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key # 秘密鍵の混入を検出
+      - id: check-added-large-files # 巨大ファイル（鍵束・DB ダンプ等）の誤コミット防止
+        args: ["--maxkb=2000"]
+      - id: check-merge-conflict # コンフリクトマーカーの残骸を検出
+
+  # --- フォーマッタ / リンタ（導入先の CI と同一バージョンに合わせる） ---
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.5.1 # このリポジトリの CI/.venv が使う black に一致
+    hooks:
+      - id: black
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.17
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+
+  # --- author/committer メールの許可リスト（社用/別 identity の混入防止） ---
+  - repo: local
+    hooks:
+      - id: check-commit-identity
+        name: commit author/committer email allowlist
+        entry: python3 scripts/check_commit_identity.py
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
+
+      # --- AI エージェントツールの痕跡検出（.claude/.codex/.cursor 等のパス） ---
+      - id: check-ai-traces
+        name: scan staged files for AI-agent tool traces
+        entry: python3 scripts/check_ai_traces.py
+        language: system
+        pass_filenames: true
+      - id: check-ai-traces-commits
+        name: scan outgoing commits for AI-agent tool traces
+        entry: python3 scripts/check_ai_traces.py --pre-push
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true

@@ -36,6 +36,7 @@ procdiag = "procdiag.cli:main"
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"
 black = "^26.0"
+pre-commit = "^4.6.0"
 
 [build-system]
 requires = ["poetry-core"]
@@ -44,6 +45,15 @@ build-backend = "poetry.core.masonry.api"
 [tool.black]
 line-length = 88
 target-version = ["py310"]
+
+# ruff は import 整列(I)のみに限定。select 未指定だと既定規則が広く適用され、
+# 既存コードで F821 等が想定外に多発するため、リポジトリ方針(black中心)に合わせ最小化。
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["I"]
 
 [tool.pytest.ini_options]
 markers = [
