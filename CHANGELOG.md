@@ -2,6 +2,16 @@
 
 本プロジェクトの主な変更点を記録します。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、[セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 
+## [0.2.2] - 2026-06-14
+
+### Changed
+- 内部リファクタ（挙動不変）で保守性を改善 (#4)。
+  - CPU-SINGLECORE-01 / CPU-SATURATION-01 の連続飽和ラン検出を `trend.find_sustained_episodes` に共通化。
+  - MEM-LEAK / FD-LEAK / THREAD-LEAK の確信度ラダーを `trend.confidence_from_fit` に共通化。
+  - `proc_registry` / `cgroup_registry` の名前引きを `Storage.proc_name` / `Storage.cg_unit_path` に統一。
+  - スパイク記録のタプル添字アクセスを `TABLE_COLUMNS` 列名アクセスへ。
+  - 未使用コード（`live_keys`、MEM-LEAK の冗長な `sys_rollup_1m` 読み）を削除。
+
 ## [0.2.1] - 2026-06-13
 
 ### Fixed

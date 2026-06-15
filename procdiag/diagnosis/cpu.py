@@ -33,7 +33,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import detect_periodicity
+from .trend import detect_periodicity, find_sustained_episodes
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -212,56 +212,25 @@ class CpuSinglecoreRule(Rule):
                     if prev is None or cpu_avg < prev:
                         minute_data[bucket]["cpu_avg"] = cpu_avg
 
-        # Walk sorted minute buckets looking for consecutive saturated runs.
-        sorted_buckets = sorted(minute_data.keys())
-
-        saturated_episodes: list[tuple[float, float]] = []  # (start_ts, end_ts)
-        run_start: float | None = None
-        run_end: float | None = None
-        run_len = 0
-        prev_bucket: int | None = None
-
-        for bucket in sorted_buckets:
-            data = minute_data[bucket]
-            core_max = data["core_max"]
-            cpu_avg = data["cpu_avg"]
-            ts = data["ts"]
-
-            # Check if this bucket is consecutive with the previous (within 90s to
-            # tolerate minor jitter in rollup timestamps).
-            is_consecutive = prev_bucket is None or (bucket - prev_bucket) <= 90
-
-            is_saturated = (
-                core_max is not None
-                and cpu_avg is not None
-                and core_max >= self.core_pct_threshold
-                and cpu_avg < self.avg_pct_max
+        # A minute is "saturated" when its worst-case core is pegged while the
+        # overall average stays low.  find_sustained_episodes handles the
+        # consecutive-run detection (90s jitter tolerance, min-length, trailing).
+        samples = [
+            (
+                bucket,
+                minute_data[bucket]["ts"],
+                (
+                    minute_data[bucket]["core_max"] is not None
+                    and minute_data[bucket]["cpu_avg"] is not None
+                    and minute_data[bucket]["core_max"] >= self.core_pct_threshold
+                    and minute_data[bucket]["cpu_avg"] < self.avg_pct_max
+                ),
             )
-
-            if is_saturated and is_consecutive:
-                if run_start is None:
-                    run_start = ts
-                run_end = ts
-                run_len += 1
-            elif is_saturated and not is_consecutive:
-                # Gap in time — close existing run if long enough, start new one.
-                if run_start is not None and run_len >= self.min_consecutive_minutes:
-                    saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
-                run_start = ts
-                run_end = ts
-                run_len = 1
-            else:
-                if run_start is not None and run_len >= self.min_consecutive_minutes:
-                    saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
-                run_start = None
-                run_end = None
-                run_len = 0
-
-            prev_bucket = bucket
-
-        # Don't forget an episode running to the end of the window.
-        if run_start is not None and run_len >= self.min_consecutive_minutes:
-            saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
+            for bucket in sorted(minute_data)
+        ]
+        saturated_episodes = find_sustained_episodes(
+            samples, min_consecutive=self.min_consecutive_minutes
+        )
 
         if not saturated_episodes:
             return []
@@ -292,11 +261,7 @@ class CpuSinglecoreRule(Rule):
             top_process_names: list[str] = []
             has_python = False
             for proc_id in top_procs_ids:
-                # proc_registry has no ts column; use direct SQL to avoid ORDER BY ts.
-                reg = store.conn.execute(
-                    "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-                ).fetchone()
-                name = reg["name"] if reg else f"proc_{proc_id}"
+                name = store.proc_name(proc_id)
                 top_process_names.append(name)
                 if "python" in name.lower() or name.lower() in ("python", "python3"):
                     has_python = True
@@ -429,45 +394,22 @@ class CpuSaturationRule(Rule):
                 if psi is not None and (prev is None or psi > prev):
                     minute_data[bucket]["max_psi"] = psi
 
-        sorted_buckets = sorted(minute_data.keys())
-
-        saturated_episodes: list[tuple[float, float]] = []
-        run_start: float | None = None
-        run_end: float | None = None
-        run_len = 0
-        prev_bucket: int | None = None
-
-        for bucket in sorted_buckets:
-            data = minute_data[bucket]
-            psi = data["max_psi"]
-            ts = data["ts"]
-
-            is_consecutive = prev_bucket is None or (bucket - prev_bucket) <= 90
-            is_saturated = psi is not None and psi > self.psi_threshold
-
-            if is_saturated and is_consecutive:
-                if run_start is None:
-                    run_start = ts
-                run_end = ts
-                run_len += 1
-            elif is_saturated and not is_consecutive:
-                if run_start is not None and run_len >= self.min_consecutive_minutes:
-                    saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
-                run_start = ts
-                run_end = ts
-                run_len = 1
-            else:
-                if run_start is not None and run_len >= self.min_consecutive_minutes:
-                    saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
-                run_start = None
-                run_end = None
-                run_len = 0
-
-            prev_bucket = bucket
-
-        # Flush trailing run.
-        if run_start is not None and run_len >= self.min_consecutive_minutes:
-            saturated_episodes.append((run_start, run_end))  # type: ignore[arg-type]
+        # A minute is "saturated" when its peak psi_cpu_some10 exceeds the
+        # threshold; find_sustained_episodes handles consecutive-run detection.
+        samples = [
+            (
+                bucket,
+                minute_data[bucket]["ts"],
+                (
+                    minute_data[bucket]["max_psi"] is not None
+                    and minute_data[bucket]["max_psi"] > self.psi_threshold
+                ),
+            )
+            for bucket in sorted(minute_data)
+        ]
+        saturated_episodes = find_sustained_episodes(
+            samples, min_consecutive=self.min_consecutive_minutes
+        )
 
         if not saturated_episodes:
             return []

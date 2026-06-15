@@ -332,10 +332,7 @@ class IoBottleneckRule(Rule):
 
             # Resolve names.
             for proc_id in top_proc_ids:
-                name_row = store.conn.execute(
-                    "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-                ).fetchone()
-                name = name_row["name"] if name_row else str(proc_id)
+                name = store.proc_name(proc_id)
                 total_bytes = proc_io[proc_id]
                 if total_bytes > 0:
                     top_writers.append(
@@ -375,10 +372,7 @@ class IoBottleneckRule(Rule):
             ]
 
             for cg_id in top_cg_ids:
-                unit_row = store.conn.execute(
-                    "SELECT unit_path FROM cgroup_registry WHERE cg_id = ?", (cg_id,)
-                ).fetchone()
-                unit_path = unit_row["unit_path"] if unit_row else str(cg_id)
+                unit_path = store.cg_unit_path(cg_id)
                 total_bytes = cg_io[cg_id]
                 if total_bytes > 0:
                     top_cg_writers.append(

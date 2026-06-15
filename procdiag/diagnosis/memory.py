@@ -34,7 +34,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import TrendFit, fit_linear, detect_recurrence
+from .trend import TrendFit, confidence_from_fit, detect_recurrence, fit_linear
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -117,11 +117,7 @@ class MemLeakRule(Rule):
             if slope_mb_h < self.slope_warning_mb_h:
                 continue
 
-            # Look up process name from proc_registry (no time column; direct query).
-            reg = store.conn.execute(
-                "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-            ).fetchone()
-            process_name = reg["name"] if reg else f"proc_{proc_id}"
+            process_name = store.proc_name(proc_id)
 
             # Severity escalation.
             severity = (
@@ -131,39 +127,32 @@ class MemLeakRule(Rule):
             )
 
             # Confidence from R² × observation time (baseline).
-            if fit.r2 >= 0.95 and fit.span_hours >= 12.0:
-                confidence = Confidence.HIGH
-            elif fit.r2 >= 0.90 and fit.span_hours >= self.min_observation_hours:
-                confidence = Confidence.MEDIUM
-            else:
-                confidence = Confidence.LOW
+            confidence = confidence_from_fit(
+                fit, min_observation_hours=self.min_observation_hours
+            )
 
             # Estimate days until OOM (very rough: extrapolate to total mem).
+            # Uses the last known total memory from sys_samples.
             days_to_oom: float | None = None
-            mem_row = store.rows(
-                "sys_rollup_1m", since=window.start_ts, until=window.end_ts
+            sys_last = store.rows(
+                "sys_samples",
+                since=window.start_ts,
+                until=window.end_ts,
             )
-            if mem_row:
-                # Use last known total memory from sys_samples.
-                sys_last = store.rows(
-                    "sys_samples",
-                    since=window.start_ts,
-                    until=window.end_ts,
+            if sys_last:
+                last_sys = sys_last[-1]
+                total_mem = (
+                    last_sys["mem_used"] + last_sys["mem_available"]
+                    if last_sys["mem_available"] is not None
+                    else None
                 )
-                if sys_last:
-                    last_sys = sys_last[-1]
-                    total_mem = (
-                        last_sys["mem_used"] + last_sys["mem_available"]
-                        if last_sys["mem_available"] is not None
-                        else None
-                    )
-                    if total_mem and slope_mb_h > 0:
-                        current_rss = series[-1][1]
-                        remaining_bytes = total_mem - current_rss
-                        if remaining_bytes > 0:
-                            days_to_oom = remaining_bytes / (
-                                _BYTES_PER_MB * slope_mb_h * 24
-                            )
+                if total_mem and slope_mb_h > 0:
+                    current_rss = series[-1][1]
+                    remaining_bytes = total_mem - current_rss
+                    if remaining_bytes > 0:
+                        days_to_oom = remaining_bytes / (
+                            _BYTES_PER_MB * slope_mb_h * 24
+                        )
 
             # Detect if the process is Python-based.
             is_python = "python" in process_name.lower() or "py" in process_name.lower()

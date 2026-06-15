@@ -39,7 +39,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import fit_linear
+from .trend import confidence_from_fit, fit_linear
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -140,19 +140,10 @@ class FdLeakRule(Rule):
             if slope_fd_h < self.slope_warning_fd_h:
                 continue
 
-            # Look up process name from proc_registry.
-            reg = store.conn.execute(
-                "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-            ).fetchone()
-            process_name = reg["name"] if reg else f"proc_{proc_id}"
-
-            # Confidence from R² × observation time.
-            if fit.r2 >= 0.95 and fit.span_hours >= 12.0:
-                confidence = Confidence.HIGH
-            elif fit.r2 >= 0.90 and fit.span_hours >= self.min_observation_hours:
-                confidence = Confidence.MEDIUM
-            else:
-                confidence = Confidence.LOW
+            process_name = store.proc_name(proc_id)
+            confidence = confidence_from_fit(
+                fit, min_observation_hours=self.min_observation_hours
+            )
 
             # Estimate days until soft/hard FD limit is reached.
             current_fds = series[-1][1]
@@ -265,19 +256,10 @@ class ThreadLeakRule(Rule):
             if slope_h < self.slope_warning_h:
                 continue
 
-            # Look up process name from proc_registry.
-            reg = store.conn.execute(
-                "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-            ).fetchone()
-            process_name = reg["name"] if reg else f"proc_{proc_id}"
-
-            # Confidence from R² × observation time.
-            if fit.r2 >= 0.95 and fit.span_hours >= 12.0:
-                confidence = Confidence.HIGH
-            elif fit.r2 >= 0.90 and fit.span_hours >= self.min_observation_hours:
-                confidence = Confidence.MEDIUM
-            else:
-                confidence = Confidence.LOW
+            process_name = store.proc_name(proc_id)
+            confidence = confidence_from_fit(
+                fit, min_observation_hours=self.min_observation_hours
+            )
 
             # Estimate days until a nominal thread-max limit is reached.
             current_threads = series[-1][1]

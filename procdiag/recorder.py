@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, Optional
 from .config import ProcdiagConfig
 from .core.sampler import RunContext, Sampler
 from .scheduler import TierScheduler
-from .storage import Storage
+from .storage import Storage, TABLE_COLUMNS
 
 try:
     from . import __version__ as _VERSION
@@ -262,59 +262,61 @@ class Recorder:
 
     def _top_processes_json(self, proc_batches: list) -> str:
         """Extract top-10 processes by CPU and RSS from proc_samples batches."""
-        rows = []
-        for b in proc_batches:
-            if b.table == "proc_samples":
-                rows.extend(b.rows)
+        cols = TABLE_COLUMNS["proc_samples"]
+        rows = [
+            dict(zip(cols, r))
+            for b in proc_batches
+            if b.table == "proc_samples"
+            for r in b.rows
+        ]
 
-        # proc_samples columns: ts, proc_id, pid, cpu_pct, rss, pss,
-        #                       num_threads, num_fds, io_read_delta, io_write_delta
         by_cpu = sorted(
             rows,
-            key=lambda r: (r[3] if r[3] is not None else 0.0),
+            key=lambda d: d["cpu_pct"] if d["cpu_pct"] is not None else 0.0,
             reverse=True,
         )[:10]
         by_rss = sorted(
             rows,
-            key=lambda r: (r[4] if r[4] is not None else 0),
+            key=lambda d: d["rss"] if d["rss"] is not None else 0,
             reverse=True,
         )[:10]
 
-        def _row_to_dict(r: tuple) -> dict:
+        def _pick(d: dict) -> dict:
             return {
-                "ts": r[0],
-                "proc_id": r[1],
-                "pid": r[2],
-                "cpu_pct": r[3],
-                "rss": r[4],
+                "ts": d["ts"],
+                "proc_id": d["proc_id"],
+                "pid": d["pid"],
+                "cpu_pct": d["cpu_pct"],
+                "rss": d["rss"],
             }
 
         return json.dumps(
             {
-                "by_cpu": [_row_to_dict(r) for r in by_cpu],
-                "by_rss": [_row_to_dict(r) for r in by_rss],
+                "by_cpu": [_pick(d) for d in by_cpu],
+                "by_rss": [_pick(d) for d in by_rss],
             }
         )
 
     def _top_cgroups_json(self, cg_batches: list) -> str:
         """Extract top-5 cgroups by memory from cg_samples batches."""
-        rows = []
-        for b in cg_batches:
-            if b.table == "cg_samples":
-                rows.extend(b.rows)
+        cols = TABLE_COLUMNS["cg_samples"]
+        rows = [
+            dict(zip(cols, r))
+            for b in cg_batches
+            if b.table == "cg_samples"
+            for r in b.rows
+        ]
 
-        # cg_samples columns: ts, cg_id, cpu_usec_delta, mem_current, mem_swap,
-        #                     io_rbytes_delta, io_wbytes_delta, pids
         by_mem = sorted(
             rows,
-            key=lambda r: (r[3] if r[3] is not None else 0),
+            key=lambda d: d["mem_current"] if d["mem_current"] is not None else 0,
             reverse=True,
         )[:5]
 
-        def _row_to_dict(r: tuple) -> dict:
-            return {"ts": r[0], "cg_id": r[1], "mem_current": r[3]}
+        def _pick(d: dict) -> dict:
+            return {"ts": d["ts"], "cg_id": d["cg_id"], "mem_current": d["mem_current"]}
 
-        return json.dumps({"by_mem": [_row_to_dict(r) for r in by_mem]})
+        return json.dumps({"by_mem": [_pick(d) for d in by_mem]})
 
     # ------------------------------------------------------------------
     # Scheduled job callables
@@ -486,10 +488,7 @@ class Recorder:
             labels: list[str] = []
             for _, pid in candidates[:_PSS_MAX_TARGETS]:
                 try:
-                    reg = self._storage.conn.execute(
-                        "SELECT name FROM proc_registry WHERE proc_id = ?", (pid,)
-                    ).fetchone()
-                    name = reg["name"] if reg else f"proc_{pid}"
+                    name = self._storage.proc_name(pid)
                 except Exception:
                     name = f"proc_{pid}"
                 labels.append(f"proc_id={pid} name={name}")

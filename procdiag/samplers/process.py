@@ -280,8 +280,6 @@ class ProcessSampler(Sampler):
         self.last_zombie_count = zombie_count
 
         # Clean up stale _prev_io entries for pids that no longer exist.
-        live_keys = {(proc_id, pid) for pid in self._pid_cache for proc_id in []}
-        # Simpler: just keep keys whose pid is still in cache.
         live_pid_set = set(self._pid_cache.keys())
         for key in list(self._prev_io):
             if key[1] not in live_pid_set:

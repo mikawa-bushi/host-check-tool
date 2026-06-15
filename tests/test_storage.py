@@ -319,3 +319,26 @@ def test_read_only_accepts_relative_path(tmp_path, monkeypatch):
         store.flush()
     with Storage(Path("rel.db"), read_only=True) as ro:
         assert len(ro.rows("sys_samples")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Registry name-lookup helpers (issue #4 §3-3)
+# ---------------------------------------------------------------------------
+
+
+def test_proc_name_returns_registered_name(tmp_db):
+    proc_id = tmp_db.proc_id_for("nginx", "abc123hash", "nginx -g daemon", 1000.0)
+    assert tmp_db.proc_name(proc_id) == "nginx"
+
+
+def test_proc_name_falls_back_for_unknown_id(tmp_db):
+    assert tmp_db.proc_name(99999) == "proc_99999"
+
+
+def test_cg_unit_path_returns_registered_path(tmp_db):
+    cg_id = tmp_db.cg_id_for("system.slice/nginx.service", 1000.0)
+    assert tmp_db.cg_unit_path(cg_id) == "system.slice/nginx.service"
+
+
+def test_cg_unit_path_falls_back_for_unknown_id(tmp_db):
+    assert tmp_db.cg_unit_path(99999) == "99999"

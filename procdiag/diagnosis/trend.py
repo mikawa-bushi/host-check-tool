@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from ..core import Confidence
+
 # ---------------------------------------------------------------------------
 # TrendFit — result of linear regression
 # ---------------------------------------------------------------------------
@@ -110,6 +112,95 @@ def fit_linear(
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
 
     return TrendFit(slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours)
+
+
+# ---------------------------------------------------------------------------
+# confidence_from_fit
+# ---------------------------------------------------------------------------
+
+
+def confidence_from_fit(
+    fit: TrendFit,
+    *,
+    min_observation_hours: float,
+    high_r2: float = 0.95,
+    high_span_hours: float = 12.0,
+    medium_r2: float = 0.90,
+) -> Confidence:
+    """Map a :class:`TrendFit` to a :class:`~procdiag.core.Confidence` level.
+
+    Shared by the regression-based leak rules (MEM-LEAK / FD-LEAK /
+    THREAD-LEAK) so the R²×observation-span ladder lives in one place:
+
+    * ``HIGH``   — ``r2 >= high_r2`` **and** ``span_hours >= high_span_hours``
+    * ``MEDIUM`` — ``r2 >= medium_r2`` **and** ``span_hours >= min_observation_hours``
+    * ``LOW``    — otherwise
+    """
+    if fit.r2 >= high_r2 and fit.span_hours >= high_span_hours:
+        return Confidence.HIGH
+    if fit.r2 >= medium_r2 and fit.span_hours >= min_observation_hours:
+        return Confidence.MEDIUM
+    return Confidence.LOW
+
+
+# ---------------------------------------------------------------------------
+# find_sustained_episodes
+# ---------------------------------------------------------------------------
+
+
+def find_sustained_episodes(
+    samples: list[tuple[int, float, bool]],
+    *,
+    min_consecutive: int,
+    max_gap_seconds: float = 90.0,
+) -> list[tuple[float, float]]:
+    """Find runs of consecutive "saturated" minute buckets.
+
+    *samples* is a list of ``(bucket, ts, is_saturated)`` triples (sorted here
+    by ``bucket``).  Two saturated buckets are part of the same run while their
+    ``bucket`` values are within *max_gap_seconds* of each other; a larger gap
+    or an unsaturated bucket ends the current run.  A run qualifies as an
+    episode only when it spans at least *min_consecutive* buckets.
+
+    Returns ``(start_ts, end_ts)`` for each qualifying episode.  Shared by
+    CPU-SINGLECORE-01 and CPU-SATURATION-01 so the run-detection state machine
+    lives in one place.
+    """
+    episodes: list[tuple[float, float]] = []
+    run_start: float | None = None
+    run_end: float | None = None
+    run_len = 0
+    prev_bucket: int | None = None
+
+    for bucket, ts, is_saturated in sorted(samples, key=lambda s: s[0]):
+        is_consecutive = (
+            prev_bucket is None or (bucket - prev_bucket) <= max_gap_seconds
+        )
+
+        if is_saturated and is_consecutive:
+            if run_start is None:
+                run_start = ts
+            run_end = ts
+            run_len += 1
+        elif is_saturated and not is_consecutive:
+            if run_start is not None and run_len >= min_consecutive:
+                episodes.append((run_start, run_end))  # type: ignore[arg-type]
+            run_start = ts
+            run_end = ts
+            run_len = 1
+        else:
+            if run_start is not None and run_len >= min_consecutive:
+                episodes.append((run_start, run_end))  # type: ignore[arg-type]
+            run_start = None
+            run_end = None
+            run_len = 0
+
+        prev_bucket = bucket
+
+    if run_start is not None and run_len >= min_consecutive:
+        episodes.append((run_start, run_end))  # type: ignore[arg-type]
+
+    return episodes
 
 
 # ---------------------------------------------------------------------------

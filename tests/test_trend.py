@@ -14,12 +14,15 @@ import time
 
 import pytest
 
+from procdiag.core import Confidence
 from procdiag.diagnosis.trend import (
     Period,
     TrendFit,
+    confidence_from_fit,
     detect_periodicity,
     detect_recurrence,
     extrapolate_full,
+    find_sustained_episodes,
     fit_linear,
 )
 
@@ -308,3 +311,103 @@ class TestDetectRecurrence:
         data = {f"2026-01-{d:02d}": (d % 3 == 0) for d in range(1, 10)}
         frac = detect_recurrence(data)
         assert 0.0 <= frac <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# confidence_from_fit (issue #4 §3-2)
+# ---------------------------------------------------------------------------
+
+
+def _fit(r2: float, span_hours: float) -> TrendFit:
+    return TrendFit(slope_per_hour=1.0, r2=r2, n=100, span_hours=span_hours)
+
+
+class TestConfidenceFromFit:
+    def test_high_needs_high_r2_and_long_span(self):
+        assert (
+            confidence_from_fit(_fit(0.96, 12.0), min_observation_hours=6.0)
+            == Confidence.HIGH
+        )
+
+    def test_high_r2_but_short_span_is_medium(self):
+        # r2 high but span < 12h → not HIGH; r2>=0.90 and span>=min_obs → MEDIUM
+        assert (
+            confidence_from_fit(_fit(0.96, 10.0), min_observation_hours=6.0)
+            == Confidence.MEDIUM
+        )
+
+    def test_medium_band(self):
+        assert (
+            confidence_from_fit(_fit(0.92, 8.0), min_observation_hours=6.0)
+            == Confidence.MEDIUM
+        )
+
+    def test_low_when_r2_below_medium(self):
+        assert (
+            confidence_from_fit(_fit(0.80, 20.0), min_observation_hours=6.0)
+            == Confidence.LOW
+        )
+
+    def test_low_when_span_below_min_observation(self):
+        # r2 0.95 but span 5h < min_obs 6h → not MEDIUM, span<12 → not HIGH → LOW
+        assert (
+            confidence_from_fit(_fit(0.95, 5.0), min_observation_hours=6.0)
+            == Confidence.LOW
+        )
+
+    def test_exact_high_boundary_is_inclusive(self):
+        # both thresholds use >=, so the exact boundary qualifies as HIGH
+        assert (
+            confidence_from_fit(_fit(0.95, 12.0), min_observation_hours=6.0)
+            == Confidence.HIGH
+        )
+
+    def test_exact_medium_boundary_is_inclusive(self):
+        assert (
+            confidence_from_fit(_fit(0.90, 6.0), min_observation_hours=6.0)
+            == Confidence.MEDIUM
+        )
+
+
+# ---------------------------------------------------------------------------
+# find_sustained_episodes (issue #4 §3-1)
+# ---------------------------------------------------------------------------
+
+
+class TestFindSustainedEpisodes:
+    def test_single_run_meets_min(self):
+        samples = [(0, 0.0, True), (60, 60.0, True), (120, 120.0, True)]
+        assert find_sustained_episodes(samples, min_consecutive=3) == [(0.0, 120.0)]
+
+    def test_run_below_min_is_dropped(self):
+        samples = [(0, 0.0, True), (60, 60.0, True)]
+        assert find_sustained_episodes(samples, min_consecutive=3) == []
+
+    def test_time_gap_splits_into_two_episodes(self):
+        samples = [
+            (0, 0.0, True),
+            (60, 60.0, True),
+            (120, 120.0, True),
+            (3000, 3000.0, True),  # gap > 90s from previous bucket
+            (3060, 3060.0, True),
+            (3120, 3120.0, True),
+        ]
+        assert find_sustained_episodes(samples, min_consecutive=3) == [
+            (0.0, 120.0),
+            (3000.0, 3120.0),
+        ]
+
+    def test_unsaturated_bucket_breaks_run(self):
+        samples = [
+            (0, 0.0, True),
+            (60, 60.0, True),
+            (120, 120.0, False),  # breaks the (too-short) first run
+            (180, 180.0, True),
+            (240, 240.0, True),
+            (300, 300.0, True),
+        ]
+        assert find_sustained_episodes(samples, min_consecutive=3) == [(180.0, 300.0)]
+
+    def test_input_is_sorted_by_bucket(self):
+        samples = [(120, 120.0, True), (0, 0.0, True), (60, 60.0, True)]
+        assert find_sustained_episodes(samples, min_consecutive=3) == [(0.0, 120.0)]

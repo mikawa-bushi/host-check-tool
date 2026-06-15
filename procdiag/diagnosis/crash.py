@@ -255,10 +255,7 @@ class OomKillRule(Rule):
                 continue
 
             # All four conditions met — look up process name.
-            reg = store.conn.execute(
-                "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
-            ).fetchone()
-            process_name = reg["name"] if reg else f"proc_{proc_id}"
+            process_name = store.proc_name(proc_id)
 
             # Build evidence.
             lifetime_minutes = round(lifetime / 60.0, 1)

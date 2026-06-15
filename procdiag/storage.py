@@ -833,6 +833,32 @@ class Storage:
         return cg_id
 
     # ------------------------------------------------------------------
+    # Registry reverse lookups (id -> human label)
+    # ------------------------------------------------------------------
+
+    def proc_name(self, proc_id: int) -> str:
+        """Return the registered process name for *proc_id*.
+
+        Falls back to ``"proc_{proc_id}"`` when the id is not in
+        ``proc_registry``.  Centralises the name lookup that the diagnosis
+        rules previously inlined as raw SQL.
+        """
+        row = self.conn.execute(
+            "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
+        ).fetchone()
+        return row["name"] if row else f"proc_{proc_id}"
+
+    def cg_unit_path(self, cg_id: int) -> str:
+        """Return the registered cgroup unit path for *cg_id*.
+
+        Falls back to ``str(cg_id)`` when the id is not in ``cgroup_registry``.
+        """
+        row = self.conn.execute(
+            "SELECT unit_path FROM cgroup_registry WHERE cg_id = ?", (cg_id,)
+        ).fetchone()
+        return row["unit_path"] if row else str(cg_id)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
