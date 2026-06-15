@@ -19,6 +19,7 @@ Key design choices that mirror netdiag:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -28,6 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .core.util import parse_duration
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -635,8 +638,15 @@ class Storage:
                 break
             try:
                 self.retention(raw_arg, rollup_arg)
-            except Exception:
-                pass
+            except (sqlite3.Error, OSError) as exc:
+                # Do not silently swallow: a recurring retention failure would
+                # otherwise let the DB grow unbounded with no trace.
+                logger.warning(
+                    "DBサイズガード: retention 失敗 (%s): %s", step_name, exc
+                )
+                self.record_event(
+                    "db_guard_error", f"{step_name}: retention 失敗: {exc}"
+                )
             after = _db_size()
             detail = f"{step_name}: DB={after // (1024 * 1024)}MB"
             self.record_event("db_guard", detail)
@@ -647,8 +657,8 @@ class Storage:
         try:
             self.conn.execute("VACUUM")
             self.conn.commit()
-        except Exception:
-            pass
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("DBサイズガード: VACUUM 失敗: %s", exc)
 
         size_after = _db_size()
         return {

@@ -246,3 +246,20 @@ def test_retention_leaves_spike_events_alone(tmp_path):
         count = store.conn.execute("SELECT COUNT(*) FROM ops_events").fetchone()[0]
         # Should still be there (retention does not touch ops_events)
         assert count == 1
+
+
+def test_enforce_size_budget_records_retention_failure(tmp_path, monkeypatch):
+    """A failing retention during the size guard is recorded, not swallowed."""
+    import sqlite3
+
+    with Storage(tmp_path / "guard.db") as store:
+
+        def _boom(*_a, **_k):
+            raise sqlite3.OperationalError("retention boom")
+
+        monkeypatch.setattr(store, "retention", _boom)
+        # max_bytes=1 forces over-budget so the retention ladder runs.
+        store.enforce_size_budget(max_bytes=1, min_free_bytes=None)
+
+        errors = store.rows("ops_events", where="kind = 'db_guard_error'")
+        assert len(errors) >= 1

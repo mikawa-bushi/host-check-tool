@@ -29,6 +29,7 @@ from procdiag.config import ProcdiagConfig
 from procdiag.doctor import (
     DoctorCheck,
     _check_cgroup_v2,
+    _check_config_security,
     _check_db_disk,
     _check_io_counters,
     _check_journal,
@@ -390,13 +391,13 @@ class TestCheckDbDisk:
 
 
 class TestRunDoctor:
-    def test_returns_8_checks(self, default_config):
+    def test_returns_9_checks(self, default_config):
         checks = run_doctor(
             default_config,
             proc_root=PROC_TREE,
             cgroup_root=CGROUP_TREE,
         )
-        assert len(checks) == 8
+        assert len(checks) == 9
 
     def test_check_names_in_order(self, default_config):
         checks = run_doctor(
@@ -414,6 +415,7 @@ class TestRunDoctor:
             "journal",
             "sensors",
             "db_disk",
+            "config_security",
         ]
 
     def test_psi_ok_with_proc_tree(self, default_config):
@@ -478,15 +480,15 @@ class TestRunDoctor:
                 proc_root=PROC_TREE,
                 cgroup_root=CGROUP_TREE,
             )
-        assert len(checks) == 8
+        assert len(checks) == 9
         sensors = next(c for c in checks if c.name == "sensors")
         # sensors exceptions are caught → info status.
         assert sensors.status == "info"
 
     def test_smoke_real_machine(self):
-        """Smoke test: run_doctor on the real machine returns 8 checks without exception."""
+        """Smoke test: run_doctor on the real machine returns 9 checks without exception."""
         checks = run_doctor(ProcdiagConfig())
-        assert len(checks) == 8
+        assert len(checks) == 9
         for c in checks:
             assert isinstance(c, DoctorCheck)
             assert c.status in ("ok", "degraded", "info")
@@ -519,7 +521,7 @@ class TestDoctorCli:
         assert result.exit_code in (0, 2)
         data = json.loads(result.output)
         assert isinstance(data, list)
-        assert len(data) == 8
+        assert len(data) == 9
         for item in data:
             assert "name" in item
             assert "label" in item
@@ -529,7 +531,7 @@ class TestDoctorCli:
     def test_exit_0_when_all_ok(self, runner):
         """If no degraded checks → exit 0."""
 
-        def all_ok(config, *, proc_root=None, cgroup_root=None):
+        def all_ok(config, *, proc_root=None, cgroup_root=None, config_path=None):
             return [
                 DoctorCheck(name=n, label=n, status="ok", detail="ok")
                 for n in (
@@ -559,7 +561,7 @@ class TestDoctorCli:
     def test_exit_2_when_degraded(self, runner):
         """If any check is degraded → exit 2."""
 
-        def one_degraded(config, *, proc_root=None, cgroup_root=None):
+        def one_degraded(config, *, proc_root=None, cgroup_root=None, config_path=None):
             return [
                 DoctorCheck(
                     name="psi",
@@ -584,7 +586,7 @@ class TestDoctorCli:
     def test_json_exit_2_when_degraded(self, runner):
         """JSON output also exits 2 when degraded."""
 
-        def one_degraded(config, *, proc_root=None, cgroup_root=None):
+        def one_degraded(config, *, proc_root=None, cgroup_root=None, config_path=None):
             return [
                 DoctorCheck(
                     name="psi",
@@ -611,7 +613,7 @@ class TestDoctorCli:
         """--db overrides config.db_path and is passed to run_doctor."""
         captured: list = []
 
-        def capture(config, *, proc_root=None, cgroup_root=None):
+        def capture(config, *, proc_root=None, cgroup_root=None, config_path=None):
             captured.append(config.db_path)
             return [
                 DoctorCheck(
@@ -647,3 +649,48 @@ class TestDoctorCli:
         assert "--config" in result.output
         assert "--db" in result.output
         assert "--format" in result.output
+
+
+# ---------------------------------------------------------------------------
+# config security check (issue #5 §4-3)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckConfigSecurity:
+    def test_missing_config_is_info(self, tmp_path):
+        c = _check_config_security(str(tmp_path / "nope.py"))
+        assert c.name == "config_security"
+        assert c.status == "info"
+
+    def test_unexpected_error_is_info(self):
+        # A path containing a null byte makes Path operations raise → the check
+        # is advisory, so it degrades to info rather than failing the run.
+        c = _check_config_security("bad\x00path")
+        assert c.status == "info"
+
+    def test_world_writable_config_is_degraded(self, tmp_path):
+        p = tmp_path / "config.py"
+        p.write_text("config = None\n", encoding="utf-8")
+        os.chmod(p, 0o666)
+        c = _check_config_security(str(p))
+        assert c.status == "degraded"
+
+    def test_safe_config_is_ok(self, tmp_path):
+        p = tmp_path / "config.py"
+        p.write_text("config = None\n", encoding="utf-8")
+        os.chmod(p, 0o600)
+        c = _check_config_security(str(p))
+        assert c.status == "ok"
+
+    def test_run_doctor_includes_config_security(self, default_config, tmp_path):
+        p = tmp_path / "config.py"
+        p.write_text("config = None\n", encoding="utf-8")
+        os.chmod(p, 0o600)
+        checks = run_doctor(
+            default_config,
+            proc_root=PROC_TREE,
+            cgroup_root=CGROUP_TREE,
+            config_path=str(p),
+        )
+        assert any(c.name == "config_security" for c in checks)
+        assert len(checks) == 9

@@ -114,6 +114,19 @@ procdiag report --out report.html --json report.json
 
 ---
 
+## セキュリティ運用上の注意（設定ファイル）
+
+`config.py` は読み込み時に **`exec()` で実行される**（netdiag 由来の設計で、設定に Python 式を書けるのが利点）。
+これは、`config.py` への書き込み権限が、`procdiag` を実行するユーザー（特に systemd 常駐サービス）の
+権限での **任意コード実行** と等価であることを意味する。次を守ること:
+
+- `config.py` は **信頼できる場所** に置き、**root 所有・非 world-writable** にする（推奨 `chmod 0600`、複数ユーザーで読む必要がある場合のみ `0644`）。`doctor` が点検するのは world-writable ビットのみである点に注意。
+- 誰でも書き込める場所（`/tmp` や 0777 の共有ディレクトリ等）には置かない。
+- 配置後に `procdiag doctor` を実行すると、`設定ファイルの安全性` チェックが world-writable な `config.py` を
+  `degraded` として警告する。
+
+---
+
 ## アーキテクチャマップ
 
 ```

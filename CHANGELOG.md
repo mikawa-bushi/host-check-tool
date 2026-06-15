@@ -2,6 +2,17 @@
 
 本プロジェクトの主な変更点を記録します。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、[セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 
+## [0.2.4] - 2026-06-14
+
+### Fixed
+- `build_charts`: raw `sys_samples` のみの DB（ロールアップ前）で、PSI・ディスク・スパイクのチャートが無言で欠落していた。`sqlite3.Row` に存在しない `.get()` を呼んでいたためで、広域 `except` がその例外を握り潰していた (#5)。
+
+### Changed
+- 堅牢化 (#5)。
+  - `build_charts` / `enforce_size_budget` の広域 `except Exception` を想定 I/O 例外（`sqlite3.Error` / `OSError`）に限定し、失敗を `logger` と `ops_events`（`db_guard_error`）に記録。想定外の例外は伝播させ、不具合を隠さない。
+  - `procdiag doctor` に「設定ファイルの安全性」チェックを追加（world-writable な `config.py` を degraded として警告）。
+- `config.py` は `exec()` で実行される点について、安全な配置（root 所有・非 world-writable）のガイドを docs に追記 (#5)。
+
 ## [0.2.3] - 2026-06-14
 
 ### Changed

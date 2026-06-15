@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import html as _html_lib
 import json
+import logging
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Tuple
@@ -27,6 +29,8 @@ from typing import List, Tuple
 import procdiag
 from procdiag.core import Diagnosis, Finding, ObservationQuality, Severity
 from procdiag.storage import Storage
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ANSI colour helpers — matches netdiag palette
@@ -132,9 +136,22 @@ def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
             ts = row[ts_key]
             if ts is None:
                 continue
-            c_val = row["psi_cpu_max"] if "psi_cpu_max" in row.keys() else row.get("psi_cpu_some10", None)  # type: ignore[attr-defined]
-            m_val = row["psi_mem_max"] if "psi_mem_max" in row.keys() else row.get("psi_mem_some10", None)  # type: ignore[attr-defined]
-            i_val = row["psi_io_max"] if "psi_io_max" in row.keys() else row.get("psi_io_some10", None)  # type: ignore[attr-defined]
+            keys = row.keys()
+            c_val = (
+                row["psi_cpu_max"]
+                if "psi_cpu_max" in keys
+                else (row["psi_cpu_some10"] if "psi_cpu_some10" in keys else None)
+            )
+            m_val = (
+                row["psi_mem_max"]
+                if "psi_mem_max" in keys
+                else (row["psi_mem_some10"] if "psi_mem_some10" in keys else None)
+            )
+            i_val = (
+                row["psi_io_max"]
+                if "psi_io_max" in keys
+                else (row["psi_io_some10"] if "psi_io_some10" in keys else None)
+            )
             if c_val is None and m_val is None and i_val is None:
                 continue
             psi_list.append(
@@ -173,9 +190,11 @@ def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
             )
         charts.spikes = spikes
 
-    except Exception:
-        # Defensive: return whatever was collected so far, never raise.
-        pass
+    except (sqlite3.Error, OSError) as exc:
+        # Expected DB/IO read error — return whatever was collected so far
+        # rather than aborting the report, but log it so the gap is visible.
+        # Any other (unexpected) exception propagates so bugs are not hidden.
+        logger.warning("build_charts: チャート構築を中断しました: %s", exc)
 
     return charts
 

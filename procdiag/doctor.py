@@ -31,7 +31,7 @@ from typing import Optional
 
 import psutil
 
-from .config import ProcdiagConfig
+from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig
 
 # Maximum number of processes to sample when probing io_counters read-rate.
 _IO_SAMPLE_MAX = 80
@@ -321,15 +321,63 @@ def _check_db_disk(config: ProcdiagConfig) -> DoctorCheck:
 # ---------------------------------------------------------------------------
 
 
+def _check_config_security(config_path: Optional[str]) -> DoctorCheck:
+    """Check that the config file (executed via ``exec``) is not world-writable.
+
+    ``load_config`` runs ``config.py`` with ``exec``, so write access to that
+    file is equivalent to code execution under whatever runs ``procdiag`` —
+    notably the systemd service.  A world-writable config is therefore a
+    privilege-escalation risk worth surfacing before a recording starts.
+
+    The check is advisory: an unexpected error (e.g. an unreadable path) is
+    reported as ``info`` rather than failing the doctor run, matching how the
+    other checks treat unexpected exceptions.
+    """
+    try:
+        path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+        if not path.exists():
+            return DoctorCheck(
+                name="config_security",
+                label="設定ファイルの安全性",
+                status="info",
+                detail=f"設定ファイルが見つかりません ({path}) — 既定値で動作します",
+            )
+        if path.stat().st_mode & 0o002:
+            return DoctorCheck(
+                name="config_security",
+                label="設定ファイルの安全性",
+                status="degraded",
+                detail=(
+                    f"{path} が誰でも書き込み可能 (world-writable) です。"
+                    "config.py は exec() で実行されるため任意コード実行のリスクがあります"
+                    " — chmod o-w で権限を絞ってください"
+                ),
+            )
+        return DoctorCheck(
+            name="config_security",
+            label="設定ファイルの安全性",
+            status="ok",
+            detail=f"{path} の権限は安全です (world-writable ではありません)",
+        )
+    except Exception as exc:
+        return DoctorCheck(
+            name="config_security",
+            label="設定ファイルの安全性",
+            status="info",
+            detail=f"設定ファイル権限チェック中に予期しない例外が発生しました: {exc}",
+        )
+
+
 def run_doctor(
     config: ProcdiagConfig,
     *,
     proc_root: Path = Path("/proc"),
     cgroup_root: Path = Path("/sys/fs/cgroup"),
+    config_path: Optional[str] = None,
 ) -> list[DoctorCheck]:
     """Run all observability checks and return a list of :class:`DoctorCheck`.
 
-    Always returns exactly 8 items in a fixed order regardless of errors.
+    Always returns exactly 9 items in a fixed order regardless of errors.
     Each check is wrapped so a single failure cannot propagate.
 
     Parameters
@@ -340,6 +388,9 @@ def run_doctor(
         Override for ``/proc``; injected by tests.
     cgroup_root:
         Override for ``/sys/fs/cgroup``; injected by tests.
+    config_path:
+        Path to the config file to permission-check; falls back to the default
+        ``./config.py`` when ``None``.
     """
     return [
         _check_psi(proc_root),
@@ -350,4 +401,5 @@ def run_doctor(
         _check_journal(),
         _check_sensors(),
         _check_db_disk(config),
+        _check_config_security(config_path),
     ]

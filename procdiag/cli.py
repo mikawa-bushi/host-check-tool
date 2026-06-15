@@ -854,7 +854,7 @@ def doctor(
     if db_path:
         cfg = cfg.model_copy(update={"db_path": db_path})
 
-    checks = run_doctor(cfg)
+    checks = run_doctor(cfg, config_path=config_path)
 
     if fmt == "json":
         click.echo(

@@ -538,3 +538,35 @@ class TestSvgDownsample:
 
         svg = _psi_svg([])
         assert "データなし" in svg
+
+
+# ---------------------------------------------------------------------------
+# build_charts robustness (issue #5 §4-1)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildChartsRobustness:
+    def test_resilient_to_db_error_returns_empty(self, tmp_path) -> None:
+        db = tmp_path / "r.db"
+        with Storage(db):
+            pass  # create schema
+        ro = Storage(db, read_only=True)
+        ro.close()  # subsequent reads raise sqlite3.ProgrammingError
+        # An expected DB error is caught → partial (empty) charts, never raises.
+        charts = build_charts(ro)
+        assert charts.cpu == []
+        assert charts.mounts == {}
+
+    def test_propagates_unexpected_error(self, tmp_path, monkeypatch) -> None:
+        db = tmp_path / "r.db"
+        with Storage(db):
+            pass
+        with Storage(db, read_only=True) as ro:
+
+            def _boom(*_a, **_k):
+                raise ValueError("unexpected boom")
+
+            monkeypatch.setattr(ro, "series", _boom)
+            # A non-DB error must propagate, not be silently swallowed.
+            with pytest.raises(ValueError):
+                build_charts(ro)
