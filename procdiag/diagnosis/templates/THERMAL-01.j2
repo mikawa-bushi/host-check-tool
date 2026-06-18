@@ -1,0 +1,5 @@
+[検出] CPU が高温 ({{ evidence.peak_temp_c }}°C) の下でクロックが最大の {{ "%.0f"|format(evidence.median_freq_ratio * 100) }}% まで低下しています（サーマルスロットリングの疑い、{{ evidence.sample_count }} サンプル）。
+[根拠] thermal_samples の温度と「現在クロック / 最大クロック」比から判定。比の中央値 {{ "%.2f"|format(evidence.median_freq_ratio) }} が閾値 {{ evidence.freq_throttle_ratio }} を下回り、かつ最高温度 {{ evidence.peak_temp_c }}°C が {{ evidence.temp_threshold_c }}°C を超過。これは需要(PSI)ではなく物理的な熱制限を示します。
+[暫定対処] 筐体内の埃・ファン動作・吸排気を確認してください。`sensors` で温度、`grep MHz /proc/cpuinfo` でクロックを継続監視します。負荷の高いプロセスを一時停止すると発熱が下がります。
+[恒久対処] (1) ヒートシンク/ファンの清掃・交換、(2) 設置環境の通気・周囲温度の改善、(3) 電源/性能プロファイル(governor)の見直し、(4) 高温が続くなら筐体・冷却設計の再検討。
+[影響予測] スロットリングが続くと体感速度の低下・処理遅延が慢性化し、さらに高温が進むと保護停止やハードウェア劣化に至る可能性があります。

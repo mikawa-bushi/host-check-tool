@@ -32,7 +32,28 @@ from .core.util import parse_duration
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+
+# Forward migrations keyed by the schema version they produce.  Each value is a
+# list of idempotent DDL statements that upgrade a DB from (version - 1) to
+# version, applied in order on the write path by ``_ensure_schema_version``.
+# ``_SCHEMA`` already contains the *current* shape, so a brand-new DB never runs
+# these — they exist only to bring an older on-disk DB forward.
+_MIGRATIONS: "dict[int, list[str]]" = {
+    2: [
+        "CREATE INDEX IF NOT EXISTS idx_ops_events_kind_ts ON ops_events(kind, ts)",
+    ],
+    3: [
+        "CREATE TABLE IF NOT EXISTS thermal_samples ("
+        " ts REAL PRIMARY KEY, temp_max_c REAL,"
+        " cpu_freq_cur_mhz REAL, cpu_freq_max_mhz REAL)",
+    ],
+}
+
+
+class StorageVersionError(RuntimeError):
+    """Raised when a DB's schema version is newer than this procdiag supports."""
+
 
 # Minimum seconds between ``last_seen`` rewrites for the same cgroup unit.
 # ``last_seen`` is metadata that nothing reads for logic, so the per-tick
@@ -105,6 +126,11 @@ CREATE TABLE IF NOT EXISTS dir_samples (
   ts REAL, path TEXT, size_bytes INTEGER, is_estimate INTEGER,
   PRIMARY KEY (ts, path)
 );
+-- サーマル / CPU 周波数 (Tier-3, capability-gated; センサ無し環境では空)
+CREATE TABLE IF NOT EXISTS thermal_samples (
+  ts REAL PRIMARY KEY,
+  temp_max_c REAL, cpu_freq_cur_mhz REAL, cpu_freq_max_mhz REAL
+);
 
 -- スパイクイベント
 CREATE TABLE IF NOT EXISTS spike_events (
@@ -119,6 +145,9 @@ CREATE TABLE IF NOT EXISTS spike_events (
 CREATE TABLE IF NOT EXISTS ops_events (
   ts REAL, kind TEXT, detail TEXT
 );
+-- ops_events は kind での絞り込み(gap/throttle 集計)と ts での retention 削除が
+-- 主アクセスだが PK が無く全表走査になる。索引を張って走査を避ける。
+CREATE INDEX IF NOT EXISTS idx_ops_events_kind_ts ON ops_events(kind, ts);
 
 -- ロールアップ(1分)
 CREATE TABLE IF NOT EXISTS sys_rollup_1m (
@@ -204,6 +233,12 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "size_bytes",
         "is_estimate",
     ],
+    "thermal_samples": [
+        "ts",
+        "temp_max_c",
+        "cpu_freq_cur_mhz",
+        "cpu_freq_max_mhz",
+    ],
     "sys_rollup_1m": [
         "ts_min",
         "cpu_avg",
@@ -272,16 +307,9 @@ class Storage:
         if not read_only:
             self.conn.executescript(_SCHEMA)
             self.conn.commit()
-            # Record schema version if not already present.
-            existing = self.conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-            if existing is None:
-                self.conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-                self.conn.commit()
+            self._ensure_schema_version()
+        else:
+            self._check_read_only_version()
 
         # In-memory write buffer: table_name -> list[tuple]
         self._buffer: Dict[str, List[tuple]] = defaultdict(list)
@@ -302,11 +330,88 @@ class Storage:
         )
 
     # ------------------------------------------------------------------
+    # Schema versioning / migrations
+    # ------------------------------------------------------------------
+
+    def _ensure_schema_version(self) -> None:
+        """Read the stored schema version and migrate forward if needed.
+
+        Write path only.  A brand-new DB (no stored version) is stamped with the
+        current version.  An older DB has each pending migration in
+        ``_MIGRATIONS`` applied in order.  A DB written by a *newer* procdiag is
+        refused outright so a future schema is never silently mis-read.
+        """
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            self.conn.commit()
+            return
+
+        stored = int(row["value"])
+        if stored == SCHEMA_VERSION:
+            return
+        if stored > SCHEMA_VERSION:
+            raise StorageVersionError(
+                f"DB のスキーマ版 {stored} はこの procdiag (版 {SCHEMA_VERSION}) "
+                "より新しいため開けません。procdiag を更新してください。"
+            )
+
+        for target in range(stored + 1, SCHEMA_VERSION + 1):
+            for stmt in _MIGRATIONS.get(target, []):
+                self.conn.execute(stmt)
+            self.conn.execute(
+                "UPDATE meta SET value=? WHERE key='schema_version'",
+                (str(target),),
+            )
+        self.conn.commit()
+        logger.info("スキーマを版 %d から %d へ移行しました", stored, SCHEMA_VERSION)
+
+    def _check_read_only_version(self) -> None:
+        """Refuse a read-only DB written by a *newer* procdiag.
+
+        Older DBs are tolerated silently: a read-only connection cannot migrate,
+        and past migrations only add indexes/columns that reads survive without.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.Error:
+            return  # not a procdiag DB / no meta table — let reads fail naturally
+        if row is not None and int(row["value"]) > SCHEMA_VERSION:
+            raise StorageVersionError(
+                f"DB のスキーマ版 {int(row['value'])} はこの procdiag "
+                f"(版 {SCHEMA_VERSION}) より新しいため読めません。"
+            )
+
+    # ------------------------------------------------------------------
     # Write path (recorder-only)
     # ------------------------------------------------------------------
 
     def buffer(self, table: str, rows: List[tuple]) -> None:
-        """Accumulate rows in the in-memory buffer for a later flush."""
+        """Accumulate rows in the in-memory buffer for a later flush.
+
+        Each row is INSERTed positionally in ``TABLE_COLUMNS[table]`` order, so a
+        row whose width drifted from that map would silently shift columns or
+        raise a cryptic SQLite error at flush.  Reject the mismatch here with a
+        clear, table-named message instead (issue v0.3 §2-6); combined with
+        ``test_table_columns_match_schema`` (§2-2) this fences the write path
+        against schema/sampler drift.
+        """
+        cols = TABLE_COLUMNS.get(table)
+        if cols is not None:
+            width = len(cols)
+            for row in rows:
+                if len(row) != width:
+                    raise ValueError(
+                        f"{table}: 行の列数 {len(row)} が TABLE_COLUMNS の "
+                        f"{width} 列と一致しません"
+                    )
         self._buffer[table].extend(rows)
 
     def flush(self, *, reason: str = "interval") -> int:
@@ -360,8 +465,22 @@ class Storage:
         ).fetchone()
         watermark = float(wm_row["value"]) if wm_row else 0.0
 
+        if watermark > current_minute_floor:
+            # Wall clock moved backward (NTP step / suspend / manual set) since
+            # the watermark was written: it now sits in the "future", so the
+            # normal `>= floor` guard below would skip every rolled-back minute
+            # forever.  Reset the watermark to now and surface the event so the
+            # observer can flag the affected window.
+            self.record_event(
+                "clock_skew",
+                f"rollup watermark {watermark:.0f} > 現在分 {current_minute_floor}"
+                " — 時計巻き戻しを検出し watermark を補正",
+            )
+            self.set_meta("rollup_watermark", str(current_minute_floor))
+            return
+
         if watermark >= current_minute_floor:
-            return  # nothing to roll up yet
+            return  # nothing to roll up yet (only an in-progress minute)
 
         # --- sys_rollup_1m ---
         sys_rows = self.conn.execute(
@@ -429,96 +548,43 @@ class Storage:
                     ),
                 )
 
-        # --- proc_rollup_1m ---
-        proc_rows = self.conn.execute(
-            "SELECT ts, proc_id, cpu_pct, rss, num_fds, num_threads "
+        # --- proc_rollup_1m (SQL aggregation) ---
+        # proc_samples is the dominant volume (processes × ticks); aggregate it
+        # in SQLite (AVG/MAX) rather than pulling every row into Python.  No
+        # percentile column here, so a single INSERT…SELECT…GROUP BY suffices.
+        # AVG/MAX return NULL for an all-NULL group, matching the previous
+        # Python ``_avg([]) -> None`` / ``max(...) if vals else None`` semantics.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO proc_rollup_1m "
+            "(ts_min, proc_id, cpu_avg, cpu_max, rss_avg, rss_max, "
+            " fds_max, threads_max) "
+            "SELECT CAST(ts / 60 AS INTEGER) * 60.0 AS ts_min, proc_id, "
+            "       AVG(cpu_pct), MAX(cpu_pct), "
+            "       CAST(AVG(rss) AS INTEGER), MAX(rss), "
+            "       MAX(num_fds), MAX(num_threads) "
             "FROM proc_samples "
             "WHERE ts >= ? AND ts < ? "
-            "ORDER BY ts",
+            "GROUP BY ts_min, proc_id",
             (watermark, current_minute_floor),
-        ).fetchall()
+        )
 
-        if proc_rows:
-            # Group by (minute_bucket, proc_id)
-            proc_buckets: Dict[Tuple[float, int], List[sqlite3.Row]] = defaultdict(list)
-            for row in proc_rows:
-                key = (int(row["ts"] / 60) * 60.0, row["proc_id"])
-                proc_buckets[key].append(row)
-
-            for (bucket, proc_id), rows in proc_buckets.items():
-                cpu_vals = [r["cpu_pct"] for r in rows if r["cpu_pct"] is not None]
-                rss_vals = [r["rss"] for r in rows if r["rss"] is not None]
-                fds_vals = [r["num_fds"] for r in rows if r["num_fds"] is not None]
-                thr_vals = [
-                    r["num_threads"] for r in rows if r["num_threads"] is not None
-                ]
-
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO proc_rollup_1m "
-                    "(ts_min, proc_id, cpu_avg, cpu_max, rss_avg, rss_max, "
-                    " fds_max, threads_max) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        bucket,
-                        proc_id,
-                        _avg(cpu_vals),
-                        max(cpu_vals) if cpu_vals else None,
-                        int(_avg(rss_vals)) if rss_vals else None,
-                        max(rss_vals) if rss_vals else None,
-                        max(fds_vals) if fds_vals else None,
-                        max(thr_vals) if thr_vals else None,
-                    ),
-                )
-
-        # --- cg_rollup_1m ---
-        cg_rows = self.conn.execute(
-            "SELECT ts, cg_id, cpu_usec_delta, mem_current, "
-            "       io_rbytes_delta, io_wbytes_delta "
+        # --- cg_rollup_1m (SQL aggregation) ---
+        # COALESCE(SUM(...), 0) reproduces the previous Python ``sum(empty) == 0``
+        # for the delta columns, while mem AVG/MAX stay NULL on an all-NULL group.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cg_rollup_1m "
+            "(ts_min, cg_id, cpu_usec_sum, mem_avg, mem_max, "
+            " io_rbytes_sum, io_wbytes_sum) "
+            "SELECT CAST(ts / 60 AS INTEGER) * 60.0 AS ts_min, cg_id, "
+            "       COALESCE(SUM(cpu_usec_delta), 0), "
+            "       CAST(AVG(mem_current) AS INTEGER), MAX(mem_current), "
+            "       COALESCE(SUM(io_rbytes_delta), 0), "
+            "       COALESCE(SUM(io_wbytes_delta), 0) "
             "FROM cg_samples "
             "WHERE ts >= ? AND ts < ? "
-            "ORDER BY ts",
+            "GROUP BY ts_min, cg_id",
             (watermark, current_minute_floor),
-        ).fetchall()
-
-        if cg_rows:
-            cg_buckets: Dict[Tuple[float, int], List[sqlite3.Row]] = defaultdict(list)
-            for row in cg_rows:
-                key = (int(row["ts"] / 60) * 60.0, row["cg_id"])
-                cg_buckets[key].append(row)
-
-            for (bucket, cg_id), rows in cg_buckets.items():
-                cpu_sum = sum(
-                    r["cpu_usec_delta"] for r in rows if r["cpu_usec_delta"] is not None
-                )
-                mem_vals = [
-                    r["mem_current"] for r in rows if r["mem_current"] is not None
-                ]
-                io_r = sum(
-                    r["io_rbytes_delta"]
-                    for r in rows
-                    if r["io_rbytes_delta"] is not None
-                )
-                io_w = sum(
-                    r["io_wbytes_delta"]
-                    for r in rows
-                    if r["io_wbytes_delta"] is not None
-                )
-
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO cg_rollup_1m "
-                    "(ts_min, cg_id, cpu_usec_sum, mem_avg, mem_max, "
-                    " io_rbytes_sum, io_wbytes_sum) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        bucket,
-                        cg_id,
-                        cpu_sum,
-                        int(_avg(mem_vals)) if mem_vals else None,
-                        max(mem_vals) if mem_vals else None,
-                        io_r,
-                        io_w,
-                    ),
-                )
+        )
 
         # Advance watermark
         self.set_meta("rollup_watermark", str(current_minute_floor))
@@ -550,7 +616,7 @@ class Storage:
                     f"DELETE FROM {tbl} WHERE ts_min < ?", (rollup_cutoff,)
                 )
                 rollup_deleted += cur.rowcount
-            for tbl in ("disk_samples", "dir_samples"):
+            for tbl in ("disk_samples", "dir_samples", "thermal_samples"):
                 cur = self.conn.execute(
                     f"DELETE FROM {tbl} WHERE ts < ?", (rollup_cutoff,)
                 )
@@ -793,6 +859,7 @@ class Storage:
             "proc_samples",
             "disk_samples",
             "dir_samples",
+            "thermal_samples",
             "spike_events",
             "ops_events",
             "sys_rollup_1m",
@@ -898,6 +965,38 @@ class Storage:
             "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
         ).fetchone()
         return row["name"] if row else f"proc_{proc_id}"
+
+    def proc_first_seen(self, proc_id: int) -> Optional[float]:
+        """Return the ``first_seen`` timestamp for *proc_id*, or None.
+
+        Used by MEM-LEAK-01 to tell whether a leaking process identity predates
+        the current boot (i.e. the leak recurred across a reboot).
+        """
+        row = self.conn.execute(
+            "SELECT first_seen FROM proc_registry WHERE proc_id = ?", (proc_id,)
+        ).fetchone()
+        if row is None or row["first_seen"] is None:
+            return None
+        return float(row["first_seen"])
+
+    def window_bounds(self) -> Optional[tuple[float, float, bool]]:
+        """Return ``(min_ts, max_ts, used_rollup_fallback)`` or None if empty.
+
+        Prefers raw ``sys_samples``; falls back to ``sys_rollup_1m`` (with the
+        flag set) so diagnosis can derive its observation window without reaching
+        into ``Storage.conn`` directly.
+        """
+        row = self.conn.execute(
+            "SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM sys_samples"
+        ).fetchone()
+        if row and row["lo"] is not None:
+            return float(row["lo"]), float(row["hi"]), False
+        row = self.conn.execute(
+            "SELECT MIN(ts_min) AS lo, MAX(ts_min) AS hi FROM sys_rollup_1m"
+        ).fetchone()
+        if row and row["lo"] is not None:
+            return float(row["lo"]), float(row["hi"]), True
+        return None
 
     def cg_unit_path(self, cg_id: int) -> str:
         """Return the registered cgroup unit path for *cg_id*.

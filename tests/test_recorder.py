@@ -519,6 +519,25 @@ class TestRecorder:
             top_cgroups = json.loads(row["top_cgroups"])
             assert "by_mem" in top_cgroups
 
+    def test_on_gap_dedupes_simultaneous_job_reports(self, tmp_path: Path):
+        """Jobs reporting the same gap in one iteration record one event (§3-6)."""
+        rec = Recorder(
+            _make_config(),
+            db_path=tmp_path / "gap.db",
+            samplers=_make_samplers(),
+            duration=1.0,
+            clock=FakeClock(0.0),
+            sleep=lambda _s: None,
+        )
+        # Three jobs reporting the same resume gap within one scheduler tick.
+        rec._on_gap(7200.0, "process")
+        rec._on_gap(7200.0, "system")
+        rec._on_gap(7200.0, "cgroup")
+        n = rec._storage.conn.execute(
+            "SELECT COUNT(*) AS c FROM ops_events WHERE kind='gap'"
+        ).fetchone()["c"]
+        assert n == 1
+
     def test_ops_events_has_stopped(self, tmp_path: Path):
         """ops_events must contain a 'stopped' row after normal shutdown."""
         config = _make_config()

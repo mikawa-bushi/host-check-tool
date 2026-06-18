@@ -188,7 +188,13 @@ class Engine:
         self._load_extra_rules(reasoning)
 
         # --- Step 1: determine window ---
-        window = self._determine_window(store, reasoning)
+        window, has_data = self._determine_window(store, reasoning)
+
+        if not has_data:
+            reasoning.append(
+                "観測データがありません（DB にサンプルが1件もありません）。"
+                "procdiag record でデータを記録してから再度実行してください。"
+            )
 
         if self.verbose:
             reasoning.append(
@@ -261,6 +267,7 @@ class Engine:
             healthy=healthy,
             reasoning=reasoning,
             quality=quality,
+            no_data=not has_data,
         )
 
     # ------------------------------------------------------------------
@@ -282,32 +289,31 @@ class Engine:
             elif self.verbose:
                 reasoning.append(f"追加ルール {name} を読み込みました")
 
-    def _determine_window(self, store: "Storage", reasoning: list[str]) -> Window:
-        """Derive the observation window from the DB's earliest/latest data."""
-        # Try sys_samples first (raw), then fall back to rollup.
-        row = store.conn.execute(
-            "SELECT MIN(ts) as t_min, MAX(ts) as t_max FROM sys_samples"
-        ).fetchone()
+    def _determine_window(
+        self, store: "Storage", reasoning: list[str]
+    ) -> tuple[Window, bool]:
+        """Derive the observation window and whether the DB held any samples.
 
-        if row and row["t_min"] is not None:
-            return Window(start_ts=row["t_min"], end_ts=row["t_max"])
+        Returns ``(window, has_data)``.  ``has_data`` is False only when neither
+        ``sys_samples`` nor ``sys_rollup_1m`` contained a single row; in that
+        case the window is a zero-span placeholder and the caller must treat
+        the result as "no observation", **not** as "healthy" (otherwise an empty
+        DB would render a green『問題なし』and exit 0 — a false negative).
+        """
+        bounds = store.window_bounds()
+        if bounds is None:
+            # No data at all — zero-span placeholder; signalled via has_data.
+            import time
 
-        # Fall back to sys_rollup_1m.
-        row = store.conn.execute(
-            "SELECT MIN(ts_min) as t_min, MAX(ts_min) as t_max FROM sys_rollup_1m"
-        ).fetchone()
+            now = time.time()
+            return Window(start_ts=now, end_ts=now), False
 
-        if row and row["t_min"] is not None:
+        lo, hi, used_fallback = bounds
+        if used_fallback:
             reasoning.append(
                 "sys_samples が空のため sys_rollup_1m でウィンドウを決定しました"
             )
-            return Window(start_ts=row["t_min"], end_ts=row["t_max"])
-
-        # No data at all — return a zero-span window (guard will catch it).
-        import time
-
-        now = time.time()
-        return Window(start_ts=now, end_ts=now)
+        return Window(start_ts=lo, end_ts=hi), True
 
     def _render_proposal(self, finding: Finding, reasoning: list[str]) -> str:
         """Render the Jinja2 proposal template for *finding*."""

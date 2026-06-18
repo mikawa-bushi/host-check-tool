@@ -341,3 +341,85 @@ def detect_recurrence(events_by_day: dict[str, bool]) -> float:
     total = len(events_by_day)
     hits = sum(1 for v in events_by_day.values() if v)
     return hits / total
+
+
+# ---------------------------------------------------------------------------
+# host-specific baseline (weekday × hour median / MAD)
+# ---------------------------------------------------------------------------
+
+
+def confidence_from_span(
+    span_hours: float,
+    n_points: int,
+    *,
+    high_hours: float = 24.0,
+    high_points: int = 10,
+    medium_hours: float = 6.0,
+) -> Confidence:
+    """Confidence for an *extrapolation* rule from observation span / points.
+
+    HIGH needs both a long span and enough points; MEDIUM a moderate span; LOW
+    otherwise.  Shared by the time-extrapolation rules (e.g. DISK-FULL-01) so the
+    span/points policy lives next to ``confidence_from_fit`` (regression) instead
+    of being re-inlined per rule (issue v0.3 §2-7).
+    """
+    if span_hours >= high_hours and n_points >= high_points:
+        return Confidence.HIGH
+    if span_hours >= medium_hours:
+        return Confidence.MEDIUM
+    return Confidence.LOW
+
+
+def learn_baseline(
+    series: list[tuple[float, float]],
+    *,
+    min_per_bin: int = 3,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    """Learn a ``(weekday, hour) -> (median, MAD)`` baseline from a value series.
+
+    *series* is ``(ts_epoch, value)`` pairs — e.g. ``cpu_avg`` from many days of
+    ``sys_rollup_1m``.  Each point is binned by the host-local weekday (0 = Mon)
+    and hour; bins with at least *min_per_bin* points get a median and a median
+    absolute deviation (MAD).  Sparser bins are omitted.
+
+    Robust statistics (median/MAD) absorb the strong weekday/business-hour
+    periodicity of factory edge PCs, so "is 45% CPU normal for *this* host at
+    *this* time?" can be answered relative to its own history.  stdlib only.
+    """
+    bins: dict[tuple[int, int], list[float]] = {}
+    for ts, val in series:
+        if val is None:
+            continue
+        dt = datetime.fromtimestamp(ts)
+        bins.setdefault((dt.weekday(), dt.hour), []).append(val)
+
+    out: dict[tuple[int, int], tuple[float, float]] = {}
+    for key, vals in bins.items():
+        if len(vals) < min_per_bin:
+            continue
+        med = statistics.median(vals)
+        mad = statistics.median([abs(v - med) for v in vals])
+        out[key] = (med, mad)
+    return out
+
+
+def baseline_deviation(
+    baseline: dict[tuple[int, int], tuple[float, float]],
+    ts: float,
+    value: float,
+) -> Optional[float]:
+    """Return how many MADs *value* sits from its ``(weekday, hour)`` baseline.
+
+    ``None`` when the bin is unknown or its MAD is zero (no spread to measure
+    against).  Positive = above the usual level for this time slot.  Intended as
+    *evidence only* — it annotates "+N×普段" without changing detection, so the
+    deterministic absolute-threshold rules keep their behaviour.
+    """
+    dt = datetime.fromtimestamp(ts)
+    stats = baseline.get((dt.weekday(), dt.hour))
+    if stats is None:
+        return None
+    med, mad = stats
+    if mad <= 0.0:
+        return None
+    return (value - med) / mad

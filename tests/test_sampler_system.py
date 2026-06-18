@@ -94,6 +94,20 @@ class TestParsePsi:
         assert result["full_avg10"] == pytest.approx(0.10)
         assert result["full_total"] == pytest.approx(111111.0)
 
+    def test_keys_allowlist_restricts_parsing(self):
+        """keys={'avg10'} parses only the 10s averages (issue v0.3 §4-6)."""
+        text = (
+            "some avg10=2.30 avg60=1.50 avg300=0.80 total=1234567\n"
+            "full avg10=0.10 avg60=0.05 avg300=0.02 total=111111\n"
+        )
+        result = parse_psi(text, keys=frozenset({"avg10"}))
+        assert result["some_avg10"] == pytest.approx(2.30)
+        assert result["full_avg10"] == pytest.approx(0.10)
+        assert "some_avg60" not in result
+        assert "some_avg300" not in result
+        assert "some_total" not in result
+        assert "full_total" not in result
+
     def test_empty_string_returns_empty_dict(self):
         """Empty input must not raise; return an empty dict."""
         result = parse_psi("")

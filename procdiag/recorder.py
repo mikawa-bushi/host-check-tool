@@ -148,12 +148,14 @@ class Recorder:
         from .samplers.disk import DiskSampler  # type: ignore[import]
         from .samplers.process import ProcessSampler  # type: ignore[import]
         from .samplers.system import SystemSampler  # type: ignore[import]
+        from .samplers.thermal import ThermalSampler  # type: ignore[import]
 
         return {
             "system": SystemSampler(),
             "cgroup": CgroupSampler(resolve_cg=self._storage.cg_id_for),
             "process": ProcessSampler(resolve_proc=self._storage.proc_id_for),
             "disk": DiskSampler(),
+            "thermal": ThermalSampler(),
         }
 
     def _build_trigger(self) -> Any:
@@ -244,6 +246,14 @@ class Recorder:
             decision.trigger_type if hasattr(decision, "trigger_type") else "unknown"
         )
 
+        # The spike_events row is self-contained: top_processes / top_cgroups
+        # carry the culprit snapshot inline (built above), so committing it
+        # atomically via `with conn` is sufficient — a power cut can never leave
+        # a spike_events row that "references" missing data.  The freshly
+        # buffered cg/proc samples are persisted by the next interval flush; we
+        # deliberately do *not* force an extra fsync here, since this runs on the
+        # 1-second T1 thread precisely when the host is already under pressure
+        # (WAL + synchronous=NORMAL makes the deferred flush equally durable).
         with self._storage.conn:
             self._storage.conn.execute(
                 "INSERT INTO spike_events "
@@ -257,8 +267,6 @@ class Recorder:
                     top_cgroups_json,
                 ),
             )
-
-        self._storage.flush(reason="spike")
 
     def _top_processes_json(self, proc_batches: list) -> str:
         """Extract top-10 processes by CPU and RSS from proc_samples batches."""
@@ -368,6 +376,14 @@ class Recorder:
     def _job_disk(self) -> None:
         """Tier-3 job: disk usage sampling."""
         sampler = self._samplers.get("disk")
+        if sampler is None:
+            return
+        batches = sampler.run(self._ctx)
+        self._buffer_batches(batches)
+
+    def _job_thermal(self) -> None:
+        """Tier-3 job: temperature / cpufreq sampling (capability-gated)."""
+        sampler = self._samplers.get("thermal")
         if sampler is None:
             return
         batches = sampler.run(self._ctx)
@@ -498,7 +514,19 @@ class Recorder:
         sampler.pss_targets = new_targets
 
     def _on_gap(self, delay: float, job_name: str) -> None:
-        """Record a gap event when a job fires more than 3× its interval late."""
+        """Record a gap event when a job fires more than 3× its interval late.
+
+        On a suspend/resume every registered job fires on_gap in the *same*
+        scheduler iteration (microseconds apart on the monotonic clock).  Record
+        the gap only once rather than once per job, otherwise the same real-time
+        gap is counted N times and ObservationQuality.gap_seconds is inflated by
+        the job count.  A 0.5 s window collapses same-iteration reports while
+        preserving genuinely separate gaps (≥ the 1 s T1 interval apart).
+        """
+        mono = time.monotonic()
+        if mono - getattr(self, "_last_gap_mono", float("-inf")) < 0.5:
+            return
+        self._last_gap_mono = mono
         # The leading "<delay>s" token is parsed back by
         # engine._parse_gap_delay_seconds to compute ObservationQuality.gap_seconds.
         detail = f"{delay:.1f}s ジョブ{job_name}"
@@ -555,6 +583,7 @@ class Recorder:
             sched.add("t2b_process", sc.process_interval, self._job_process)
 
         sched.add("t3_disk", sc.disk_interval, self._job_disk)
+        sched.add("t3_thermal", sc.thermal_interval, self._job_thermal)
         sched.add("t3_dir", sc.dir_scan_interval, self._job_dir_scan)
         sched.add("flush", self._flush_interval, self._job_flush)
 
@@ -589,6 +618,14 @@ class Recorder:
         # Graceful shutdown.
         try:
             self._storage.flush(reason="signal")
+            # Roll up the just-flushed final samples so the last (up to one
+            # flush-interval + 1 min) of raw data is promoted to *_rollup_1m
+            # before raw retention can ever delete it.  Without this, the
+            # most diagnostically valuable window — right before a crash or
+            # manual stop — is lost from the rollup tables that trend/leak
+            # rules read.  rollup_incremental is watermark-based and
+            # idempotent, so it is safe on the stop path.
+            self._storage.rollup_incremental()
             self._storage.record_event("stopped", "正常終了")
         except Exception:
             logger.exception("シャットダウン例外")

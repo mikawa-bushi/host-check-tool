@@ -130,11 +130,24 @@ class Sampler:
         Any exception from ``collect`` is caught, a note is appended to
         ``ctx.notes``, and an empty list is returned so the record loop
         continues uninterrupted.
+
+        ``ctx.notes`` is never drained during a record session, so under a
+        *persistent* failure (PSI vanished, recurring OSError) appending one
+        note per tick would grow it without bound — an unbounded resident-memory
+        leak that ``selfmeter`` cannot throttle (it watches CPU, not RSS).
+        Consecutive identical notes from the same sampler are therefore
+        de-duplicated; a successful collect resets the guard so a *new* failure
+        is still recorded once.
         """
         try:
-            return self.collect(ctx)
+            batches = self.collect(ctx)
+            self._last_run_note = None
+            return batches
         except Exception as e:  # never let one sampler kill the loop
-            ctx.notes.append(f"{self.name}: collect失敗 ({e})")
+            note = f"{self.name}: collect失敗 ({e})"
+            if getattr(self, "_last_run_note", None) != note:
+                ctx.notes.append(note)
+                self._last_run_note = note
             return []
 
 

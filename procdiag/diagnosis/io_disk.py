@@ -34,7 +34,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import extrapolate_full
+from .trend import confidence_from_span, extrapolate_full
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -154,14 +154,10 @@ class DiskFullRule(Rule):
                 f" ({daily_growth_bytes / 1024 / 1024 / 1024:.2f} GB/日の増加)"
             )
 
-            # Confidence based on observation span and number of points.
+            # Confidence based on observation span and number of points
+            # (shared ladder; see trend.confidence_from_span).
             span_hours = (triples[-1][0] - triples[0][0]) / 3600.0
-            if span_hours >= 24.0 and len(triples) >= 10:
-                confidence = Confidence.HIGH
-            elif span_hours >= 6.0:
-                confidence = Confidence.MEDIUM
-            else:
-                confidence = Confidence.LOW
+            confidence = confidence_from_span(span_hours, len(triples))
 
             findings.append(
                 Finding(

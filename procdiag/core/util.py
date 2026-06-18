@@ -143,3 +143,19 @@ def normalize_cmdline(
     display = raw_text[:200] if len(raw_text) > 200 else raw_text
 
     return hash12, display
+
+
+def should_use_color(no_color: bool = False) -> bool:
+    """Whether ANSI colour should be emitted to stdout.
+
+    Returns False when ``--no-color`` is requested, the ``NO_COLOR`` environment
+    variable is set (the no-color.org convention), or stdout is not a TTY.
+    Centralises the decision so every command treats colour consistently and
+    output copied into tickets/log captures stays free of escape codes.
+    """
+    import os
+    import sys
+
+    if no_color or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()

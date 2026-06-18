@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from procdiag.storage import SCHEMA_VERSION, TABLE_COLUMNS, Storage
+from procdiag.storage import (
+    SCHEMA_VERSION,
+    TABLE_COLUMNS,
+    Storage,
+    StorageVersionError,
+)
 
 # ---------------------------------------------------------------------------
 # Schema: TABLE_COLUMNS matches PRAGMA table_info for every table
@@ -36,6 +41,114 @@ def test_schema_version_in_meta(tmp_db):
     m = tmp_db.meta()
     assert "schema_version" in m
     assert m["schema_version"] == str(SCHEMA_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations + ops_events index (issue v0.3 §2-1 / §4-8)
+# ---------------------------------------------------------------------------
+
+
+def _has_ops_index(store) -> bool:
+    row = store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND name='idx_ops_events_kind_ts'"
+    ).fetchone()
+    return row is not None
+
+
+def test_ops_events_index_created_on_fresh_db(tmp_db):
+    assert _has_ops_index(tmp_db)
+
+
+def test_open_migrates_old_db_to_current(tmp_path):
+    """Opening a DB stamped with an older version migrates it forward."""
+    db = tmp_path / "mig.db"
+    with Storage(db) as store:
+        store.set_meta("schema_version", "1")
+        store.conn.commit()
+    with Storage(db) as store:
+        assert store.meta()["schema_version"] == str(SCHEMA_VERSION)
+        assert _has_ops_index(store)
+
+
+def test_newer_schema_version_refused_on_write(tmp_path):
+    db = tmp_path / "future.db"
+    with Storage(db) as store:
+        store.set_meta("schema_version", "999")
+        store.conn.commit()
+    with pytest.raises(StorageVersionError):
+        Storage(db)
+
+
+def test_newer_schema_version_refused_read_only(tmp_path):
+    db = tmp_path / "future_ro.db"
+    with Storage(db) as store:
+        store.set_meta("schema_version", "999")
+        store.conn.commit()
+    with pytest.raises(StorageVersionError):
+        Storage(db, read_only=True)
+
+
+def test_version_matches_pyproject():
+    """__version__ must equal pyproject's version (issue §2-4: catch drift).
+
+    Metadata-derivation was rejected (stale editable installs report the wrong
+    version), so the two declared values are kept in sync by this guard instead.
+    """
+    tomllib = pytest.importorskip("tomllib")  # stdlib on py3.11+
+    import procdiag
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert procdiag.__version__ == data["tool"]["poetry"]["version"]
+
+
+def test_buffer_rejects_wrong_arity(tmp_db):
+    """A row whose width drifts from TABLE_COLUMNS is rejected (issue §2-6)."""
+    with pytest.raises(ValueError):
+        tmp_db.buffer("sys_samples", [(1.0, 2.0)])  # far too few columns
+
+
+def test_proc_first_seen(tmp_db):
+    """proc_first_seen returns the registry first_seen, or None (issue §3-7)."""
+    ts = 1_700_000_000.0
+    pid = tmp_db.proc_id_for("p", "h00000000001", "p --x", ts)
+    tmp_db.conn.commit()
+    assert tmp_db.proc_first_seen(pid) == pytest.approx(ts)
+    assert tmp_db.proc_first_seen(999_999) is None
+
+
+def test_table_columns_match_schema(tmp_db):
+    """TABLE_COLUMNS must match the real column order for every listed table.
+
+    The buffer/flush write path INSERTs positionally in TABLE_COLUMNS order, and
+    synthetic test fixtures build tuples by hand, so a silent drift between this
+    map and the actual CREATE TABLE would corrupt writes (issue v0.3 §2-2).
+    """
+    for table, cols in TABLE_COLUMNS.items():
+        actual = [
+            r[1] for r in tmp_db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        assert actual == list(cols), f"{table}: TABLE_COLUMNS drift vs schema"
+
+
+def test_clock_skew_resets_watermark(tmp_path):
+    """A backward clock jump (watermark in the future) is detected (issue §3-3)."""
+    db = tmp_path / "skew.db"
+    with Storage(db) as store:
+        # Simulate a watermark written when the clock was far ahead.
+        future = (int(time.time() / 60) * 60) + 100_000 * 60
+        store.set_meta("rollup_watermark", str(future))
+        store.conn.commit()
+
+        store.rollup_incremental()
+
+        wm = float(store.meta()["rollup_watermark"])
+        assert wm < future, "watermark must be pulled back from the future"
+        skew = store.conn.execute(
+            "SELECT COUNT(*) AS c FROM ops_events WHERE kind='clock_skew'"
+        ).fetchone()
+        assert skew["c"] >= 1, "a clock_skew event must be recorded"
 
 
 # ---------------------------------------------------------------------------

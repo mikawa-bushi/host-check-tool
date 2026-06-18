@@ -23,6 +23,7 @@ from . import (
     io_disk,  # noqa: F401 — registers DISK-FULL-01
     leak,  # noqa: F401 — stub; will register FD/THREAD/ZOMBIE rules
     memory,  # noqa: F401 — registers MEM-LEAK-01
+    thermal,  # noqa: F401 — registers THERMAL-01
 )
 
 # -- public re-exports -------------------------------------------------------

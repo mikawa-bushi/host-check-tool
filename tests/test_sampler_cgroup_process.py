@@ -546,41 +546,6 @@ class TestProcessSampler:
                 len(ids) == 1
             ), f"(name, hash) = {key} resolved to multiple proc_ids: {ids}"
 
-    def test_zombie_count(self):
-        """last_zombie_count must reflect the number of zombie processes."""
-        sampler, _ = self._sampler()
-        ctx = _make_ctx()
-        sampler.setup(ctx)
-
-        # Monkeypatch status to make one process a zombie.
-        original_status = psutil.Process.status
-        call_count = [0]
-
-        def patched_status(self):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return "zombie"
-            return original_status(self)
-
-        psutil.Process.status = patched_status
-        try:
-            sampler.last_zombie_count = -1
-            sampler.collect(ctx)
-        finally:
-            psutil.Process.status = original_status
-
-        assert (
-            sampler.last_zombie_count >= 0
-        ), "last_zombie_count must be a non-negative integer after collect"
-
-    def test_zombie_count_normal_zero_or_more(self):
-        """Under normal conditions, last_zombie_count is >= 0."""
-        sampler, _ = self._sampler()
-        ctx = _make_ctx()
-        sampler.setup(ctx)
-        sampler.collect(ctx)
-        assert sampler.last_zombie_count >= 0
-
     def test_run_wraps_collect_with_defensive_wall(self):
         """run() must not propagate exceptions from collect()."""
         stub = _ProcStub()

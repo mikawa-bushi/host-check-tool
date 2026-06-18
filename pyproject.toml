@@ -37,6 +37,10 @@ procdiag = "procdiag.cli:main"
 pytest = "^8.3"
 black = "^26.0"
 pre-commit = "^4.6.0"
+# ruff は pre-commit (v0.15 系) と同系列に固定し、CI・手元・pre-commit で版を揃える。
+ruff = "^0.15.17"
+# カバレッジ計測 (poetry run pytest --cov=procdiag) を可能にする。
+pytest-cov = "^5.0"
 
 [build-system]
 requires = ["poetry-core"]
@@ -60,3 +64,10 @@ markers = [
     "real_proc: 実マシンの /proc に対して実行するスモークテスト",
     "e2e: record→check→report を通しで実行する統合テスト",
 ]
+
+[tool.coverage.run]
+source = ["procdiag"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

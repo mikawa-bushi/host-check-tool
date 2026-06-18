@@ -183,7 +183,12 @@ class CgroupSampler(Sampler):
             cpu_raw = _parse_cpu_stat(unit_dir / "cpu.stat")
             if cpu_raw is not None:
                 if unit_path in self._prev_cpu:
-                    cpu_usec_delta = cpu_raw - self._prev_cpu[unit_path]
+                    # Clamp to >=0: when a unit restarts the cgroup is recreated
+                    # and its cumulative counter resets to 0, so raw-prev would be
+                    # a large negative value that corrupts cg_rollup_1m sums.
+                    # max(0, …) treats the reset tick as 0 and resumes from the
+                    # new baseline (set below) — matches system/process samplers.
+                    cpu_usec_delta = max(0, cpu_raw - self._prev_cpu[unit_path])
                 self._prev_cpu[unit_path] = cpu_raw
 
             # --- Memory ---
@@ -196,11 +201,13 @@ class CgroupSampler(Sampler):
             rb_raw, wb_raw = _parse_io_stat(unit_dir / "io.stat")
             if rb_raw is not None:
                 if unit_path in self._prev_io_r:
-                    io_rbytes_delta = rb_raw - self._prev_io_r[unit_path]
+                    # Clamp to >=0 against cgroup counter resets on unit restart
+                    # (see cpu.stat note above).
+                    io_rbytes_delta = max(0, rb_raw - self._prev_io_r[unit_path])
                 self._prev_io_r[unit_path] = rb_raw
             if wb_raw is not None:
                 if unit_path in self._prev_io_w:
-                    io_wbytes_delta = wb_raw - self._prev_io_w[unit_path]
+                    io_wbytes_delta = max(0, wb_raw - self._prev_io_w[unit_path])
                 self._prev_io_w[unit_path] = wb_raw
 
             # --- PIDs ---

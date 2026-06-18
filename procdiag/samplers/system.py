@@ -40,9 +40,12 @@ from ..storage import TABLE_COLUMNS
 
 _PSI_KINDS = ("some", "full")
 _PSI_AVG_KEYS = ("avg10", "avg60", "avg300")
+# The sampler only consumes the 10-second averages (some_avg10 / full_avg10);
+# restrict per-tick parsing to these to skip avg60/avg300/total conversions.
+_PSI_USED_KEYS = frozenset({"avg10"})
 
 
-def parse_psi(text: str) -> Dict[str, float]:
+def parse_psi(text: str, *, keys: "frozenset[str] | None" = None) -> Dict[str, float]:
     """Parse the content of a ``/proc/pressure/*`` file into a flat dict.
 
     The returned dict has keys of the form ``"<kind>_<metric>"`` where
@@ -61,6 +64,10 @@ def parse_psi(text: str) -> Dict[str, float]:
     Lines that cannot be parsed are silently skipped so that a partially
     readable file (e.g. a kernel that omits the ``full`` line for ``cpu``)
     still returns whatever data is present rather than raising.
+
+    When *keys* is given (e.g. ``{"avg10"}``), only those metric keys are
+    parsed; the per-tick sampler passes an allowlist so it does not float-
+    convert ``avg60``/``avg300``/``total`` tokens it never uses.
     """
     result: Dict[str, float] = {}
     for line in text.splitlines():
@@ -78,6 +85,8 @@ def parse_psi(text: str) -> Dict[str, float]:
                 continue
             key, _, raw_val = token.partition("=")
             key = key.strip()
+            if keys is not None and key not in keys:
+                continue
             raw_val = raw_val.strip()
             try:
                 value = float(raw_val)
@@ -325,6 +334,6 @@ class SystemSampler(Sampler):
         """Read and parse a single PSI file.  Returns None on any I/O error."""
         try:
             text = path.read_text()
-            return parse_psi(text)
+            return parse_psi(text, keys=_PSI_USED_KEYS)
         except OSError:
             return None

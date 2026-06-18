@@ -27,6 +27,9 @@ pip install host-check-tool
 # 設定と data/ ディレクトリを生成
 procdiag init
 
+# 記録開始前にホストの観測能力 (PSI/cgroup/権限/容量) を確認
+procdiag doctor
+
 # 記録を開始 (Ctrl-C で安全に停止)
 procdiag record
 
@@ -72,7 +75,9 @@ procdiag check  --only MEM-LEAK-01,DISK-FULL-01
 |---|---|
 | `0` | Finding なし (正常) |
 | `1` | critical / warning の Finding あり |
-| `2` | info レベルの Finding のみ |
+| `2` | info レベルの Finding のみ (`--exit-zero-on-info` で 0 に畳める) |
+| `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
+| `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
 
 ## systemd 運用
 
@@ -120,7 +125,7 @@ config = ProcdiagConfig(
 - Python 3.10+
 - psutil — OS メトリクス取得
 - pydantic — 設定バリデーション
-- jinja2 — HTML レポートテンプレート
+- jinja2 — 診断の提案文テンプレートのレンダリング (HTML レポート本体は標準ライブラリのみで生成)
 - click — CLI フレームワーク
 - 標準ライブラリのみ (sqlite3, signal, threading, …)
 

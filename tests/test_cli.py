@@ -741,3 +741,75 @@ class TestCheckExitZeroOnInfo:
     def test_flag_shown_in_help(self, runner):
         result = runner.invoke(cli, ["check", "--help"])
         assert "--exit-zero-on-info" in result.output
+
+
+# ---------------------------------------------------------------------------
+# check on an empty DB — must not look healthy (issue v0.3 §1-1 / A-01)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckNoData:
+    def test_empty_db_exits_3_and_warns(self, runner, tmp_path):
+        db = tmp_path / "empty.db"
+        with Storage(db):
+            pass  # create schema only — zero samples
+        result = runner.invoke(cli, ["check", "--db", str(db)])
+        assert result.exit_code == 3, result.output
+        assert "観測データ" in result.output
+        assert "問題は見つかりませんでした" not in result.output
+
+    def test_empty_db_json_has_no_data_true(self, runner, tmp_path):
+        db = tmp_path / "empty2.db"
+        with Storage(db):
+            pass
+        result = runner.invoke(cli, ["check", "--db", str(db), "--format", "json"])
+        assert result.exit_code == 3, result.output
+        data = json.loads(result.output)
+        assert data["no_data"] is True
+        assert data["healthy"] is True
+
+
+# ---------------------------------------------------------------------------
+# CLI cluster improvements — issue v0.3 §1-2 / 1-6 / 1-8 / 1-9
+# ---------------------------------------------------------------------------
+
+
+class TestCliClusterImprovements:
+    def test_check_db_missing_exits_4(self, runner, tmp_path):
+        """DB-missing is a precondition error (exit 4), distinct from 1."""
+        result = runner.invoke(cli, ["check", "--db", str(tmp_path / "nope.db")])
+        assert result.exit_code == 4
+        assert "DB ファイル" in result.output
+
+    def test_check_quiet_suppresses_message(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "r.txt"
+        result = runner.invoke(
+            cli,
+            ["check", "--db", str(db_with_data), "--output", str(out), "--quiet"],
+        )
+        assert result.exit_code in (0, 2)
+        assert "書き出しました" not in result.output
+
+    def test_check_quiet_via_env(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "r2.txt"
+        result = runner.invoke(
+            cli,
+            ["check", "--db", str(db_with_data), "--output", str(out)],
+            env={"PROCDIAG_QUIET": "1"},
+        )
+        assert "書き出しました" not in result.output
+
+    def test_doctor_ascii_flag(self, runner):
+        result = runner.invoke(cli, ["doctor", "--ascii"])
+        assert result.exit_code in (0, 2)
+        assert ("[OK]" in result.output) or ("[WARN]" in result.output)
+        assert "✔" not in result.output
+        assert "⚠" not in result.output
+
+    def test_status_empty_db_warns(self, runner, tmp_path):
+        db = tmp_path / "empty.db"
+        with Storage(db):
+            pass
+        result = runner.invoke(cli, ["status", "--db", str(db)])
+        assert result.exit_code == 0
+        assert "まだサンプルがありません" in result.output

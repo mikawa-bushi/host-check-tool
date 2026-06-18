@@ -34,7 +34,14 @@ from ..core import (
     Window,
     register,
 )
-from .trend import TrendFit, confidence_from_fit, detect_recurrence, fit_linear
+from .trend import (
+    TrendFit,
+    baseline_deviation,
+    confidence_from_fit,
+    detect_recurrence,
+    fit_linear,
+    learn_baseline,
+)
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -111,6 +118,13 @@ class MemLeakRule(Rule):
             ts = row["ts_min"]
             if rss is not None:
                 rss_by_proc.setdefault(pid, []).append((ts, float(rss)))
+
+        # Read the host's current boot time once (reboot-crossing escalation,
+        # EXT-03).  Absent / unparseable boot_time simply disables the check.
+        try:
+            boot_time: float | None = float(store.meta().get("boot_time", "")) or None
+        except (TypeError, ValueError):
+            boot_time = None
 
         for proc_id, series in rss_by_proc.items():
             fit = fit_linear(
@@ -207,6 +221,17 @@ class MemLeakRule(Rule):
                         evidence["pss_note"] = (
                             "PSSでは増加が確認できず (共有メモリ/キャッシュの可能性)"
                         )
+
+            # Reboot-crossing escalation (EXT-03): a leaking identity whose
+            # first_seen predates the current boot has recurred across at least
+            # one reboot, pointing at a systemic (driver/config) cause.  Promote
+            # MEDIUM -> HIGH and record it.  Existing data only; offline/non-root.
+            if boot_time is not None:
+                first_seen = store.proc_first_seen(proc_id)
+                if first_seen is not None and first_seen < boot_time:
+                    evidence["predates_current_boot"] = True
+                    if confidence == Confidence.MEDIUM:
+                        confidence = Confidence.HIGH
 
             summary = (
                 f"{process_name}: RSS +{slope_mb_h:.1f} MB/h で単調増加"
@@ -332,6 +357,22 @@ class MemPressureRule(Rule):
             "swap_out_total_bytes": total_swap_out,
             "pressure_event_count": len(pressure_timestamps),
         }
+
+        # Annotate the peak against this host's own usual level for the same
+        # weekday/hour (evidence only — does not change detection).  Needs
+        # enough per-time-bin history, so it stays silent on short windows.
+        psi_series = [
+            (r["ts_min"], r["psi_mem_max"])
+            for r in rollup_rows
+            if r["psi_mem_max"] is not None
+        ]
+        peak_ts = max(
+            (r["ts_min"] for r in rollup_rows if r["psi_mem_max"] == peak_psi),
+            default=window.end_ts,
+        )
+        dev = baseline_deviation(learn_baseline(psi_series), peak_ts, peak_psi)
+        if dev is not None:
+            evidence["baseline_deviation_mads"] = round(dev, 1)
 
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"

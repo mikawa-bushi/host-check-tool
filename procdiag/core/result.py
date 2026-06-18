@@ -130,6 +130,7 @@ class Diagnosis:
     healthy: bool
     reasoning: list[str] = field(default_factory=list)  # verbose trace
     quality: ObservationQuality = field(default_factory=ObservationQuality)
+    no_data: bool = False  # True when the DB held no samples at all (see engine)
 
     @property
     def primary(self) -> Finding | None:

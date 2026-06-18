@@ -58,6 +58,7 @@ class SamplingConfig(BaseModel):
     process_interval: float = 10.0  # T2b
     disk_interval: float = 60.0  # T3 disk_usage
     dir_scan_interval: float = 3600.0  # T3 watch_dirs
+    thermal_interval: float = 10.0  # T3 温度 / cpufreq
     watch_dirs: list[WatchDir] = Field(default_factory=list)
     cmdline_normalize: bool = True
     # PSS pre-check interval (seconds). 0 disables the job.
@@ -69,6 +70,7 @@ class SamplingConfig(BaseModel):
         "process_interval",
         "disk_interval",
         "dir_scan_interval",
+        "thermal_interval",
     )
     @classmethod
     def _positive_interval(cls, v: float) -> float:

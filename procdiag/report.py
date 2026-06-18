@@ -89,6 +89,75 @@ class ChartData:
 
 
 # ---------------------------------------------------------------------------
+# spike-event enrichment helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_top_processes(raw: object, store: Storage, *, limit: int = 3) -> List[dict]:
+    """Parse a spike row's ``top_processes`` JSON into named culprit entries.
+
+    ``top_processes`` is stored as ``{"by_cpu": [...], "by_rss": [...]}`` where
+    each entry has ``proc_id``/``pid``/``cpu_pct``/``rss`` but **no name** (the
+    recorder keeps the row lean).  Resolve ``proc_id`` -> name here so the report
+    can name the culprit instead of dumping ids.  Defensive: any parse or lookup
+    failure yields an empty list rather than aborting the report.
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    by_cpu = data.get("by_cpu", []) if isinstance(data, dict) else []
+    out: List[dict] = []
+    for entry in by_cpu[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        proc_id = entry.get("proc_id")
+        try:
+            name = store.proc_name(proc_id) if proc_id is not None else "?"
+        except sqlite3.Error:
+            name = f"proc_{proc_id}"
+        out.append(
+            {
+                "name": name,
+                "pid": entry.get("pid"),
+                "cpu_pct": entry.get("cpu_pct"),
+                "rss": entry.get("rss"),
+            }
+        )
+    return out
+
+
+def _format_psi_snapshot(raw: object) -> str:
+    """Turn a stored PSI-snapshot JSON into a compact human string.
+
+    ``{"cpu_some10": 23.4, "mem_some10": 1.0, "io_some10": 9.2}`` ->
+    ``"CPU 23% / MEM 1% / IO 9%"``.  Falls back to the raw text on any parse
+    error so information is never silently lost.
+    """
+    if not raw:
+        return ""
+    try:
+        d = json.loads(raw)
+    except (ValueError, TypeError):
+        return str(raw)
+    if not isinstance(d, dict):
+        return str(raw)
+
+    def g(key: str) -> str:
+        v = d.get(key)
+        return f"{v:.0f}%" if isinstance(v, (int, float)) else "—"
+
+    return f"CPU {g('cpu_some10')} / MEM {g('mem_some10')} / IO {g('io_some10')}"
+
+
+def _fmt_pct(v: object) -> str:
+    """Format a numeric percentage, or '—' for missing/non-numeric values."""
+    return f"{v:.0f}%" if isinstance(v, (int, float)) else "—"
+
+
+# ---------------------------------------------------------------------------
 # build_charts — read Storage and produce ChartData
 # ---------------------------------------------------------------------------
 
@@ -107,61 +176,53 @@ def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
 
     try:
         # --- system series ---
-        cpu_series = store.series("sys_rollup_1m", "cpu_avg", since=since)
-        if not cpu_series:
-            # fall back to raw samples
-            cpu_series = store.series("sys_samples", "cpu_total", since=since)
+        # Read whichever sys table has data exactly once (rollup preferred),
+        # then extract cpu / cpu_max_core / mem / PSI in a single pass instead
+        # of issuing six series() queries + a separate rows() for PSI.  The
+        # column names differ between the rollup and raw tables, so pick them
+        # up front based on which table we actually read.
+        sys_rows = store.rows("sys_rollup_1m", since=since)
+        if sys_rows:
+            ts_key = "ts_min"
+            cpu_key, core_key, mem_key = "cpu_avg", "cpu_max_core_max", "mem_used_avg"
+            psi_keys = ("psi_cpu_max", "psi_mem_max", "psi_io_max")
+        else:
+            sys_rows = store.rows("sys_samples", since=since)
+            ts_key = "ts"
+            cpu_key, core_key, mem_key = "cpu_total", "cpu_max_core", "mem_used"
+            psi_keys = ("psi_cpu_some10", "psi_mem_some10", "psi_io_some10")
 
-        charts.cpu = cpu_series
-
-        # cpu_max_core from rollup if available, else raw
-        core_series = store.series("sys_rollup_1m", "cpu_max_core_max", since=since)
-        if not core_series:
-            core_series = store.series("sys_samples", "cpu_max_core", since=since)
-        charts.cpu_max_core = core_series
-
-        # mem_used
-        mem_series = store.series("sys_rollup_1m", "mem_used_avg", since=since)
-        if not mem_series:
-            mem_series = store.series("sys_samples", "mem_used", since=since)
-        charts.mem_used = mem_series
-
-        # PSI — need three columns together; query rows() and build tuples
-        psi_rows = store.rows("sys_rollup_1m", since=since)
-        if not psi_rows:
-            psi_rows = store.rows("sys_samples", since=since)
+        cpu_series: List[Tuple[float, float]] = []
+        core_series: List[Tuple[float, float]] = []
+        mem_series: List[Tuple[float, float]] = []
         psi_list: List[Tuple[float, float, float, float]] = []
-        for row in psi_rows:
-            ts_key = "ts_min" if "ts_min" in row.keys() else "ts"
+        for row in sys_rows:
             ts = row[ts_key]
             if ts is None:
                 continue
-            keys = row.keys()
-            c_val = (
-                row["psi_cpu_max"]
-                if "psi_cpu_max" in keys
-                else (row["psi_cpu_some10"] if "psi_cpu_some10" in keys else None)
-            )
-            m_val = (
-                row["psi_mem_max"]
-                if "psi_mem_max" in keys
-                else (row["psi_mem_some10"] if "psi_mem_some10" in keys else None)
-            )
-            i_val = (
-                row["psi_io_max"]
-                if "psi_io_max" in keys
-                else (row["psi_io_some10"] if "psi_io_some10" in keys else None)
-            )
-            if c_val is None and m_val is None and i_val is None:
-                continue
-            psi_list.append(
-                (
-                    float(ts),
-                    float(c_val) if c_val is not None else 0.0,
-                    float(m_val) if m_val is not None else 0.0,
-                    float(i_val) if i_val is not None else 0.0,
+            tsf = float(ts)
+            cpu_v = row[cpu_key]
+            if cpu_v is not None:
+                cpu_series.append((tsf, float(cpu_v)))
+            core_v = row[core_key]
+            if core_v is not None:
+                core_series.append((tsf, float(core_v)))
+            mem_v = row[mem_key]
+            if mem_v is not None:
+                mem_series.append((tsf, float(mem_v)))
+            c_val, m_val, i_val = (row[k] for k in psi_keys)
+            if c_val is not None or m_val is not None or i_val is not None:
+                psi_list.append(
+                    (
+                        tsf,
+                        float(c_val) if c_val is not None else 0.0,
+                        float(m_val) if m_val is not None else 0.0,
+                        float(i_val) if i_val is not None else 0.0,
+                    )
                 )
-            )
+        charts.cpu = cpu_series
+        charts.cpu_max_core = core_series
+        charts.mem_used = mem_series
         charts.psi = psi_list
 
         # --- disk series ---
@@ -181,11 +242,14 @@ def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
         spike_rows = store.rows("spike_events")
         spikes: List[dict] = []
         for row in spike_rows:
+            keys = row.keys()
+            top_raw = row["top_processes"] if "top_processes" in keys else None
             spikes.append(
                 {
                     "ts": row["ts"],
                     "trigger_type": row["trigger_type"],
                     "psi_snapshot": row["psi_snapshot"],
+                    "top_processes": _parse_top_processes(top_raw, store),
                 }
             )
         charts.spikes = spikes
@@ -228,7 +292,14 @@ def render_terminal(
 
     lines.append("")
 
-    if diag.healthy:
+    if diag.no_data and not diag.findings:
+        warn = _c(_ANSI.get(Severity.WARNING, ""), color)
+        lines.append(
+            f"{_c(_BOLD, color)}{warn}"
+            f"⚠ 観測データがありません。procdiag record でデータを記録してから "
+            f"再度 check してください。{_c(_RESET, color)}"
+        )
+    elif diag.healthy:
         lines.append(
             f"{_c(_BOLD, color)}{_c(_GREEN, color)}"
             f"診断: 問題は見つかりませんでした。{_c(_RESET, color)}"
@@ -292,6 +363,7 @@ def render_json(diag: Diagnosis) -> str:
     return json.dumps(
         {
             "healthy": diag.healthy,
+            "no_data": diag.no_data,
             "findings": [f.to_dict() for f in diag.findings],
             "quality": diag.quality.to_dict(),
             "reasoning": list(diag.reasoning),
@@ -308,6 +380,10 @@ def render_json(diag: Diagnosis) -> str:
 # ---------------------------------------------------------------------------
 
 _SVG_PALETTE = ["#4a90d9", "#e06c2b", "#2ba56c"]
+# Per-series dash patterns so PSI lines stay distinguishable without colour
+# (red/green colour-blindness, monochrome print): CPU solid / MEM dashed /
+# IO dotted.  Empty string = solid line.
+_PSI_DASHES = ["", "6 3", "2 3"]
 
 
 def _bucket_downsample(
@@ -351,6 +427,8 @@ def _polyline_svg(
     unit: str = "",
     y_max: float | None = None,
     color: str = "#4a90d9",
+    threshold: float | None = None,
+    threshold_label: str = "",
 ) -> str:
     """Generate a minimal SVG polyline for *series*.
 
@@ -378,6 +456,9 @@ def _polyline_svg(
     v_max_data = max(v for _, v in pts)
     if y_max is None:
         y_max = v_max_data if v_max_data > 0 else 1.0
+    # Keep a threshold guide line on-scale when it sits above the data.
+    if threshold is not None and threshold > y_max:
+        y_max = threshold
     y_range = y_max if y_max > 0 else 1.0
 
     # Margin for axis labels
@@ -401,12 +482,24 @@ def _polyline_svg(
     t_end = datetime.fromtimestamp(ts_max).strftime(fmt)
     y_label = f"{y_max:.0f}{unit}"
 
+    threshold_svg = ""
+    if threshold is not None:
+        ty = round(margin_top + (1.0 - min(threshold, y_range) / y_range) * chart_h, 1)
+        threshold_svg = (
+            f'<line x1="{margin_left}" y1="{ty}" x2="{w - margin_right}" y2="{ty}" '
+            f'stroke="#c0392b" stroke-width="1" stroke-dasharray="4 3" opacity="0.75"/>'
+            f'<text x="{w - margin_right}" y="{ty - 2}" text-anchor="end" '
+            f'font-size="9" fill="#c0392b">{_html_lib.escape(threshold_label)}</text>'
+        )
+
     return (
         f'<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">'
         f'<rect width="{w}" height="{h}" fill="#fafafa" rx="4"/>'
         # y-axis max label
         f'<text x="{margin_left - 2}" y="{margin_top + 4}" '
         f'text-anchor="end" font-size="10" fill="#666">{_html_lib.escape(y_label)}</text>'
+        # threshold guide line (rule decision boundary)
+        f"{threshold_svg}"
         # polyline
         f'<polyline points="{polyline_pts}" '
         f'fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>'
@@ -429,6 +522,8 @@ def _psi_svg(
     *,
     w: int = 720,
     h: int = 120,
+    threshold: float | None = None,
+    threshold_label: str = "",
 ) -> str:
     """Generate a 3-series PSI SVG with a legend.
 
@@ -456,6 +551,9 @@ def _psi_svg(
     # y-max across all three series
     all_vals = [v for s in series_list for _, v in s]
     y_max_data = max(all_vals) if all_vals else 1.0
+    # Expand the scale so a threshold guide above the data stays visible.
+    if threshold is not None and threshold > y_max_data:
+        y_max_data = threshold
     y_range = y_max_data if y_max_data > 0 else 1.0
 
     legend_h = 16
@@ -472,23 +570,26 @@ def _psi_svg(
         return (round(x, 1), round(y, 1))
 
     lines_svg = ""
-    for series, color in zip(series_list, colors):
+    for series, color, dash in zip(series_list, colors, _PSI_DASHES):
         if not series:
             continue
         pts = " ".join(f"{px(ts, v)[0]},{px(ts, v)[1]}" for ts, v in series)
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         lines_svg += (
             f'<polyline points="{pts}" fill="none" stroke="{color}" '
-            f'stroke-width="1.5" stroke-linejoin="round"/>'
+            f'stroke-width="1.5" stroke-linejoin="round"{dash_attr}/>'
         )
 
     # Legend
     legend_y = h - legend_h + 2
     legend_svg = ""
-    for idx, (lbl, col) in enumerate(zip(labels, colors)):
+    for idx, (lbl, col, dash) in enumerate(zip(labels, colors, _PSI_DASHES)):
         lx = margin_left + idx * 100
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         legend_svg += (
-            f'<rect x="{lx}" y="{legend_y}" width="12" height="8" fill="{col}"/>'
-            f'<text x="{lx + 15}" y="{legend_y + 8}" font-size="10" fill="#333">'
+            f'<line x1="{lx}" y1="{legend_y + 5}" x2="{lx + 14}" y2="{legend_y + 5}" '
+            f'stroke="{col}" stroke-width="2"{dash_attr}/>'
+            f'<text x="{lx + 18}" y="{legend_y + 8}" font-size="10" fill="#333">'
             f"{_html_lib.escape(lbl)}</text>"
         )
 
@@ -497,11 +598,22 @@ def _psi_svg(
     t_end = datetime.fromtimestamp(ts_max).strftime(fmt)
     y_label = f"{y_max_data:.0f}%"
 
+    threshold_svg = ""
+    if threshold is not None:
+        ty = round(margin_top + (1.0 - min(threshold, y_range) / y_range) * chart_h, 1)
+        threshold_svg = (
+            f'<line x1="{margin_left}" y1="{ty}" x2="{w - margin_right}" y2="{ty}" '
+            f'stroke="#c0392b" stroke-width="1" stroke-dasharray="4 3" opacity="0.75"/>'
+            f'<text x="{w - margin_right}" y="{ty - 2}" text-anchor="end" '
+            f'font-size="9" fill="#c0392b">{_html_lib.escape(threshold_label)}</text>'
+        )
+
     return (
         f'<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">'
         f'<rect width="{w}" height="{h}" fill="#fafafa" rx="4"/>'
         f'<text x="{margin_left - 2}" y="{margin_top + 4}" '
         f'text-anchor="end" font-size="10" fill="#666">{_html_lib.escape(y_label)}</text>'
+        + threshold_svg
         + lines_svg
         + f'<text x="{margin_left}" y="{margin_top + chart_h + margin_bottom - 4}" '
         f'font-size="10" fill="#666">{_html_lib.escape(t_start)}</text>'
@@ -539,7 +651,22 @@ th { background: #f0f0f0; text-align: left; }
 .chart-row { margin: .75rem 0; }
 .chart-label { font-size: .85rem; color: #555; margin-bottom: .1rem; }
 .spike-table td { font-size: .82rem; }
+@media print {
+  /* Colour-independent fallback so a monochrome printout still distinguishes
+     severities (badges become bordered, finding rules thicken their border). */
+  .badge-ok, .badge-warn, .badge-crit {
+    background: #fff !important; color: #000 !important; border: 1.5px solid #000;
+  }
+  .finding { border-left-width: 6px; }
+}
 """
+
+
+_SEV_SYMBOL = {
+    Severity.CRITICAL: "✘",
+    Severity.WARNING: "⚠",
+    Severity.INFO: "ℹ",
+}
 
 
 def render_html(
@@ -569,7 +696,10 @@ def render_html(
     title = hostname_label or meta_hostname or "procdiag レポート"
 
     # --- ① サマリ ---
-    if diag.healthy:
+    if diag.no_data and not diag.findings:
+        badge = '<span class="badge-warn">観測データなし</span>'
+        verdict = "観測データがありません。procdiag record でデータを記録してください"
+    elif diag.healthy:
         badge = '<span class="badge-ok">正常</span>'
         verdict = "問題は見つかりませんでした"
     else:
@@ -583,12 +713,7 @@ def render_html(
 
     finding_rows = ""
     for f in diag.findings:
-        sev_map = {
-            Severity.CRITICAL: "✘",
-            Severity.WARNING: "⚠",
-            Severity.INFO: "ℹ",
-        }
-        sym = sev_map.get(f.severity, "")
+        sym = _SEV_SYMBOL.get(f.severity, "")
         conf_ja = _confidence_ja(
             f.confidence.value if hasattr(f.confidence, "value") else f.confidence
         )
@@ -634,7 +759,7 @@ def render_html(
 
         detail_html += f"""
 <div class="finding {sev_cls}">
-  <h3>{esc(f.rule_id)} — {esc(f.summary)} <small>[確信度: {esc(conf_ja)}]</small></h3>
+  <h3>{esc(_SEV_SYMBOL.get(f.severity, ""))} {esc(f.rule_id)} — {esc(f.summary)} <small>[確信度: {esc(conf_ja)}]</small></h3>
   <div class="proposal">{proposal_html}</div>
   {related_html}
 </div>
@@ -662,6 +787,8 @@ def render_html(
             unit="%",
             y_max=100.0,
             color="#e06c2b",
+            threshold=95.0,  # CPU-SINGLECORE-01 (_CPU_SINGLECORE_CORE_PCT)
+            threshold_label="単一コア飽和 95%",
         )
         charts_html += f'<div class="chart-row">{core_svg}</div>'
 
@@ -679,7 +806,11 @@ def render_html(
         charts_html += f'<div class="chart-row">{mem_svg}</div>'
 
         # PSI
-        psi_svg = _psi_svg(charts.psi)
+        psi_svg = _psi_svg(
+            charts.psi,
+            threshold=20.0,  # CPU-SATURATION-01 (_CPU_SATURATION_PSI_THRESHOLD)
+            threshold_label="CPU飽和 20%",
+        )
         charts_html += f'<div class="chart-row">{psi_svg}</div>'
 
         # Disk mount points
@@ -699,19 +830,30 @@ def render_html(
     spike_list = charts.spikes if charts else []
     for ev in spike_list:
         ts_str = datetime.fromtimestamp(ev.get("ts", 0)).strftime("%Y-%m-%d %H:%M:%S")
+        psi_str = _format_psi_snapshot(ev.get("psi_snapshot", ""))
+        procs = ev.get("top_processes") or []
+        if procs:
+            procs_str = " / ".join(
+                f"{esc(p.get('name', '?'))}(pid {esc(p.get('pid', '?'))}) "
+                f"CPU {_fmt_pct(p.get('cpu_pct'))}"
+                for p in procs
+            )
+        else:
+            procs_str = "—"
         spike_rows_html += (
             f"<tr class='spike-table'>"
             f"<td>{esc(ts_str)}</td>"
             f"<td>{esc(ev.get('trigger_type', ''))}</td>"
-            f"<td><small>{esc(ev.get('psi_snapshot', ''))}</small></td>"
+            f"<td><small>{esc(psi_str)}</small></td>"
+            f"<td><small>{procs_str}</small></td>"
             f"</tr>"
         )
 
     spike_section = f"""
 <h2>④ スパイクイベント一覧</h2>
 <table>
-  <thead><tr><th>時刻</th><th>種別</th><th>PSIスナップショット</th></tr></thead>
-  <tbody>{spike_rows_html if spike_rows_html else '<tr><td colspan="3">イベントなし</td></tr>'}</tbody>
+  <thead><tr><th>時刻</th><th>種別</th><th>PSI (CPU/MEM/IO)</th><th>上位プロセス (CPU順)</th></tr></thead>
+  <tbody>{spike_rows_html if spike_rows_html else '<tr><td colspan="4">イベントなし</td></tr>'}</tbody>
 </table>
 """
 
@@ -732,7 +874,10 @@ def render_html(
 </div>
 """
 
-    generated_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # Times shown in the HTML (chart axes, spike table) come from
+    # datetime.fromtimestamp() and are therefore in the host's *local* zone.
+    # Keep the footer consistent (local + %Z) instead of mixing in UTC.
+    generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -741,7 +886,7 @@ def render_html(
 {_CSS}
 </style></head><body>
 <h1>{esc(title)}</h1>
-<p style="color:#888;font-size:.85rem;">生成日時: {esc(generated_at)} / procdiag {esc(procdiag.__version__)}</p>
+<p style="color:#888;font-size:.85rem;">生成日時: {esc(generated_at)} / procdiag {esc(procdiag.__version__)} ／ 時刻はすべてホストのローカルタイム</p>
 {summary_section}
 {proposal_section}
 {charts_html}

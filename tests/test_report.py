@@ -566,7 +566,7 @@ class TestBuildChartsRobustness:
             def _boom(*_a, **_k):
                 raise ValueError("unexpected boom")
 
-            monkeypatch.setattr(ro, "series", _boom)
+            monkeypatch.setattr(ro, "rows", _boom)
             # A non-DB error must propagate, not be silently swallowed.
             with pytest.raises(ValueError):
                 build_charts(ro)
@@ -593,3 +593,172 @@ class TestRenderHtmlHostname:
     def test_default_title_when_neither(self) -> None:
         html = render_html(_healthy_diag())
         assert "procdiag レポート" in html
+
+
+# ---------------------------------------------------------------------------
+# no_data rendering (empty DB must not render as『正常』) — issue v0.3 §1-1
+# ---------------------------------------------------------------------------
+
+
+class TestNoData:
+    @staticmethod
+    def _no_data_diag() -> Diagnosis:
+        return Diagnosis(
+            findings=[],
+            healthy=True,
+            quality=_make_quality(span_hours=0.0),
+            no_data=True,
+        )
+
+    def test_terminal_shows_no_data_warning(self) -> None:
+        out = render_terminal(self._no_data_diag(), color=False)
+        assert "観測データがありません" in out
+        assert "問題は見つかりませんでした" not in out
+
+    def test_json_has_no_data_key(self) -> None:
+        parsed = json.loads(render_json(self._no_data_diag()))
+        assert parsed["no_data"] is True
+
+    def test_json_no_data_false_by_default(self) -> None:
+        parsed = json.loads(render_json(_healthy_diag()))
+        assert parsed["no_data"] is False
+
+    def test_html_shows_no_data_badge(self) -> None:
+        out = render_html(self._no_data_diag())
+        assert "観測データなし" in out
+        # The green『正常』badge element must not be emitted (the CSS rule
+        # ``.badge-ok { … }`` is always present in <style>, so assert on the
+        # element's ``class="badge-ok"`` usage, not the bare class name).
+        assert 'class="badge-ok"' not in out
+
+
+# ---------------------------------------------------------------------------
+# Chart threshold guide lines (rule decision boundaries) — issue v0.3 §1-4
+# ---------------------------------------------------------------------------
+
+
+class TestThresholdLines:
+    def test_cpu_max_core_threshold_drawn(self) -> None:
+        out = render_html(_finding_diag(), _charts_with_data())
+        assert "単一コア飽和 95%" in out
+        assert "stroke-dasharray" in out
+
+    def test_psi_threshold_drawn(self) -> None:
+        out = render_html(_finding_diag(), _charts_with_data())
+        assert "CPU飽和 20%" in out
+
+
+# ---------------------------------------------------------------------------
+# Spike culprit names + formatted PSI snapshot — issue v0.3 §1-3
+# ---------------------------------------------------------------------------
+
+
+class TestSpikeCulprits:
+    def test_build_charts_resolves_culprit_names(self, tmp_path) -> None:
+        db = tmp_path / "spike.db"
+        now = time.time()
+        with Storage(db) as store:
+            store.conn.execute(
+                "INSERT INTO proc_registry "
+                "(proc_id, name, cmdline_hash, cmdline_sample, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (7, "mysqld", "h", "mysqld --opt", now, now),
+            )
+            top = json.dumps(
+                {
+                    "by_cpu": [
+                        {
+                            "ts": now,
+                            "proc_id": 7,
+                            "pid": 1234,
+                            "cpu_pct": 87.5,
+                            "rss": 1000,
+                        }
+                    ],
+                    "by_rss": [],
+                }
+            )
+            store.conn.execute(
+                "INSERT INTO spike_events "
+                "(ts, trigger_type, psi_snapshot, top_processes, top_cgroups) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now, "cpu", '{"cpu_some10": 40}', top, "[]"),
+            )
+            store.conn.commit()
+            charts = build_charts(store)
+
+        assert len(charts.spikes) == 1
+        procs = charts.spikes[0]["top_processes"]
+        assert procs and procs[0]["name"] == "mysqld"
+        assert procs[0]["pid"] == 1234
+
+    def test_build_charts_handles_empty_top_processes(self, tmp_path) -> None:
+        """A spike row with ``"[]"`` top_processes must not raise."""
+        db = tmp_path / "spike2.db"
+        now = time.time()
+        with Storage(db) as store:
+            store.conn.execute(
+                "INSERT INTO spike_events "
+                "(ts, trigger_type, psi_snapshot, top_processes, top_cgroups) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now, "cpu", "{}", "[]", "[]"),
+            )
+            store.conn.commit()
+            charts = build_charts(store)
+        assert charts.spikes[0]["top_processes"] == []
+
+    def test_render_html_shows_culprit_and_formatted_psi(self) -> None:
+        spikes = [
+            {
+                "ts": time.time(),
+                "trigger_type": "cpu",
+                "psi_snapshot": '{"cpu_some10": 40, "mem_some10": 1, "io_some10": 9}',
+                "top_processes": [
+                    {"name": "mysqld", "pid": 1234, "cpu_pct": 87.5, "rss": 1000}
+                ],
+            }
+        ]
+        out = render_html(_finding_diag(), ChartData(spikes=spikes))
+        assert "上位プロセス" in out  # new column header
+        assert "mysqld" in out
+        assert "pid 1234" in out
+        assert "CPU 40%" in out  # formatted PSI snapshot, not raw JSON
+        assert "cpu_some10" not in out  # raw JSON keys no longer leak into HTML
+
+
+# ---------------------------------------------------------------------------
+# Colour-independent encoding (colour-blind / mono print) — issue v0.3 §1-5
+# ---------------------------------------------------------------------------
+
+
+class TestColourIndependence:
+    def test_psi_lines_use_dash_patterns(self) -> None:
+        out = render_html(_finding_diag(), _charts_with_data())
+        # MEM PSI line is dashed ("6 3"); proves lines differ by more than hue.
+        assert 'stroke-dasharray="6 3"' in out
+
+    def test_print_media_query_present(self) -> None:
+        out = render_html(_finding_diag(), _charts_with_data())
+        assert "@media print" in out
+
+    def test_finding_card_has_severity_symbol(self) -> None:
+        # _finding_diag() has a WARNING finding → the detail card heading is
+        # prefixed with ⚠ (distinct from the colour-only left border).
+        out = render_html(_finding_diag())
+        assert "⚠ MEM-LEAK-01" in out
+
+
+# ---------------------------------------------------------------------------
+# Local-timezone consistency in HTML — issue v0.3 §3-4
+# ---------------------------------------------------------------------------
+
+
+class TestLocalTimezone:
+    def test_html_footer_notes_local_time(self) -> None:
+        out = render_html(_finding_diag())
+        assert "ローカルタイム" in out
+
+    def test_json_generated_at_is_utc_iso(self) -> None:
+        # JSON stays machine-readable UTC ISO-8601 (unchanged contract).
+        parsed = json.loads(render_json(_finding_diag()))
+        assert parsed["generated_at"].endswith("+00:00")

@@ -759,3 +759,54 @@ class TestGapSecondsAggregation:
         # 3.0.  Correct behaviour: 12.5 + 7.0 + 30.0 = 49.5 seconds.
         assert diag.quality.gap_seconds == pytest.approx(49.5)
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# no_data signal (empty DB must not look healthy) — issue v0.3 §1-1 / A-01
+# ---------------------------------------------------------------------------
+
+
+class TestNoData:
+    """An empty DB must set diag.no_data=True, not a false『healthy』."""
+
+    def test_no_data_flag_when_db_empty(self, tmp_path):
+        store = make_db(tmp_path)  # schema only, zero samples
+        diag = Engine(_cfg(min_obs_hours=0.0)).run(store)
+        assert diag.no_data is True
+        assert diag.findings == []
+        store.close()
+
+    def test_no_data_false_when_samples_present(self, tmp_path):
+        store = make_db(tmp_path, hours=8.0)
+        add_sys_baseline(store, hours=8.0)
+        store.conn.commit()
+        diag = Engine(_cfg(min_obs_hours=6.0)).run(store)
+        assert diag.no_data is False
+        store.close()
+
+    def test_no_data_false_when_only_rollup_present(self, tmp_path):
+        """sys_samples empty but sys_rollup_1m present → still counts as data."""
+        store = make_db(tmp_path)
+        minute = int(time.time() / 60) * 60.0
+        store.buffer(
+            "sys_rollup_1m",
+            [(minute, 20.0, 30.0, 25.0, 40.0, 1_000_000, 1_100_000, 0.0, 0.0, 0.0, 0)],
+        )
+        store.flush()
+        diag = Engine(_cfg(min_obs_hours=0.0)).run(store)
+        assert diag.no_data is False
+        store.close()
+
+    def test_short_recording_is_not_no_data(self, tmp_path):
+        """Data exists but span < min_observation_hours → healthy, NOT no_data.
+
+        no_data is reserved for a genuinely empty DB; a short recording still
+        has observations and must keep no_data=False.
+        """
+        store = make_db(tmp_path, hours=2.0)
+        add_sys_baseline(store, hours=2.0)
+        store.conn.commit()
+        diag = Engine(_cfg(min_obs_hours=6.0)).run(store)
+        assert diag.no_data is False
+        assert diag.healthy is True
+        store.close()

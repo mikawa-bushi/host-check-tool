@@ -19,8 +19,9 @@ Key design choices:
 * **PSS scrutiny mode** — if a process's ``proc_id`` is in ``pss_targets``
   (populated by T06 rules), the sampler additionally reads
   ``ctx.proc_root/<pid>/smaps_rollup`` and extracts the ``Pss:`` line.
-* **Zombie counting** — processes with ``status == "zombie"`` are counted in
-  ``last_zombie_count`` for the ZOMBIE-01 rule.
+* **num_fds throttling** — ``num_fds()`` scans ``/proc/<pid>/fd`` and is the
+  most expensive per-process call; it is sampled ~once per minute since
+  FD-LEAK-01 only reads fds at 1-minute rollup granularity.
 
 Process identity uses ``normalize_cmdline`` + ``resolve_proc`` (injected
 callable) following the proc_registry contract from design §5.2.
@@ -107,8 +108,9 @@ class ProcessSampler(Sampler):
         self.io_total: int = 0
         # PSS scrutiny: set of proc_ids (max 5) for which smaps_rollup is read.
         self.pss_targets: set[int] = set()
-        # Zombie count from the last collect tick.
-        self.last_zombie_count: int = 0
+        # Tick counter used to throttle the expensive num_fds() /proc/<pid>/fd
+        # scan to roughly once per minute instead of every tick.
+        self._tick: int = 0
 
     def setup(self, ctx: RunContext) -> None:
         """No capability detection needed for process scanning."""
@@ -117,7 +119,15 @@ class ProcessSampler(Sampler):
         """Scan all processes and return ``proc_samples`` rows."""
         ts = time.time()
         rows: list[tuple] = []
-        zombie_count = 0
+
+        # num_fds() opens and scans /proc/<pid>/fd for every process — the most
+        # expensive per-process syscall here.  FD-LEAK-01 reads fds at 1-minute
+        # rollup granularity, so sampling it roughly once per minute (rather than
+        # every tick) is lossless for the rule while cutting the scan cost.
+        interval = max(ctx.config.sampling.process_interval, 1.0)
+        fd_every = max(1, round(60.0 / interval))
+        read_fds = self._tick % fd_every == 0
+        self._tick += 1
 
         # Refresh the PID cache: discover new PIDs, remove stale ones.
         try:
@@ -166,10 +176,16 @@ class ProcessSampler(Sampler):
                     except (psutil.AccessDenied, psutil.ZombieProcess):
                         num_threads = None
 
-                    try:
-                        num_fds: Optional[int] = proc.num_fds()
-                    except (psutil.AccessDenied, psutil.ZombieProcess, AttributeError):
-                        num_fds = None
+                    num_fds: Optional[int] = None
+                    if read_fds:
+                        try:
+                            num_fds = proc.num_fds()
+                        except (
+                            psutil.AccessDenied,
+                            psutil.ZombieProcess,
+                            AttributeError,
+                        ):
+                            num_fds = None
 
                     # I/O counters — AccessDenied is expected for
                     # processes owned by other users when running non-root.
@@ -196,11 +212,6 @@ class ProcessSampler(Sampler):
                             cur_r = None
                             cur_w = None
 
-                    try:
-                        status: str = proc.status()
-                    except (psutil.AccessDenied, psutil.ZombieProcess):
-                        status = "unknown"
-
             except psutil.NoSuchProcess:
                 # Process died between the pid listing and oneshot.
                 del self._pid_cache[pid]
@@ -213,10 +224,6 @@ class ProcessSampler(Sampler):
             except Exception:
                 # Any other unexpected error — skip gracefully.
                 continue
-
-            # Zombie counting.
-            if status == "zombie":
-                zombie_count += 1
 
             # Normalise cmdline and resolve the registry ID once per PID;
             # later ticks reuse the cached identity.
@@ -277,12 +284,10 @@ class ProcessSampler(Sampler):
                 )
             )
 
-        self.last_zombie_count = zombie_count
-
-        # Clean up stale _prev_io entries for pids that no longer exist.
-        live_pid_set = set(self._pid_cache.keys())
+        # Clean up stale _prev_io entries for pids that no longer exist
+        # (membership-test the cache dict directly — no set rebuild needed).
         for key in list(self._prev_io):
-            if key[1] not in live_pid_set:
+            if key[1] not in self._pid_cache:
                 del self._prev_io[key]
 
         return [SampleBatch(table="proc_samples", rows=rows)]

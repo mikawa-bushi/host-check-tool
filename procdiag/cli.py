@@ -24,12 +24,15 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
 
 from . import __version__
 from .plugins import load_plugins
+
+if TYPE_CHECKING:
+    from .config import ProcdiagConfig
 
 # ---------------------------------------------------------------------------
 # Version resolution (mirrors netdiag _resolve_version)
@@ -51,6 +54,68 @@ def _resolve_version() -> str:
             return __version__
     except ImportError:  # pragma: no cover
         return __version__
+
+
+# ---------------------------------------------------------------------------
+# Shared command helpers
+# ---------------------------------------------------------------------------
+
+# Exit code for usage / precondition errors (missing DB, unreadable config),
+# kept distinct from the diagnosis-result codes (0/1/2/3) so automation can
+# tell a broken observation pipeline (no DB = record never ran) from an
+# unhealthy host.
+_EXIT_USAGE = 4
+
+_DB_MISSING_MSG = (
+    "エラー: DB ファイルが見つかりません: {db}\n"
+    "先に procdiag record を実行してください。"
+)
+
+
+def _ensure_db_and_config(
+    config_path: Optional[str], db_path: Optional[str]
+) -> tuple[ProcdiagConfig, str]:
+    """Load config, resolve the DB path, and exit (code 4) if the DB is absent.
+
+    Centralises the load_config + existence-check that check/report/status/
+    export/prune previously each repeated inline, and gives the DB-missing
+    case its own exit code (4) instead of overloading the diagnosis code 1.
+    """
+    from .config import load_config
+
+    cfg = load_config(Path(config_path) if config_path else None)
+    resolved_db = db_path or cfg.db_path
+    if not Path(resolved_db).exists():
+        click.echo(_DB_MISSING_MSG.format(db=resolved_db), err=True)
+        sys.exit(_EXIT_USAGE)
+    return cfg, resolved_db
+
+
+def _is_quiet(flag: bool) -> bool:
+    """Whether completion/progress messages should be suppressed.
+
+    True when ``--quiet`` is passed or ``PROCDIAG_QUIET`` is set — so unattended
+    systemd/cron runs don't spew per-invocation chatter into journald, and
+    ``--format json`` stays machine-clean on stdout.
+    """
+    return flag or bool(os.environ.get("PROCDIAG_QUIET"))
+
+
+def _can_show_unicode() -> bool:
+    """Best-effort check that stdout can render the ✔/⚠/ℹ status glyphs.
+
+    A POSIX/ascii locale (common on minimal serial consoles / journald pipes)
+    cannot, so doctor falls back to ASCII labels there.  When the encoding is
+    unknown we assume a modern UTF-8 terminal and return True.
+    """
+    enc = getattr(sys.stdout, "encoding", None)
+    if not enc:
+        return True
+    try:
+        "✔⚠ℹ".encode(enc)
+        return True
+    except (LookupError, UnicodeEncodeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +159,8 @@ def init(dir: str) -> None:
     click.echo(
         "\n次のステップ:\n"
         "  1. config.py を必要に応じて編集してください\n"
-        "  2. procdiag record --config config.py で記録を開始してください"
+        "  2. procdiag doctor --config config.py で観測能力を確認してください\n"
+        "  3. procdiag record --config config.py で記録を開始してください"
     )
 
 
@@ -185,6 +251,12 @@ def record(
     is_flag=True,
     help="info のみの Finding のとき終了コード 0 を返す (既定は 2)。CI 向け。",
 )
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
+)
 def check(
     db_path: Optional[str],
     config_path: Optional[str],
@@ -195,25 +267,20 @@ def check(
     verbose: bool,
     no_color: bool,
     exit_zero_on_info: bool,
+    quiet: bool,
 ) -> None:
     """記録済みデータに診断ルールを実行し、改善提案を出力します。
 
-    終了コード: 0=問題なし / 1=critical・warning あり / 2=info のみ
+    終了コード: 0=問題なし / 1=critical・warning あり / 2=info のみ /
+    3=観測データなし（DB にサンプルが1件もない＝記録が回っていない）/
+    4=前提条件エラー（DB ファイルが無い等）
     """
     from . import report as report_mod  # T07 — deferred
-    from .config import load_config
+    from .core.util import should_use_color
     from .diagnosis.engine import Engine  # T06 — deferred
     from .storage import Storage
 
-    cfg = load_config(Path(config_path) if config_path else None)
-    resolved_db = db_path or cfg.db_path
-
-    if not Path(resolved_db).exists():
-        click.echo(
-            "エラー: DBファイルが見つかりません。先に procdiag record を実行してください。",
-            err=True,
-        )
-        sys.exit(1)
+    cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
 
     only_list = [s.strip() for s in only.split(",")] if only else None
     skip_list = [s.strip() for s in skip.split(",")] if skip else None
@@ -242,12 +309,13 @@ def check(
             meta_hostname=meta_hostname,
         )
     else:
-        color = sys.stdout.isatty() and not no_color
+        color = should_use_color(no_color)
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
 
     if output:
         Path(output).write_text(text, encoding="utf-8")
-        click.echo(f"レポートを書き出しました: {output}")
+        if not _is_quiet(quiet):
+            click.echo(f"レポートを書き出しました: {output}")
     else:
         click.echo(text)
 
@@ -260,6 +328,10 @@ def check(
         sys.exit(1)
     if diag.findings and not exit_zero_on_info:
         sys.exit(2)
+    if diag.no_data and not diag.findings:
+        # Empty DB / no observation at all — distinct from a healthy host so
+        # callers (CI, wrappers) can tell "nothing recorded" from "all clear".
+        sys.exit(3)
     sys.exit(0)
 
 
@@ -300,27 +372,25 @@ _advise_cmd.hidden = True  # type: ignore[attr-defined]
     type=click.Path(),
     help="JSON レポートの出力先 (省略時はスキップ)。",
 )
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
+)
 def report(
     db_path: Optional[str],
     config_path: Optional[str],
     html_out: str,
     json_out: Optional[str],
+    quiet: bool,
 ) -> None:
     """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
     from . import report as report_mod  # T07 — deferred
-    from .config import load_config
     from .diagnosis.engine import Engine  # T06 — deferred
     from .storage import Storage
 
-    cfg = load_config(Path(config_path) if config_path else None)
-    resolved_db = db_path or cfg.db_path
-
-    if not Path(resolved_db).exists():
-        click.echo(
-            "エラー: DBファイルが見つかりません。先に procdiag record を実行してください。",
-            err=True,
-        )
-        sys.exit(1)
+    cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
 
     with Storage(resolved_db, read_only=True) as store:
         engine = Engine(cfg)
@@ -335,12 +405,15 @@ def report(
         meta_hostname=meta_hostname,
     )
     Path(html_out).write_text(html_text, encoding="utf-8")
-    click.echo(f"HTML レポートを書き出しました: {html_out}")
+    quiet_mode = _is_quiet(quiet)
+    if not quiet_mode:
+        click.echo(f"HTML レポートを書き出しました: {html_out}")
 
     if json_out:
         json_text = report_mod.render_json(diag)
         Path(json_out).write_text(json_text, encoding="utf-8")
-        click.echo(f"JSON レポートを書き出しました: {json_out}")
+        if not quiet_mode:
+            click.echo(f"JSON レポートを書き出しました: {json_out}")
 
 
 # ---------------------------------------------------------------------------
@@ -361,19 +434,10 @@ def report(
 )
 def status(db_path: Optional[str], fmt: str) -> None:
     """記録済み DB の概況 (期間、サンプル数、自己負荷) を表示します。"""
-    from .config import load_config
     from .core.util import humanize_bytes, humanize_duration
     from .storage import Storage
 
-    cfg = load_config()
-    resolved_db = db_path or cfg.db_path
-
-    if not Path(resolved_db).exists():
-        click.echo(
-            "エラー: DBファイルが見つかりません。先に procdiag record を実行してください。",
-            err=True,
-        )
-        sys.exit(1)
+    _cfg, resolved_db = _ensure_db_and_config(None, db_path)
 
     with Storage(resolved_db, read_only=True) as store:
         counts = store.counts()
@@ -414,6 +478,7 @@ def status(db_path: Optional[str], fmt: str) -> None:
         payload = {
             "meta": meta_dict,
             "counts": counts,
+            "has_data": counts.get("sys_samples", 0) > 0,
             "span": span_str,
             "start": start_str,
             "end": end_str,
@@ -445,6 +510,13 @@ def status(db_path: Optional[str], fmt: str) -> None:
         for ev in recent_events:
             ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["ts"]))
             click.echo(f"  [{ts_str}] {ev['kind']}  {ev['detail'] or ''}")
+
+    if counts.get("sys_samples", 0) == 0:
+        click.echo(
+            "\n⚠ まだサンプルがありません。procdiag record が稼働しているか、"
+            "--db のパスが正しいかを確認してください。",
+            err=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -653,26 +725,24 @@ def list_samplers() -> None:
     type=click.Path(),
     help="出力先ファイル (既定: - = stdout)。",
 )
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
+)
 def export(
     db_path: Optional[str],
     fmt: str,
     rollup: str,
     out_path: str,
+    quiet: bool,
 ) -> None:
     """記録データを CSV または JSON でエクスポートします。"""
-    from .config import load_config
     from .export import export_rows
     from .storage import Storage
 
-    cfg = load_config()
-    resolved_db = db_path or cfg.db_path
-
-    if not Path(resolved_db).exists():
-        click.echo(
-            "エラー: DBファイルが見つかりません。先に procdiag record を実行してください。",
-            err=True,
-        )
-        sys.exit(1)
+    _cfg, resolved_db = _ensure_db_and_config(None, db_path)
 
     table = "sys_samples" if rollup == "raw" else "sys_rollup_1m"
 
@@ -682,7 +752,8 @@ def export(
         else:
             with open(out_path, "w", encoding="utf-8", newline="") as fh:
                 count = export_rows(store, table=table, fmt=fmt, out=fh)
-            click.echo(f"{count} 行を書き出しました: {out_path}", err=True)
+            if not _is_quiet(quiet):
+                click.echo(f"{count} 行を書き出しました: {out_path}", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -706,34 +777,33 @@ def export(
     default=None,
     help="ロールアップの保持期間 (例: 90d)。省略時は config の値。",
 )
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
+)
 def prune(
     db_path: Optional[str],
     raw_retention: Optional[str],
     rollup_retention: Optional[str],
+    quiet: bool,
 ) -> None:
     """期限切れのサンプルを削除します (保持ポリシーの手動実行)。"""
-    from .config import load_config
     from .storage import Storage
 
-    cfg = load_config()
-    resolved_db = db_path or cfg.db_path
+    cfg, resolved_db = _ensure_db_and_config(None, db_path)
     raw = raw_retention or cfg.retention.raw
     rollup = rollup_retention or cfg.retention.rollup
-
-    if not Path(resolved_db).exists():
-        click.echo(
-            "エラー: DBファイルが見つかりません。先に procdiag record を実行してください。",
-            err=True,
-        )
-        sys.exit(1)
 
     with Storage(resolved_db) as store:
         result = store.retention(raw=raw, rollup=rollup)
 
-    click.echo(
-        f"削除完了: 生サンプル {result['raw_deleted']} 件, "
-        f"ロールアップ {result['rollup_deleted']} 件"
-    )
+    if not _is_quiet(quiet):
+        click.echo(
+            f"削除完了: 生サンプル {result['raw_deleted']} 件, "
+            f"ロールアップ {result['rollup_deleted']} 件"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -855,10 +925,17 @@ def service_install(
     default="text",
     help="出力フォーマット (既定: text)。",
 )
+@click.option(
+    "--ascii",
+    "ascii_",
+    is_flag=True,
+    help="記号を ASCII ([OK]/[WARN]/[INFO]) で出力する (Unicode 非対応端末向け)。",
+)
 def doctor(
     config_path: Optional[str],
     db_path: Optional[str],
     fmt: str,
+    ascii_: bool,
 ) -> None:
     """記録開始前にホストの観測能力を診断します。
 
@@ -890,20 +967,28 @@ def doctor(
             )
         )
     else:
-        _STATUS_SYMBOL = {"ok": "✔", "degraded": "⚠", "info": "ℹ"}
+        use_ascii = (
+            ascii_ or bool(os.environ.get("NO_COLOR")) or not _can_show_unicode()
+        )
+        if use_ascii:
+            status_symbol = {"ok": "[OK]", "degraded": "[WARN]", "info": "[INFO]"}
+            ok_mark, warn_mark = "[OK]", "[WARN]"
+        else:
+            status_symbol = {"ok": "✔", "degraded": "⚠", "info": "ℹ"}
+            ok_mark, warn_mark = "✔", "⚠"
         for c in checks:
-            sym = _STATUS_SYMBOL.get(c.status, "?")
+            sym = status_symbol.get(c.status, "?")
             click.echo(f"{sym} [{c.label}] {c.detail}")
 
         degraded_count = sum(1 for c in checks if c.status == "degraded")
         click.echo("")
         if degraded_count:
             click.echo(
-                f"⚠ {degraded_count} 件の降格があります。"
+                f"{warn_mark} {degraded_count} 件の降格があります。"
                 "記録は可能ですが該当データは欠損します"
             )
         else:
-            click.echo("✔ すべての観測能力が利用可能です")
+            click.echo(f"{ok_mark} すべての観測能力が利用可能です")
 
     degraded = any(c.status == "degraded" for c in checks)
     sys.exit(2 if degraded else 0)

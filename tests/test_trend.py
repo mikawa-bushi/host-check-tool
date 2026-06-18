@@ -18,12 +18,15 @@ from procdiag.core import Confidence
 from procdiag.diagnosis.trend import (
     Period,
     TrendFit,
+    baseline_deviation,
     confidence_from_fit,
+    confidence_from_span,
     detect_periodicity,
     detect_recurrence,
     extrapolate_full,
     find_sustained_episodes,
     fit_linear,
+    learn_baseline,
 )
 
 # ---------------------------------------------------------------------------
@@ -411,3 +414,47 @@ class TestFindSustainedEpisodes:
     def test_input_is_sorted_by_bucket(self):
         samples = [(120, 120.0, True), (0, 0.0, True), (60, 60.0, True)]
         assert find_sustained_episodes(samples, min_consecutive=3) == [(0.0, 120.0)]
+
+
+# ---------------------------------------------------------------------------
+# host-specific baseline (issue v0.3 §3-8)
+# ---------------------------------------------------------------------------
+
+
+class TestConfidenceFromSpan:
+    def test_ladder(self):
+        # HIGH needs both a long span and enough points (issue v0.3 §2-7).
+        assert confidence_from_span(30.0, 12) == Confidence.HIGH
+        assert confidence_from_span(30.0, 5) == Confidence.MEDIUM  # too few points
+        assert confidence_from_span(8.0, 50) == Confidence.MEDIUM  # span < 24h
+        assert confidence_from_span(2.0, 50) == Confidence.LOW
+
+
+class TestBaseline:
+    def test_learn_baseline_and_deviation(self):
+        from datetime import datetime
+
+        week = 7 * 24 * 3600
+        t0 = 1_700_000_000.0  # fixed epoch; same weekday/hour each +1 week
+        series = [(t0 + i * week, 10.0 + i) for i in range(5)]  # values 10..14
+        bl = learn_baseline(series, min_per_bin=3)
+
+        key = (datetime.fromtimestamp(t0).weekday(), datetime.fromtimestamp(t0).hour)
+        assert key in bl
+        med, mad = bl[key]
+        assert med == pytest.approx(12.0)  # median of 10..14
+        assert mad == pytest.approx(1.0)  # median(|v-12|)
+
+        # A value far above the usual level yields a large positive deviation.
+        dev = baseline_deviation(bl, t0, 30.0)
+        assert dev is not None and dev > 5
+
+    def test_unknown_bin_returns_none(self):
+        t0 = 1_700_000_000.0
+        bl = learn_baseline([(t0, 10.0)] * 0)  # empty
+        assert baseline_deviation(bl, t0, 50.0) is None
+
+    def test_sparse_bin_omitted(self):
+        t0 = 1_700_000_000.0
+        bl = learn_baseline([(t0, 10.0), (t0, 12.0)], min_per_bin=3)
+        assert bl == {}  # only 2 points in the bin, below min_per_bin
