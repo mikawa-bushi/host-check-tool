@@ -64,7 +64,11 @@ procdiag report --out report.html --json report.json
 procdiag record --duration 24h --config config.py --db data/procdiag.db
 procdiag check  --format json --output findings.json
 procdiag check  --only MEM-LEAK-01,DISK-FULL-01
+procdiag status --config /etc/procdiag/config.py   # DB の場所は config の db_path から
 ```
+
+`check` / `report` / `status` / `export` / `prune` は `--config` を受け取り、
+DB の場所 (`db_path`) と保持期間などを設定ファイルから解決する (`--db` 指定が優先)。
 
 ## 終了コード
 

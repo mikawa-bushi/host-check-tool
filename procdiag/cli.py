@@ -5,26 +5,23 @@ metrics, ``procdiag check`` (alias ``advise``) runs all rules and prints
 the root cause and next steps.  The remaining commands support that core
 workflow (status, export, explain, prune) or system integration (service).
 
-Design mirrors netdiag's ``cli.py`` verbatim where possible:
+Design mirrors netdiag's ``cli.py`` where possible:
 
-- ``click.group`` + ``version_option`` using ``_resolve_version``
-- Thin command handlers: all logic delegated to modules via *deferred* imports
-- Delayed imports for T05/T06/T07 modules (recorder, engine, report) so this
-  file's own import and the tests of non-record commands succeed even before
-  those parallel tasks are complete.
+- ``click.group`` + ``version_option``
+- Thin command handlers: all logic lives in the library modules, imported
+  inside each command so ``procdiag --help`` stays fast (no psutil / jinja2 /
+  rule-registry import just to print usage).
 - ``load_plugins()`` called once at group invocation (same as netdiag).
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
 import time
-from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import click
 
@@ -33,28 +30,8 @@ from .plugins import load_plugins
 
 if TYPE_CHECKING:
     from .config import ProcdiagConfig
-
-# ---------------------------------------------------------------------------
-# Version resolution (mirrors netdiag _resolve_version)
-# ---------------------------------------------------------------------------
-
-
-def _resolve_version() -> str:
-    """Installed package version, falling back to the in-tree ``__version__``.
-
-    Works both when pip-installed (distribution metadata present) and from a
-    source checkout.
-    """
-    try:
-        from importlib.metadata import PackageNotFoundError, version
-
-        try:
-            return version("host-check-tool")
-        except PackageNotFoundError:
-            return __version__
-    except ImportError:  # pragma: no cover
-        return __version__
-
+    from .core import Diagnosis
+    from .report import ChartData
 
 # ---------------------------------------------------------------------------
 # Shared command helpers
@@ -71,24 +48,59 @@ _DB_MISSING_MSG = (
     "先に procdiag record を実行してください。"
 )
 
+_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _db_option(help_text: str) -> Callable:
+    """``--db PATH`` option (overrides ``config.db_path``)."""
+    return click.option(
+        "--db", "db_path", default=None, type=click.Path(), help=help_text
+    )
+
+
+def _config_option(
+    help_text: str = "設定ファイルのパス (既定: ./config.py)。",
+) -> Callable:
+    """``--config PATH`` option."""
+    return click.option(
+        "--config", "config_path", default=None, type=click.Path(), help=help_text
+    )
+
+
+_quiet_option = click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
+)
+
+
+def _load_config(
+    config_path: Optional[str], db_path: Optional[str] = None
+) -> ProcdiagConfig:
+    """Load the config (``./config.py`` by default) with an optional DB override."""
+    from .config import load_config
+
+    cfg = load_config(Path(config_path) if config_path else None)
+    if db_path:
+        cfg = cfg.model_copy(update={"db_path": db_path})
+    return cfg
+
 
 def _ensure_db_and_config(
     config_path: Optional[str], db_path: Optional[str]
 ) -> tuple[ProcdiagConfig, str]:
     """Load config, resolve the DB path, and exit (code 4) if the DB is absent.
 
-    Centralises the load_config + existence-check that check/report/status/
-    export/prune previously each repeated inline, and gives the DB-missing
-    case its own exit code (4) instead of overloading the diagnosis code 1.
+    Centralises the load_config + existence-check shared by check/report/
+    status/export/prune, and gives the DB-missing case its own exit code (4)
+    instead of overloading the diagnosis code 1.
     """
-    from .config import load_config
-
-    cfg = load_config(Path(config_path) if config_path else None)
-    resolved_db = db_path or cfg.db_path
-    if not Path(resolved_db).exists():
-        click.echo(_DB_MISSING_MSG.format(db=resolved_db), err=True)
+    cfg = _load_config(config_path, db_path)
+    if not Path(cfg.db_path).exists():
+        click.echo(_DB_MISSING_MSG.format(db=cfg.db_path), err=True)
         sys.exit(_EXIT_USAGE)
-    return cfg, resolved_db
+    return cfg, cfg.db_path
 
 
 def _is_quiet(flag: bool) -> bool:
@@ -118,13 +130,69 @@ def _can_show_unicode() -> bool:
         return False
 
 
+def _split_ids(value: Optional[str]) -> Optional[list[str]]:
+    """``"A, B"`` -> ``["A", "B"]`` for the ``--only`` / ``--skip`` options."""
+    return [s.strip() for s in value.split(",")] if value else None
+
+
+def _load_registries() -> None:
+    """Import the built-in rule and sampler modules to fill both registries."""
+    from . import diagnosis, samplers  # noqa: F401  (imported for registration)
+
+
+def _diagnose(
+    cfg: ProcdiagConfig,
+    db: str,
+    *,
+    only: Optional[list[str]] = None,
+    skip: Optional[list[str]] = None,
+    verbose: bool = False,
+    with_charts: bool = False,
+) -> tuple[Diagnosis, Optional[ChartData], Optional[str]]:
+    """Run the rules on *db*; return ``(diagnosis, charts, meta_hostname)``.
+
+    Charts and the recorded hostname are only needed for HTML output, so they
+    are read (inside the open connection) only when *with_charts* is set and
+    are ``None`` otherwise.
+    """
+    from .diagnosis import Engine
+    from .report import build_charts
+    from .storage import Storage
+
+    charts = None
+    meta_hostname = None
+    with Storage(db, read_only=True) as store:
+        diag = Engine(cfg, verbose=verbose).run(store, only=only, skip=skip)
+        if with_charts:
+            charts = build_charts(store)
+            meta_hostname = store.meta().get("hostname")
+    return diag, charts, meta_hostname
+
+
+def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
+    """Map a diagnosis to the documented ``check`` exit code.
+
+    0=healthy / 1=critical or warning / 2=info-only findings (0 with
+    ``exit_zero_on_info``, for CI) / 3=no observation data at all.
+    """
+    if any(f.severity.value in ("warning", "critical") for f in diag.findings):
+        return 1
+    if diag.findings and not exit_zero_on_info:
+        return 2
+    if diag.no_data and not diag.findings:
+        # Empty DB / no observation at all — distinct from a healthy host so
+        # callers (CI, wrappers) can tell "nothing recorded" from "all clear".
+        return 3
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI group
 # ---------------------------------------------------------------------------
 
 
 @click.group()
-@click.version_option(version=_resolve_version(), prog_name="procdiag")
+@click.version_option(version=__version__, prog_name="procdiag")
 def cli() -> None:
     """procdiag — local-first Linux ホスト資源診断ツール。"""
     load_plugins()
@@ -173,31 +241,16 @@ def init(dir: str) -> None:
 @click.option(
     "--duration", default=None, help="記録時間 (例: 24h, 60s)。省略時は無期限。"
 )
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="設定ファイルのパス (既定: ./config.py)。",
-)
-@click.option(
-    "--db",
-    "db_path",
-    default=None,
-    type=click.Path(),
-    help="記録先 DB ファイルのパス (config の db_path を上書き)。",
-)
+@_config_option()
+@_db_option("記録先 DB ファイルのパス (config の db_path を上書き)。")
 def record(
     duration: Optional[str], config_path: Optional[str], db_path: Optional[str]
 ) -> None:
     """CPU・メモリ・ディスクを記録します (フォアグラウンド)。Ctrl-C で安全に停止します。"""
-    from .config import load_config
     from .core.util import parse_duration
-    from .recorder import Recorder  # T05 — deferred
+    from .recorder import Recorder
 
-    cfg = load_config(Path(config_path) if config_path else None)
-    if db_path:
-        cfg = cfg.model_copy(update={"db_path": db_path})
+    cfg = _load_config(config_path, db_path)
 
     duration_sec: Optional[float] = None
     if duration:
@@ -218,20 +271,8 @@ def record(
 
 
 @cli.command()
-@click.option(
-    "--db",
-    "db_path",
-    default=None,
-    type=click.Path(),
-    help="診断対象の DB ファイル (既定: config の db_path)。",
-)
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="設定ファイルのパス。",
-)
+@_db_option("診断対象の DB ファイル (既定: config の db_path)。")
+@_config_option("設定ファイルのパス。")
 @click.option("--only", default=None, help="カンマ区切りのルール ID のみ実行。")
 @click.option("--skip", default=None, help="カンマ区切りのルール ID をスキップ。")
 @click.option(
@@ -251,12 +292,7 @@ def record(
     is_flag=True,
     help="info のみの Finding のとき終了コード 0 を返す (既定は 2)。CI 向け。",
 )
-@click.option(
-    "--quiet",
-    "-q",
-    is_flag=True,
-    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
-)
+@_quiet_option
 def check(
     db_path: Optional[str],
     config_path: Optional[str],
@@ -275,29 +311,18 @@ def check(
     3=観測データなし（DB にサンプルが1件もない＝記録が回っていない）/
     4=前提条件エラー（DB ファイルが無い等）
     """
-    from . import report as report_mod  # T07 — deferred
+    from . import report as report_mod
     from .core.util import should_use_color
-    from .diagnosis.engine import Engine  # T06 — deferred
-    from .storage import Storage
 
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-
-    only_list = [s.strip() for s in only.split(",")] if only else None
-    skip_list = [s.strip() for s in skip.split(",")] if skip else None
-
-    charts = None
-    meta_hostname: Optional[str] = None
-    with Storage(resolved_db, read_only=True) as store:
-        engine = Engine(cfg, verbose=verbose)
-        diag = engine.run(store, only=only_list, skip=skip_list)
-        if fmt == "html":
-            # Build charts while the DB connection is still open — doing this
-            # after the `with` block would read a closed connection and yield
-            # empty charts (the report command builds them in-block too).
-            charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
-            # Also read while the connection is open; only the html renderer
-            # uses it (stays None for json/text, which never call render_html).
-            meta_hostname = store.meta().get("hostname")
+    diag, charts, meta_hostname = _diagnose(
+        cfg,
+        resolved_db,
+        only=_split_ids(only),
+        skip=_split_ids(skip),
+        verbose=verbose,
+        with_charts=fmt == "html",
+    )
 
     if fmt == "json":
         text = report_mod.render_json(diag)
@@ -319,27 +344,12 @@ def check(
     else:
         click.echo(text)
 
-    # Exit codes: 0=healthy / 1=critical or warning / 2=info-only findings.
-    # --exit-zero-on-info collapses the info-only case to 0 for CI pipelines.
-    has_warn_or_critical = any(
-        f.severity.value in ("warning", "critical") for f in diag.findings
-    )
-    if has_warn_or_critical:
-        sys.exit(1)
-    if diag.findings and not exit_zero_on_info:
-        sys.exit(2)
-    if diag.no_data and not diag.findings:
-        # Empty DB / no observation at all — distinct from a healthy host so
-        # callers (CI, wrappers) can tell "nothing recorded" from "all clear".
-        sys.exit(3)
-    sys.exit(0)
+    sys.exit(_exit_code(diag, exit_zero_on_info=exit_zero_on_info))
 
 
 # Register ``advise`` as a hidden alias for ``check`` (design doc §3).
 cli.add_command(check, name="advise")
-# Mark the alias as hidden so it doesn't appear in --help.
-_advise_cmd = cli.commands["advise"]
-_advise_cmd.hidden = True  # type: ignore[attr-defined]
+cli.commands["advise"].hidden = True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -348,16 +358,8 @@ _advise_cmd.hidden = True  # type: ignore[attr-defined]
 
 
 @cli.command()
-@click.option(
-    "--db", "db_path", default=None, type=click.Path(), help="診断対象の DB ファイル。"
-)
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="設定ファイルのパス。",
-)
+@_db_option("診断対象の DB ファイル。")
+@_config_option("設定ファイルのパス。")
 @click.option(
     "--out",
     "html_out",
@@ -372,12 +374,7 @@ _advise_cmd.hidden = True  # type: ignore[attr-defined]
     type=click.Path(),
     help="JSON レポートの出力先 (省略時はスキップ)。",
 )
-@click.option(
-    "--quiet",
-    "-q",
-    is_flag=True,
-    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
-)
+@_quiet_option
 def report(
     db_path: Optional[str],
     config_path: Optional[str],
@@ -386,17 +383,10 @@ def report(
     quiet: bool,
 ) -> None:
     """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
-    from . import report as report_mod  # T07 — deferred
-    from .diagnosis.engine import Engine  # T06 — deferred
-    from .storage import Storage
+    from . import report as report_mod
 
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-
-    with Storage(resolved_db, read_only=True) as store:
-        engine = Engine(cfg)
-        diag = engine.run(store)
-        charts = report_mod.build_charts(store)  # type: ignore[attr-defined]
-        meta_hostname = store.meta().get("hostname")
+    diag, charts, meta_hostname = _diagnose(cfg, resolved_db, with_charts=True)
 
     html_text = report_mod.render_html(
         diag,
@@ -410,8 +400,7 @@ def report(
         click.echo(f"HTML レポートを書き出しました: {html_out}")
 
     if json_out:
-        json_text = report_mod.render_json(diag)
-        Path(json_out).write_text(json_text, encoding="utf-8")
+        Path(json_out).write_text(report_mod.render_json(diag), encoding="utf-8")
         if not quiet_mode:
             click.echo(f"JSON レポートを書き出しました: {json_out}")
 
@@ -422,9 +411,8 @@ def report(
 
 
 @cli.command()
-@click.option(
-    "--db", "db_path", default=None, type=click.Path(), help="対象の DB ファイル。"
-)
+@_db_option("対象の DB ファイル。")
+@_config_option()
 @click.option(
     "--format",
     "fmt",
@@ -432,47 +420,28 @@ def report(
     default="text",
     help="出力フォーマット。",
 )
-def status(db_path: Optional[str], fmt: str) -> None:
+def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None:
     """記録済み DB の概況 (期間、サンプル数、自己負荷) を表示します。"""
     from .core.util import humanize_bytes, humanize_duration
     from .storage import Storage
 
-    _cfg, resolved_db = _ensure_db_and_config(None, db_path)
+    _cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
 
+    # Everything below is a SQL aggregate / bounded query, so status stays
+    # instant even on a long recording (no full sys_samples load).
     with Storage(resolved_db, read_only=True) as store:
         counts = store.counts()
         meta_dict = store.meta()
+        self_cpu_avg, self_cpu_max = store.self_cpu_stats()
+        bounds = store.time_bounds("sys_samples")
+        recent_events = store.recent_events(5)
 
-        # Self-CPU stats from sys_samples
-        cpu_rows = store.series("sys_samples", "self_cpu")
-        self_cpu_avg: Optional[float] = None
-        self_cpu_max: Optional[float] = None
-        if cpu_rows:
-            cpu_vals = [v for _, v in cpu_rows if v is not None]
-            if cpu_vals:
-                self_cpu_avg = sum(cpu_vals) / len(cpu_vals)
-                self_cpu_max = max(cpu_vals)
-
-        # Time span from sys_samples
-        ts_rows = store.rows("sys_samples")
-        span_str = "—"
-        start_str = "—"
-        end_str = "—"
-        if ts_rows:
-            ts_vals = [r["ts"] for r in ts_rows if r["ts"] is not None]
-            if ts_vals:
-                span_sec = max(ts_vals) - min(ts_vals)
-                span_str = humanize_duration(span_sec)
-                start_str = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(min(ts_vals))
-                )
-                end_str = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(max(ts_vals))
-                )
-
-        # Recent ops_events (last 5)
-        event_rows = store.rows("ops_events")
-        recent_events = list(event_rows)[-5:]
+    span_str = start_str = end_str = "—"
+    if bounds is not None:
+        lo, hi = bounds
+        span_str = humanize_duration(hi - lo)
+        start_str = time.strftime(_TIME_FMT, time.localtime(lo))
+        end_str = time.strftime(_TIME_FMT, time.localtime(hi))
 
     if fmt == "json":
         payload = {
@@ -508,7 +477,7 @@ def status(db_path: Optional[str], fmt: str) -> None:
     if recent_events:
         click.echo("\n直近イベント (最大5件):")
         for ev in recent_events:
-            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["ts"]))
+            ts_str = time.strftime(_TIME_FMT, time.localtime(ev["ts"]))
             click.echo(f"  [{ts_str}] {ev['kind']}  {ev['detail'] or ''}")
 
     if counts.get("sys_samples", 0) == 0:
@@ -535,90 +504,54 @@ def explain(name: Optional[str]) -> None:
     from .core.rule import all_rules, get_rule
     from .core.sampler import all_samplers, get_sampler
 
-    # Try to load diagnosis module (may not be implemented yet in P2).
-    with suppress(ImportError):
-        importlib.import_module("procdiag.diagnosis")
-
-    # Try to load built-in samplers.
-    for mod_name in (
-        "procdiag.samplers.system",
-        "procdiag.samplers.cgroup",
-        "procdiag.samplers.process",
-        "procdiag.samplers.disk",
-    ):
-        with suppress(ImportError):
-            importlib.import_module(mod_name)
+    _load_registries()
 
     if name is None:
-        # List all rules and samplers.
         rules = all_rules()
         samplers = all_samplers()
 
         click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━\n")
-        if rules:
-            for rid in sorted(rules):
-                cls = rules[rid]
-                what = getattr(cls, "what", "") or ""
-                click.echo(f"  {rid.ljust(22)} {what[:60]}")
-        else:
-            click.echo("  (ルールモジュール未導入)")
+        for rid in sorted(rules):
+            what = getattr(rules[rid], "what", "") or ""
+            click.echo(f"  {rid.ljust(22)} {what[:60]}")
 
         click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━\n")
-        if samplers:
-            for sname in sorted(
-                samplers, key=lambda n: (getattr(samplers[n], "tier", ""), n)
-            ):
-                cls = samplers[sname]
-                tier = getattr(cls, "tier", "?")
-                what = getattr(cls, "what", "") or ""
-                click.echo(f"  {sname.ljust(14)} [{tier.ljust(3)}]  {what[:50]}")
-        else:
-            click.echo("  (サンプラーモジュール未導入)")
+        for sname in sorted(
+            samplers, key=lambda n: (getattr(samplers[n], "tier", ""), n)
+        ):
+            cls = samplers[sname]
+            tier = getattr(cls, "tier", "?")
+            what = getattr(cls, "what", "") or ""
+            click.echo(f"  {sname.ljust(14)} [{tier.ljust(3)}]  {what[:50]}")
         return
 
     # Look up by rule_id (uppercase convention) or sampler name (lowercase).
     rule_cls = get_rule(name)
     sampler_cls = get_sampler(name)
 
-    if rule_cls is None and sampler_cls is None:
+    if rule_cls is not None:
+        category = getattr(rule_cls, "category", "")
+        heading = f"# {name} — {getattr(rule_cls, 'title', '')}  (カテゴリ: {category})"
+        _print_detail(heading, rule_cls, what_label="検出内容")
+    elif sampler_cls is not None:
+        tier = getattr(sampler_cls, "tier", "")
+        interval_key = getattr(sampler_cls, "interval_key", "")
+        heading = (
+            f"# {name} — {getattr(sampler_cls, 'title', '')}"
+            f"  (Tier: {tier}, 間隔: {interval_key})"
+        )
+        _print_detail(heading, sampler_cls, what_label="計測内容")
+    else:
         click.echo(f"不明な名前です: {name}", err=True)
         sys.exit(1)
 
-    if rule_cls is not None:
-        _print_rule_detail(name, rule_cls)
-    else:
-        _print_sampler_detail(name, sampler_cls)
 
-
-def _print_rule_detail(rule_id: str, cls: type) -> None:
-    """Print detail for a single rule class."""
-    title = getattr(cls, "title", "")
-    category = getattr(cls, "category", "")
-    what = getattr(cls, "what", "") or ""
-    why = getattr(cls, "why", "") or ""
+def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
+    """Print a rule's / sampler's what, why and manual check commands."""
+    click.echo(f"{heading}\n")
+    click.echo(f"{what_label}:  {getattr(cls, 'what', '') or ''}")
+    click.echo(f"理由:      {getattr(cls, 'why', '') or ''}")
     cmds = getattr(cls, "manual_commands", []) or []
-
-    click.echo(f"# {rule_id} — {title}  (カテゴリ: {category})\n")
-    click.echo(f"検出内容:  {what}")
-    click.echo(f"理由:      {why}")
-    if cmds:
-        click.echo("\n手動確認コマンド:")
-        for cmd in cmds:
-            click.echo(f"  $ {cmd}")
-
-
-def _print_sampler_detail(sampler_name: str, cls: type) -> None:
-    """Print detail for a single sampler class."""
-    title = getattr(cls, "title", "")
-    tier = getattr(cls, "tier", "")
-    interval_key = getattr(cls, "interval_key", "")
-    what = getattr(cls, "what", "") or ""
-    why = getattr(cls, "why", "") or ""
-    cmds = getattr(cls, "manual_commands", []) or []
-
-    click.echo(f"# {sampler_name} — {title}  (Tier: {tier}, 間隔: {interval_key})\n")
-    click.echo(f"計測内容:  {what}")
-    click.echo(f"理由:      {why}")
     if cmds:
         click.echo("\n手動確認コマンド:")
         for cmd in cmds:
@@ -626,7 +559,7 @@ def _print_sampler_detail(sampler_name: str, cls: type) -> None:
 
 
 # ---------------------------------------------------------------------------
-# list-rules
+# list-rules / list-samplers
 # ---------------------------------------------------------------------------
 
 
@@ -635,15 +568,9 @@ def list_rules() -> None:
     """登録済みルールを rule_id / category / title の一覧で表示します。"""
     from .core.rule import all_rules
 
-    with suppress(ImportError):
-        importlib.import_module("procdiag.diagnosis")
-
+    _load_registries()
     rules = all_rules()
-    if not rules:
-        click.echo("(ルールモジュール未導入)")
-        return
 
-    # Group by category.
     by_cat: dict[str, list[str]] = {}
     for rid, cls in rules.items():
         cat = getattr(cls, "category", "other") or "other"
@@ -652,14 +579,8 @@ def list_rules() -> None:
     for cat in sorted(by_cat):
         click.echo(f"\n[{cat}]")
         for rid in sorted(by_cat[cat]):
-            cls = rules[rid]
-            title = getattr(cls, "title", "") or ""
+            title = getattr(rules[rid], "title", "") or ""
             click.echo(f"  {rid.ljust(22)} {title}")
-
-
-# ---------------------------------------------------------------------------
-# list-samplers
-# ---------------------------------------------------------------------------
 
 
 @cli.command(name="list-samplers")
@@ -667,19 +588,8 @@ def list_samplers() -> None:
     """登録済みサンプラーを Tier ごとに一覧表示します。"""
     from .core.sampler import all_samplers
 
-    for mod_name in (
-        "procdiag.samplers.system",
-        "procdiag.samplers.cgroup",
-        "procdiag.samplers.process",
-        "procdiag.samplers.disk",
-    ):
-        with suppress(ImportError):
-            importlib.import_module(mod_name)
-
+    _load_registries()
     samplers = all_samplers()
-    if not samplers:
-        click.echo("(サンプラーモジュール未導入)")
-        return
 
     by_tier: dict[str, list[str]] = {}
     for sname, cls in samplers.items():
@@ -701,9 +611,8 @@ def list_samplers() -> None:
 
 
 @cli.command()
-@click.option(
-    "--db", "db_path", default=None, type=click.Path(), help="対象の DB ファイル。"
-)
+@_db_option("対象の DB ファイル。")
+@_config_option()
 @click.option(
     "--format",
     "fmt",
@@ -725,14 +634,10 @@ def list_samplers() -> None:
     type=click.Path(),
     help="出力先ファイル (既定: - = stdout)。",
 )
-@click.option(
-    "--quiet",
-    "-q",
-    is_flag=True,
-    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
-)
+@_quiet_option
 def export(
     db_path: Optional[str],
+    config_path: Optional[str],
     fmt: str,
     rollup: str,
     out_path: str,
@@ -742,13 +647,12 @@ def export(
     from .export import export_rows
     from .storage import Storage
 
-    _cfg, resolved_db = _ensure_db_and_config(None, db_path)
-
+    _cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     table = "sys_samples" if rollup == "raw" else "sys_rollup_1m"
 
     with Storage(resolved_db, read_only=True) as store:
         if out_path == "-":
-            count = export_rows(store, table=table, fmt=fmt, out=sys.stdout)
+            export_rows(store, table=table, fmt=fmt, out=sys.stdout)
         else:
             with open(out_path, "w", encoding="utf-8", newline="") as fh:
                 count = export_rows(store, table=table, fmt=fmt, out=fh)
@@ -762,9 +666,8 @@ def export(
 
 
 @cli.command()
-@click.option(
-    "--db", "db_path", default=None, type=click.Path(), help="対象の DB ファイル。"
-)
+@_db_option("対象の DB ファイル。")
+@_config_option()
 @click.option(
     "--raw",
     "raw_retention",
@@ -777,14 +680,10 @@ def export(
     default=None,
     help="ロールアップの保持期間 (例: 90d)。省略時は config の値。",
 )
-@click.option(
-    "--quiet",
-    "-q",
-    is_flag=True,
-    help="完了メッセージを抑止する (PROCDIAG_QUIET でも可)。",
-)
+@_quiet_option
 def prune(
     db_path: Optional[str],
+    config_path: Optional[str],
     raw_retention: Optional[str],
     rollup_retention: Optional[str],
     quiet: bool,
@@ -792,7 +691,7 @@ def prune(
     """期限切れのサンプルを削除します (保持ポリシーの手動実行)。"""
     from .storage import Storage
 
-    cfg, resolved_db = _ensure_db_and_config(None, db_path)
+    cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     raw = raw_retention or cfg.retention.raw
     rollup = rollup_retention or cfg.retention.rollup
 
@@ -810,6 +709,12 @@ def prune(
 # service (subgroup)
 # ---------------------------------------------------------------------------
 
+_unit_config_option = _config_option("ユニットに渡す --config パス。")
+_unit_db_option = _db_option("ユニットに渡す --db パス。")
+_unit_duration_option = click.option(
+    "--duration", default=None, help="ユニットに渡す --duration 値。"
+)
+
 
 @cli.group()
 def service() -> None:
@@ -820,21 +725,9 @@ def service() -> None:
 @click.option(
     "--system", is_flag=True, help="system ユニットとして出力 (既定: user ユニット)。"
 )
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="ユニットに渡す --config パス。",
-)
-@click.option(
-    "--db",
-    "db_path",
-    default=None,
-    type=click.Path(),
-    help="ユニットに渡す --db パス。",
-)
-@click.option("--duration", default=None, help="ユニットに渡す --duration 値。")
+@_unit_config_option
+@_unit_db_option
+@_unit_duration_option
 def service_print(
     system: bool,
     config_path: Optional[str],
@@ -855,21 +748,9 @@ def service_print(
 
 
 @service.command("install")
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="ユニットに渡す --config パス。",
-)
-@click.option(
-    "--db",
-    "db_path",
-    default=None,
-    type=click.Path(),
-    help="ユニットに渡す --db パス。",
-)
-@click.option("--duration", default=None, help="ユニットに渡す --duration 値。")
+@_unit_config_option
+@_unit_db_option
+@_unit_duration_option
 def service_install(
     config_path: Optional[str],
     db_path: Optional[str],
@@ -902,22 +783,16 @@ def service_install(
 # doctor
 # ---------------------------------------------------------------------------
 
+_DOCTOR_SYMBOLS = {
+    # ascii?: {status: symbol}
+    False: {"ok": "✔", "degraded": "⚠", "info": "ℹ"},
+    True: {"ok": "[OK]", "degraded": "[WARN]", "info": "[INFO]"},
+}
+
 
 @cli.command()
-@click.option(
-    "--config",
-    "config_path",
-    default=None,
-    type=click.Path(),
-    help="設定ファイルのパス (既定: ./config.py)。",
-)
-@click.option(
-    "--db",
-    "db_path",
-    default=None,
-    type=click.Path(),
-    help="記録先 DB ファイルのパス (config の db_path を上書き)。",
-)
+@_config_option()
+@_db_option("記録先 DB ファイルのパス (config の db_path を上書き)。")
 @click.option(
     "--format",
     "fmt",
@@ -941,14 +816,11 @@ def doctor(
 
     終了コード: 0=すべて ok/info / 2=degraded あり
     """
-    from .config import load_config
     from .doctor import run_doctor
 
-    cfg = load_config(Path(config_path) if config_path else None)
-    if db_path:
-        cfg = cfg.model_copy(update={"db_path": db_path})
-
+    cfg = _load_config(config_path, db_path)
     checks = run_doctor(cfg, config_path=config_path)
+    degraded_count = sum(1 for c in checks if c.status == "degraded")
 
     if fmt == "json":
         click.echo(
@@ -970,28 +842,20 @@ def doctor(
         use_ascii = (
             ascii_ or bool(os.environ.get("NO_COLOR")) or not _can_show_unicode()
         )
-        if use_ascii:
-            status_symbol = {"ok": "[OK]", "degraded": "[WARN]", "info": "[INFO]"}
-            ok_mark, warn_mark = "[OK]", "[WARN]"
-        else:
-            status_symbol = {"ok": "✔", "degraded": "⚠", "info": "ℹ"}
-            ok_mark, warn_mark = "✔", "⚠"
+        symbols = _DOCTOR_SYMBOLS[use_ascii]
         for c in checks:
-            sym = status_symbol.get(c.status, "?")
-            click.echo(f"{sym} [{c.label}] {c.detail}")
+            click.echo(f"{symbols.get(c.status, '?')} [{c.label}] {c.detail}")
 
-        degraded_count = sum(1 for c in checks if c.status == "degraded")
         click.echo("")
         if degraded_count:
             click.echo(
-                f"{warn_mark} {degraded_count} 件の降格があります。"
+                f"{symbols['degraded']} {degraded_count} 件の降格があります。"
                 "記録は可能ですが該当データは欠損します"
             )
         else:
-            click.echo(f"{ok_mark} すべての観測能力が利用可能です")
+            click.echo(f"{symbols['ok']} すべての観測能力が利用可能です")
 
-    degraded = any(c.status == "degraded" for c in checks)
-    sys.exit(2 if degraded else 0)
+    sys.exit(2 if degraded_count else 0)
 
 
 # ---------------------------------------------------------------------------

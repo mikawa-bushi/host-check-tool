@@ -339,6 +339,28 @@ class TestStatus:
         assert "counts" in data
         assert "meta" in data
 
+    def test_json_reports_span_and_self_cpu(self, runner, db_with_data):
+        result = runner.invoke(
+            cli, ["status", "--db", str(db_with_data), "--format", "json"]
+        )
+        data = json.loads(result.output)
+        assert data["has_data"] is True
+        assert data["span"] != "—" and data["start"] < data["end"]
+        assert data["self_cpu_avg"] == pytest.approx(0.1)
+        assert [e["kind"] for e in data["recent_events"]] == ["test_event"]
+
+    def test_db_path_taken_from_config(self, runner, db_with_data, tmp_path):
+        """status --config resolves the DB from the config file's db_path."""
+        cfg = tmp_path / "site.py"
+        cfg.write_text(
+            "from procdiag.config import ProcdiagConfig\n"
+            f"config = ProcdiagConfig(db_path={str(db_with_data)!r})\n",
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", "--config", str(cfg)])
+        assert result.exit_code == 0, result.output
+        assert str(db_with_data) in result.output
+
     def test_no_db_friendly_error(self, runner, tmp_path):
         missing = str(tmp_path / "nonexistent.db")
         result = runner.invoke(cli, ["status", "--db", missing])
