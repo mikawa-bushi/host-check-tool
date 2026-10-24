@@ -16,8 +16,6 @@ Coverage areas:
 
 from __future__ import annotations
 
-import pytest
-
 from procdiag.config import TriggerConfig
 from procdiag.core.sampler import SystemSnapshot
 from procdiag.samplers.trigger import _STORM_WINDOW_SEC, SpikeDecision, SpikeTrigger
@@ -301,7 +299,7 @@ class TestStormAggregation:
             _cfg(spike_storm_threshold=10, spike_cooldown_sec=1),
             psi_available=True,
         )
-        results = self._fire_many(trig, 11, gap=2.0)  # 11th triggers storm
+        self._fire_many(trig, 11, gap=2.0)  # 11th triggers storm
 
         # Now fire 5 more times within the storm window (within 5 min total).
         snap = _snap(psi=_psi(cpu=25.0))
@@ -317,7 +315,7 @@ class TestStormAggregation:
             psi_available=True,
         )
         # Create 11 fires clustered at t≈0.
-        results = self._fire_many(trig, 11, gap=2.0)
+        self._fire_many(trig, 11, gap=2.0)
 
         # Advance time past the 5-minute window.  All prior fire timestamps
         # are now older than _STORM_WINDOW_SEC; the window count drops to 0.

@@ -21,11 +21,12 @@ differences from the netdiag engine:
 from __future__ import annotations
 
 import re
+import time
 import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from jinja2 import Environment, FileSystemLoader, UndefinedError
+from jinja2 import Environment, FileSystemLoader
 
 from ..config import ProcdiagConfig
 from ..core import (
@@ -245,7 +246,7 @@ class Engine:
             finding.proposal = self._render_proposal(finding, reasoning)
 
         # --- Step 4: fold ---
-        findings = _fold(raw_findings)
+        findings = fold(raw_findings)
 
         # --- Step 5: sort ---
         findings.sort(
@@ -303,8 +304,6 @@ class Engine:
         bounds = store.window_bounds()
         if bounds is None:
             # No data at all — zero-span placeholder; signalled via has_data.
-            import time
-
             now = time.time()
             return Window(start_ts=now, end_ts=now), False
 
@@ -343,32 +342,12 @@ class Engine:
 
         # Self CPU from sys_samples — aggregated in SQL so a long recording is
         # not materialised into Python just to compute avg/max.
-        cpu_agg = store.conn.execute(
-            "SELECT AVG(self_cpu) AS avg, MAX(self_cpu) AS max FROM sys_samples "
-            "WHERE ts >= ? AND ts <= ? AND self_cpu IS NOT NULL",
-            (window.start_ts, window.end_ts),
-        ).fetchone()
-        self_cpu_avg = cpu_agg["avg"] if cpu_agg and cpu_agg["avg"] is not None else 0.0
-        self_cpu_max = cpu_agg["max"] if cpu_agg and cpu_agg["max"] is not None else 0.0
-
-        # Throttle events.
-        throttle_rows = store.rows(
-            "ops_events",
-            where="kind = 'throttle_down'",
+        self_cpu_avg, self_cpu_max = store.self_cpu_stats(
+            window.start_ts, window.end_ts
         )
-        throttle_events = len(throttle_rows)
 
-        # Missing IO percentage from proc_samples.
-        proc_count_row = store.conn.execute(
-            "SELECT COUNT(*) AS total, "
-            "SUM(CASE WHEN io_read_delta IS NULL THEN 1 ELSE 0 END) AS missing "
-            "FROM proc_samples WHERE ts >= ? AND ts <= ?",
-            (window.start_ts, window.end_ts),
-        ).fetchone()
-        if proc_count_row and proc_count_row["total"] > 0:
-            missing_io_pct = (proc_count_row["missing"] or 0) / proc_count_row["total"]
-        else:
-            missing_io_pct = 0.0
+        throttle_events = len(store.rows("ops_events", where="kind = 'throttle_down'"))
+        missing_io_pct = store.missing_io_ratio(window.start_ts, window.end_ts)
 
         notes: list[str] = []
         if missing_io_pct > 0.1:
@@ -381,8 +360,8 @@ class Engine:
             span_hours=span_hours,
             gap_seconds=gap_seconds,
             missing_io_pct=missing_io_pct,
-            self_cpu_avg=self_cpu_avg,
-            self_cpu_max=self_cpu_max,
+            self_cpu_avg=self_cpu_avg if self_cpu_avg is not None else 0.0,
+            self_cpu_max=self_cpu_max if self_cpu_max is not None else 0.0,
             throttle_events=throttle_events,
             notes=notes,
         )
@@ -403,11 +382,6 @@ def fold(findings: list[Finding]) -> list[Finding]:
     The fold table ``_FOLD_INTO`` is a plain dict and can be extended for
     future rule relationships without changing this function.
     """
-    return _fold(findings)
-
-
-def _fold(findings: list[Finding]) -> list[Finding]:
-    """Internal implementation of finding folding."""
     # Build an index of parent findings by (rule_id, subject).
     parent_index: dict[tuple[str, str], Finding] = {}
     for f in findings:

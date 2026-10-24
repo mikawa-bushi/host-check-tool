@@ -20,15 +20,14 @@ Key design choices that mirror netdiag:
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .core.util import parse_duration
+from .core.util import MiB, parse_duration
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +272,55 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
     ],
 }
 
+_COLUMN_SETS: Dict[str, frozenset] = {t: frozenset(c) for t, c in TABLE_COLUMNS.items()}
+
+
+def make_row(table: str, **values: Any) -> tuple:
+    """Build a positional ``SampleBatch`` row for *table* from named columns.
+
+    Samplers name every column instead of hand-ordering a tuple, so adding or
+    reordering a column in ``TABLE_COLUMNS`` can never silently shift values
+    into the wrong column: a missing or unknown name raises immediately.
+    """
+    cols = TABLE_COLUMNS[table]
+    if values.keys() != _COLUMN_SETS[table]:
+        missing = [c for c in cols if c not in values]
+        unknown = [k for k in values if k not in _COLUMN_SETS[table]]
+        raise ValueError(
+            f"{table}: 列が一致しません (不足: {missing}, 不明: {unknown})"
+        )
+    return tuple(values[c] for c in cols)
+
+
+# ---------------------------------------------------------------------------
+# Table groups — one place that knows which tables share which policy
+# ---------------------------------------------------------------------------
+
+# Raw high-frequency samples: kept for ``retention.raw`` (e.g. 48h).
+_RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples")
+# 1-minute rollups: keyed by ``ts_min`` and kept for ``retention.rollup``.
+_ROLLUP_TABLES = ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m")
+# Low-frequency raw samples that are cheap enough to keep as long as rollups.
+_LONG_LIVED_TABLES = ("disk_samples", "dir_samples", "thermal_samples")
+# Lookup tables without a timestamp column.
+_NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry")
+# Every table, in the order ``counts()`` reports them.
+_ALL_TABLES = (
+    *_NO_TS_TABLES,
+    *_RAW_TABLES,
+    *_LONG_LIVED_TABLES,
+    "spike_events",
+    "ops_events",
+    *_ROLLUP_TABLES,
+)
+
+
+def _ts_column(table: str) -> Optional[str]:
+    """Return the timestamp column of *table* (``None`` for lookup tables)."""
+    if table in _NO_TS_TABLES:
+        return None
+    return "ts_min" if table in _ROLLUP_TABLES else "ts"
+
 
 # ---------------------------------------------------------------------------
 # Storage class
@@ -423,7 +471,7 @@ class Storage:
         """
         if not self._buffer:
             if reason in ("spike", "signal"):
-                self._record_ops_event_direct(reason, "バッファ空でフラッシュ")
+                self.record_event(reason, "バッファ空でフラッシュ")
             return 0
 
         total = 0
@@ -442,10 +490,7 @@ class Storage:
                 )
                 total += len(rows)
             if reason in ("spike", "signal"):
-                self.conn.execute(
-                    "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, ?)",
-                    (time.time(), "flush", f"reason={reason}"),
-                )
+                self._insert_event("flush", f"reason={reason}")
         self._buffer.clear()
         return total
 
@@ -499,34 +544,13 @@ class Storage:
                 bucket = int(row["ts"] / 60) * 60.0
                 minute_buckets[bucket].append(row)
 
+            # sys_rollup_1m needs a p95, which SQLite cannot aggregate, so this
+            # one table is rolled up in Python (it is 1 row/s — small).
             for bucket, rows in minute_buckets.items():
-                cpu_vals = [r["cpu_total"] for r in rows if r["cpu_total"] is not None]
-                core_vals = [
-                    r["cpu_max_core"] for r in rows if r["cpu_max_core"] is not None
-                ]
-                mem_vals = [r["mem_used"] for r in rows if r["mem_used"] is not None]
-                psi_cpu = [
-                    r["psi_cpu_some10"] for r in rows if r["psi_cpu_some10"] is not None
-                ]
-                psi_mem = [
-                    r["psi_mem_some10"] for r in rows if r["psi_mem_some10"] is not None
-                ]
-                psi_io = [
-                    r["psi_io_some10"] for r in rows if r["psi_io_some10"] is not None
-                ]
-                swap_out = [r["swap_out"] for r in rows if r["swap_out"] is not None]
-
-                cpu_avg = _avg(cpu_vals)
-                cpu_max = max(cpu_vals) if cpu_vals else None
-                cpu_p95 = _p95(cpu_vals)
-                core_max = max(core_vals) if core_vals else None
-                mem_avg = int(_avg(mem_vals)) if mem_vals else None
-                mem_max = max(mem_vals) if mem_vals else None
-                psi_cpu_max = max(psi_cpu) if psi_cpu else None
-                psi_mem_max = max(psi_mem) if psi_mem else None
-                psi_io_max = max(psi_io) if psi_io else None
-                swap_sum = sum(swap_out) if swap_out else None
-
+                cpu_vals = _non_null(rows, "cpu_total")
+                mem_vals = _non_null(rows, "mem_used")
+                swap_out = _non_null(rows, "swap_out")
+                mem_avg = _avg(mem_vals)
                 self.conn.execute(
                     "INSERT OR REPLACE INTO sys_rollup_1m "
                     "(ts_min, cpu_avg, cpu_max, cpu_p95, cpu_max_core_max, "
@@ -535,16 +559,16 @@ class Storage:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         bucket,
-                        cpu_avg,
-                        cpu_max,
-                        cpu_p95,
-                        core_max,
-                        mem_avg,
-                        mem_max,
-                        psi_cpu_max,
-                        psi_mem_max,
-                        psi_io_max,
-                        swap_sum,
+                        _avg(cpu_vals),
+                        _max(cpu_vals),
+                        _p95(cpu_vals),
+                        _max(_non_null(rows, "cpu_max_core")),
+                        int(mem_avg) if mem_avg is not None else None,
+                        _max(mem_vals),
+                        _max(_non_null(rows, "psi_cpu_some10")),
+                        _max(_non_null(rows, "psi_mem_some10")),
+                        _max(_non_null(rows, "psi_io_some10")),
+                        sum(swap_out) if swap_out else None,
                     ),
                 )
 
@@ -601,28 +625,24 @@ class Storage:
         raw_cutoff = now - parse_duration(raw)
         rollup_cutoff = now - parse_duration(rollup)
 
-        raw_deleted = 0
         with self.conn:
-            for tbl in ("sys_samples", "cg_samples", "proc_samples"):
-                cur = self.conn.execute(
-                    f"DELETE FROM {tbl} WHERE ts < ?", (raw_cutoff,)
-                )
-                raw_deleted += cur.rowcount
-
-        rollup_deleted = 0
+            raw_deleted = self._delete_before(_RAW_TABLES, raw_cutoff)
         with self.conn:
-            for tbl in ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m"):
-                cur = self.conn.execute(
-                    f"DELETE FROM {tbl} WHERE ts_min < ?", (rollup_cutoff,)
-                )
-                rollup_deleted += cur.rowcount
-            for tbl in ("disk_samples", "dir_samples", "thermal_samples"):
-                cur = self.conn.execute(
-                    f"DELETE FROM {tbl} WHERE ts < ?", (rollup_cutoff,)
-                )
-                rollup_deleted += cur.rowcount
+            rollup_deleted = self._delete_before(
+                _ROLLUP_TABLES + _LONG_LIVED_TABLES, rollup_cutoff
+            )
 
         return {"raw_deleted": raw_deleted, "rollup_deleted": rollup_deleted}
+
+    def _delete_before(self, tables: Iterable[str], cutoff: float) -> int:
+        """Delete rows older than *cutoff* from *tables*; return the row count."""
+        deleted = 0
+        for tbl in tables:
+            cur = self.conn.execute(
+                f"DELETE FROM {tbl} WHERE {_ts_column(tbl)} < ?", (cutoff,)
+            )
+            deleted += cur.rowcount
+        return deleted
 
     def enforce_size_budget(
         self,
@@ -714,7 +734,7 @@ class Storage:
                     "db_guard_error", f"{step_name}: retention 失敗: {exc}"
                 )
             after = _db_size()
-            detail = f"{step_name}: DB={after // (1024 * 1024)}MB"
+            detail = f"{step_name}: DB={after // MiB}MB"
             self.record_event("db_guard", detail)
             steps.append(step_name)
 
@@ -737,16 +757,41 @@ class Storage:
     def record_event(self, kind: str, detail: str = "") -> None:
         """Insert one row into ``ops_events`` immediately (no buffering)."""
         with self.conn:
+            self._insert_event(kind, detail)
+
+    def record_spike(
+        self,
+        *,
+        trigger_type: str,
+        psi_snapshot: str,
+        top_processes: str,
+        top_cgroups: str,
+    ) -> None:
+        """Commit one ``spike_events`` row immediately.
+
+        The JSON payload columns are encoded by :mod:`procdiag.spikes`; the row
+        is self-contained (it carries the culprit snapshot inline), so a single
+        atomic insert is all the durability a spike needs.
+        """
+        with self.conn:
             self.conn.execute(
-                "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, ?)",
-                (time.time(), kind, detail),
+                "INSERT INTO spike_events "
+                "(ts, trigger_type, psi_snapshot, top_processes, top_cgroups) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (time.time(), trigger_type, psi_snapshot, top_processes, top_cgroups),
             )
 
     def set_meta(self, key: str, value: str) -> None:
-        """Upsert a key-value pair in the ``meta`` table."""
+        """Upsert a key-value pair in the ``meta`` table (caller commits)."""
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value)
         )
+
+    def write_meta(self, entries: Dict[str, str]) -> None:
+        """Upsert several ``meta`` entries and commit them together."""
+        with self.conn:
+            for key, value in entries.items():
+                self.set_meta(key, value)
 
     # ------------------------------------------------------------------
     # Read path
@@ -775,8 +820,7 @@ class Storage:
         When *subject_col* and *subject* are both given, the query is filtered
         to rows where ``subject_col = subject``.
         """
-        _rollup_tables = {"sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m"}
-        ts_col = "ts_min" if table in _rollup_tables else "ts"
+        ts_col = _ts_column(table)
         q = f"SELECT {ts_col}, {column} FROM {table} WHERE {column} IS NOT NULL"
         params: List[Any] = []
 
@@ -815,14 +859,9 @@ class Storage:
             if cached is not None:
                 return cached
 
-        # Rollup tables use ts_min; registry/meta tables have no timestamp column,
-        # so time filtering and ordering do not apply to them.
-        _rollup_tables = {"sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m"}
-        _no_ts_tables = {"proc_registry", "cgroup_registry", "meta"}
-        if table in _no_ts_tables:
-            ts_col = None
-        else:
-            ts_col = "ts_min" if table in _rollup_tables else "ts"
+        # Registry/meta tables have no timestamp column, so time filtering and
+        # ordering do not apply to them.
+        ts_col = _ts_column(table)
         if ts_col is None and (since is not None or until is not None):
             raise ValueError(
                 f"テーブル {table} には時刻列がないため since/until は使えません"
@@ -850,23 +889,7 @@ class Storage:
     def counts(self) -> Dict[str, Any]:
         """Return per-table row counts and the DB file size in bytes."""
         result: Dict[str, Any] = {}
-        tables = [
-            "meta",
-            "proc_registry",
-            "cgroup_registry",
-            "sys_samples",
-            "cg_samples",
-            "proc_samples",
-            "disk_samples",
-            "dir_samples",
-            "thermal_samples",
-            "spike_events",
-            "ops_events",
-            "sys_rollup_1m",
-            "proc_rollup_1m",
-            "cg_rollup_1m",
-        ]
-        for tbl in tables:
+        for tbl in _ALL_TABLES:
             row = self.conn.execute(f"SELECT COUNT(*) AS c FROM {tbl}").fetchone()
             result[tbl] = row["c"]
         try:
@@ -874,6 +897,66 @@ class Storage:
         except OSError:
             result["db_bytes"] = 0
         return result
+
+    def time_bounds(self, table: str) -> Optional[Tuple[float, float]]:
+        """Return ``(min_ts, max_ts)`` of *table*, or ``None`` when it is empty.
+
+        Aggregated in SQL so callers that only need the recorded span (status,
+        window detection) never materialise a long recording into Python.
+        """
+        ts_col = _ts_column(table)
+        row = self.conn.execute(
+            f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table}"
+        ).fetchone()
+        if row is None or row["lo"] is None:
+            return None
+        return float(row["lo"]), float(row["hi"])
+
+    def self_cpu_stats(
+        self, since: Optional[float] = None, until: Optional[float] = None
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Return ``(avg, max)`` of procdiag's own CPU% in ``sys_samples``.
+
+        Both are ``None`` when no sample carries a ``self_cpu`` value.
+        """
+        q = (
+            "SELECT AVG(self_cpu) AS avg, MAX(self_cpu) AS max FROM sys_samples "
+            "WHERE self_cpu IS NOT NULL"
+        )
+        params: List[Any] = []
+        if since is not None:
+            q += " AND ts >= ?"
+            params.append(since)
+        if until is not None:
+            q += " AND ts <= ?"
+            params.append(until)
+        row = self.conn.execute(q, params).fetchone()
+        return row["avg"], row["max"]
+
+    def missing_io_ratio(self, since: float, until: float) -> float:
+        """Fraction of ``proc_samples`` rows whose I/O counters were unreadable.
+
+        Non-root recording cannot read other users' ``io_counters``; the ratio
+        tells the report how much the I/O rules can be trusted.  ``0.0`` when
+        there are no process samples in the range.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN io_read_delta IS NULL THEN 1 ELSE 0 END) AS missing "
+            "FROM proc_samples WHERE ts >= ? AND ts <= ?",
+            (since, until),
+        ).fetchone()
+        if not row or not row["total"]:
+            return 0.0
+        return (row["missing"] or 0) / row["total"]
+
+    def recent_events(self, limit: int) -> List[sqlite3.Row]:
+        """Return the newest *limit* ``ops_events`` rows, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM ops_events ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return rows[::-1]
 
     # ------------------------------------------------------------------
     # Registry upsert helpers (used by T03 samplers)
@@ -986,16 +1069,12 @@ class Storage:
         flag set) so diagnosis can derive its observation window without reaching
         into ``Storage.conn`` directly.
         """
-        row = self.conn.execute(
-            "SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM sys_samples"
-        ).fetchone()
-        if row and row["lo"] is not None:
-            return float(row["lo"]), float(row["hi"]), False
-        row = self.conn.execute(
-            "SELECT MIN(ts_min) AS lo, MAX(ts_min) AS hi FROM sys_rollup_1m"
-        ).fetchone()
-        if row and row["lo"] is not None:
-            return float(row["lo"]), float(row["hi"]), True
+        bounds = self.time_bounds("sys_samples")
+        if bounds is not None:
+            return bounds[0], bounds[1], False
+        bounds = self.time_bounds("sys_rollup_1m")
+        if bounds is not None:
+            return bounds[0], bounds[1], True
         return None
 
     def cg_unit_path(self, cg_id: int) -> str:
@@ -1028,18 +1107,27 @@ class Storage:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _record_ops_event_direct(self, kind: str, detail: str) -> None:
-        """Insert an ops_event without going through the public buffer."""
+    def _insert_event(self, kind: str, detail: str) -> None:
+        """Insert an ops_event inside the caller's transaction (no commit)."""
         self.conn.execute(
             "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, ?)",
             (time.time(), kind, detail),
         )
-        self.conn.commit()
 
 
 # ---------------------------------------------------------------------------
 # Module-level pure helpers
 # ---------------------------------------------------------------------------
+
+
+def _non_null(rows: List[sqlite3.Row], col: str) -> List[Any]:
+    """Return the non-NULL values of *col* across *rows*."""
+    return [r[col] for r in rows if r[col] is not None]
+
+
+def _max(vals: List[Any]) -> Optional[Any]:
+    """Return ``max(vals)``, or None for an empty list."""
+    return max(vals) if vals else None
 
 
 def _avg(vals: List[float]) -> Optional[float]:

@@ -374,3 +374,26 @@ def test_is_python_process_matches_only_python():
     assert not _is_python_process("scapy")
     assert not _is_python_process("happy")
     assert not _is_python_process("pypy")
+
+
+# ---------------------------------------------------------------------------
+# CounterDelta — cumulative counter -> clamped per-tick delta
+# ---------------------------------------------------------------------------
+
+
+def test_counter_delta_first_tick_none_then_delta():
+    from procdiag.core.util import CounterDelta
+
+    d = CounterDelta()
+    assert d.update("a", 100) is None
+    assert d.update("a", 150) == 50
+    assert d.update("b", 7) is None  # keys are independent
+
+
+def test_counter_delta_clamps_counter_reset_to_zero():
+    from procdiag.core.util import CounterDelta
+
+    d = CounterDelta()
+    d.update(("unit", "cpu"), 10_000)
+    assert d.update(("unit", "cpu"), 20) == 0  # unit restarted: counter reset
+    assert d.update(("unit", "cpu"), 50) == 30  # resumes from the new baseline

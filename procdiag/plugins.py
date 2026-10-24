@@ -18,6 +18,7 @@ imported with ``importlib``.
 from __future__ import annotations
 
 import importlib
+from importlib.metadata import entry_points
 from typing import List, Tuple
 
 ENTRY_POINT_GROUP = "procdiag.rules"
@@ -30,28 +31,16 @@ def load_plugins() -> List[Tuple[str, bool, str]]:
     loaded and what failed without aborting on a single bad plugin.
     """
     results: List[Tuple[str, bool, str]] = []
-    try:
-        from importlib.metadata import entry_points
-    except ImportError:  # pragma: no cover — very old Python
-        return results
-
-    try:
-        eps = entry_points(group=ENTRY_POINT_GROUP)
-    except TypeError:  # Python 3.9 API shape
-        eps = entry_points().get(ENTRY_POINT_GROUP, [])  # type: ignore[attr-defined]
-
-    for ep in eps:
+    for ep in entry_points(group=ENTRY_POINT_GROUP):
         try:
-            target = (
-                ep.load() if hasattr(ep, "load") else importlib.import_module(ep.value)
-            )
+            target = ep.load()
             # If the entry point resolves to a callable (rather than a module),
             # call it so any deferred registration logic runs.
             if callable(target):
                 target()
             results.append((ep.name, True, "loaded"))
         except Exception as e:  # never let a plugin break the tool
-            results.append((getattr(ep, "name", "?"), False, str(e)))
+            results.append((ep.name, False, str(e)))
 
     return results
 

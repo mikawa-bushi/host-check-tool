@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 import psutil
 
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
+from ..storage import make_row
 
 
 @register_sampler
@@ -56,13 +57,14 @@ class ThermalSampler(Sampler):
         freq_cur, freq_max = self._read_freq()
         if temp is None and freq_cur is None and freq_max is None:
             return []  # nothing readable this tick — stay silent
-        # Column order: ts, temp_max_c, cpu_freq_cur_mhz, cpu_freq_max_mhz
-        return [
-            SampleBatch(
-                table="thermal_samples",
-                rows=[(ts, temp, freq_cur, freq_max)],
-            )
-        ]
+        row = make_row(
+            "thermal_samples",
+            ts=ts,
+            temp_max_c=temp,
+            cpu_freq_cur_mhz=freq_cur,
+            cpu_freq_max_mhz=freq_max,
+        )
+        return [SampleBatch(table="thermal_samples", rows=[row])]
 
     @staticmethod
     def _read_temp() -> Optional[float]:

@@ -18,9 +18,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
-
-import pytest
 
 from procdiag.config import ProcdiagConfig, SamplingConfig
 from procdiag.core import Confidence, Window

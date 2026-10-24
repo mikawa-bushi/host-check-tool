@@ -19,6 +19,10 @@ from .sampler import (
     sampler_registry_names,
 )
 from .util import (
+    CounterDelta,
+    GiB,
+    KiB,
+    MiB,
     humanize_bytes,
     humanize_duration,
     normalize_cmdline,
@@ -53,4 +57,8 @@ __all__ = [
     "humanize_bytes",
     "humanize_duration",
     "normalize_cmdline",
+    "CounterDelta",
+    "KiB",
+    "MiB",
+    "GiB",
 ]

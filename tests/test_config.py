@@ -8,7 +8,6 @@ from procdiag.config import (
     CONFIG_TEMPLATE,
     BudgetConfig,
     ProcdiagConfig,
-    ReportConfig,
     RetentionConfig,
     RulesConfig,
     SamplingConfig,

@@ -20,14 +20,12 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Callable
 from unittest.mock import MagicMock, patch
 
 import psutil
-import pytest
 
 from procdiag.config import ProcdiagConfig
-from procdiag.core.sampler import RunContext, SampleBatch
+from procdiag.core.sampler import RunContext
 from procdiag.samplers.cgroup import CgroupSampler
 from procdiag.samplers.process import ProcessSampler
 
@@ -209,7 +207,7 @@ class TestCgroupSamplerV2:
         sampler, stub = self._sampler()
         ctx = _make_ctx(cgroup_root=CGROUP_TREE)
         sampler.setup(ctx)
-        batches = sampler.collect(ctx)
+        sampler.collect(ctx)
 
         # Force second collect so delta logic runs.
         batches2 = sampler.collect(ctx)

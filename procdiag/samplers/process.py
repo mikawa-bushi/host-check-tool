@@ -30,13 +30,31 @@ callable) following the proc_registry contract from design §5.2.
 from __future__ import annotations
 
 import time
+from contextlib import suppress
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import psutil
 
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..core.util import normalize_cmdline
+from ..storage import make_row
+
+# Per-attribute errors that degrade a single column to None instead of
+# skipping the whole process.
+_DENIED_OR_ZOMBIE = (psutil.AccessDenied, psutil.ZombieProcess)
+
+
+class _Reading(NamedTuple):
+    """Values read for one process inside a single ``oneshot()`` block."""
+
+    name: Optional[str]  # only read for a PID without a cached identity
+    cmdline: list[str]
+    cpu: Optional[float]
+    rss: Optional[int]
+    num_threads: Optional[int]
+    num_fds: Optional[int]
+    io: Optional[Tuple[int, int]]  # cumulative (read_bytes, write_bytes)
 
 
 def _read_pss_bytes(smaps_rollup: Path) -> Optional[int]:
@@ -119,168 +137,57 @@ class ProcessSampler(Sampler):
         """Scan all processes and return ``proc_samples`` rows."""
         ts = time.time()
         rows: list[tuple] = []
-
-        # num_fds() opens and scans /proc/<pid>/fd for every process — the most
-        # expensive per-process syscall here.  FD-LEAK-01 reads fds at 1-minute
-        # rollup granularity, so sampling it roughly once per minute (rather than
-        # every tick) is lossless for the rule while cutting the scan cost.
-        interval = max(ctx.config.sampling.process_interval, 1.0)
-        fd_every = max(1, round(60.0 / interval))
-        read_fds = self._tick % fd_every == 0
-        self._tick += 1
-
-        # Refresh the PID cache: discover new PIDs, remove stale ones.
-        try:
-            live_pids = set(psutil.pids())
-        except Exception:
-            live_pids = set()
-
-        # Add new PIDs.
-        for pid in live_pids:
-            if pid not in self._pid_cache:
-                try:
-                    self._pid_cache[pid] = psutil.Process(pid)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-
-        # Remove pids that vanished.
-        for pid in list(self._pid_cache):
-            if pid not in live_pids:
-                del self._pid_cache[pid]
-                self._identity.pop(pid, None)
-                self._io_denied_pids.discard(pid)
+        read_fds = self._should_read_fds(ctx)
+        self._refresh_pid_cache()
 
         for pid, proc in list(self._pid_cache.items()):
             identity = self._identity.get(pid)
             try:
-                with proc.oneshot():
-                    if identity is None:
-                        name: str = proc.name()
-                        try:
-                            cmdline: list[str] = proc.cmdline()
-                        except (psutil.AccessDenied, psutil.ZombieProcess):
-                            cmdline = []
-
-                    # cpu_percent: returns None / 0.0 on first call for this
-                    # Process object.  We store None on first tick.
-                    raw_cpu = proc.cpu_percent()
-
-                    try:
-                        mem = proc.memory_info()
-                        rss: Optional[int] = mem.rss
-                    except (psutil.AccessDenied, psutil.ZombieProcess):
-                        rss = None
-
-                    try:
-                        num_threads: Optional[int] = proc.num_threads()
-                    except (psutil.AccessDenied, psutil.ZombieProcess):
-                        num_threads = None
-
-                    num_fds: Optional[int] = None
-                    if read_fds:
-                        try:
-                            num_fds = proc.num_fds()
-                        except (
-                            psutil.AccessDenied,
-                            psutil.ZombieProcess,
-                            AttributeError,
-                        ):
-                            num_fds = None
-
-                    # I/O counters — AccessDenied is expected for
-                    # processes owned by other users when running non-root.
-                    # A once-denied PID stays denied, so skip the read (the
-                    # missing-rate counters still tick for the quality report).
-                    self.io_total += 1
-                    io_read_delta: Optional[int] = None
-                    io_write_delta: Optional[int] = None
-                    if pid in self._io_denied_pids:
-                        self.io_denied += 1
-                        cur_r = None
-                        cur_w = None
-                    else:
-                        try:
-                            io = proc.io_counters()
-                            cur_r = io.read_bytes
-                            cur_w = io.write_bytes
-                        except (psutil.AccessDenied, AttributeError):
-                            self.io_denied += 1
-                            self._io_denied_pids.add(pid)
-                            cur_r = None
-                            cur_w = None
-                        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                            cur_r = None
-                            cur_w = None
-
+                reading = self._read_process(
+                    pid, proc, read_fds=read_fds, need_identity=identity is None
+                )
             except psutil.NoSuchProcess:
                 # Process died between the pid listing and oneshot.
-                del self._pid_cache[pid]
-                self._identity.pop(pid, None)
-                self._io_denied_pids.discard(pid)
-                continue
-            except psutil.AccessDenied:
-                # Can't inspect the process at all — skip it.
+                self._forget(pid)
                 continue
             except Exception:
-                # Any other unexpected error — skip gracefully.
+                # AccessDenied (the process cannot be inspected at all) or any
+                # other unexpected error — skip it for this tick.
                 continue
 
-            # Normalise cmdline and resolve the registry ID once per PID;
-            # later ticks reuse the cached identity.
             if identity is None:
-                hash12, sample = normalize_cmdline(
-                    cmdline,
-                    replace_digits=ctx.config.sampling.cmdline_normalize,
-                )
-                proc_id = self._resolve_proc(name, hash12, sample, ts)
-                self._identity[pid] = (name, proc_id)
+                proc_id = self._register(pid, reading, ts, ctx)
             else:
                 _, proc_id = identity
 
-            # cpu_pct: mark as None when raw_cpu is 0.0 and the PID was
-            # just added to the cache (first call always returns 0.0).
-            # We track "first seen" by checking whether (proc_id, pid)
-            # already has a prior I/O entry — but a simpler heuristic:
-            # psutil documents that the first cpu_percent() call on a
-            # Process object returns 0.0, so we cannot distinguish 0% from
-            # "no baseline".  Per spec, "新規PIDの初回 cpu_pct=None で記録".
-            # We use the absence of a prev_io key as a proxy for "first tick".
+            # psutil's first cpu_percent() on a fresh Process object returns 0.0
+            # without a baseline, so 0% and "no baseline" are indistinguishable.
+            # Per spec (新規PIDの初回 cpu_pct=None で記録) the PID's first tick
+            # records None; the absence of a _prev_io entry marks that tick.
             key = (proc_id, pid)
             is_first_tick = key not in self._prev_io
-
-            cpu_pct: Optional[float] = None if is_first_tick else raw_cpu
-
-            # I/O deltas.
-            if cur_r is not None and cur_w is not None:
-                if not is_first_tick:
-                    prev_r, prev_w = self._prev_io.get(key, (cur_r, cur_w))
-                    io_read_delta = max(0, cur_r - prev_r)
-                    io_write_delta = max(0, cur_w - prev_w)
-                self._prev_io[key] = (cur_r, cur_w)
-            else:
-                # Even if io is denied, record the key so next tick
-                # is not "first".  Use sentinel (0, 0) — delta stays None.
-                if is_first_tick:
-                    self._prev_io[key] = (0, 0)
+            io_read_delta, io_write_delta = self._io_deltas(
+                key, reading.io, is_first_tick
+            )
 
             # PSS scrutiny mode.
             pss: Optional[int] = None
             if proc_id in self.pss_targets:
-                smaps_path = ctx.proc_root / str(pid) / "smaps_rollup"
-                pss = _read_pss_bytes(smaps_path)
+                pss = _read_pss_bytes(ctx.proc_root / str(pid) / "smaps_rollup")
 
             rows.append(
-                (
-                    ts,
-                    proc_id,
-                    pid,
-                    cpu_pct,
-                    rss,
-                    pss,
-                    num_threads,
-                    num_fds,
-                    io_read_delta,
-                    io_write_delta,
+                make_row(
+                    "proc_samples",
+                    ts=ts,
+                    proc_id=proc_id,
+                    pid=pid,
+                    cpu_pct=None if is_first_tick else reading.cpu,
+                    rss=reading.rss,
+                    pss=pss,
+                    num_threads=reading.num_threads,
+                    num_fds=reading.num_fds,
+                    io_read_delta=io_read_delta,
+                    io_write_delta=io_write_delta,
                 )
             )
 
@@ -291,3 +198,143 @@ class ProcessSampler(Sampler):
                 del self._prev_io[key]
 
         return [SampleBatch(table="proc_samples", rows=rows)]
+
+    # ------------------------------------------------------------------
+    # collect() steps
+    # ------------------------------------------------------------------
+
+    def _should_read_fds(self, ctx: RunContext) -> bool:
+        """Whether this tick reads ``num_fds()`` (roughly once per minute).
+
+        ``num_fds()`` opens and scans /proc/<pid>/fd for every process — the
+        most expensive per-process syscall here.  FD-LEAK-01 reads fds at
+        1-minute rollup granularity, so sampling it about once per minute
+        (rather than every tick) is lossless for the rule while cutting the
+        scan cost.
+        """
+        interval = max(ctx.config.sampling.process_interval, 1.0)
+        fd_every = max(1, round(60.0 / interval))
+        read_fds = self._tick % fd_every == 0
+        self._tick += 1
+        return read_fds
+
+    def _refresh_pid_cache(self) -> None:
+        """Add newly started PIDs to the cache and forget vanished ones."""
+        try:
+            live_pids = set(psutil.pids())
+        except Exception:
+            live_pids = set()
+
+        for pid in live_pids:
+            if pid not in self._pid_cache:
+                with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    self._pid_cache[pid] = psutil.Process(pid)
+
+        for pid in list(self._pid_cache):
+            if pid not in live_pids:
+                self._forget(pid)
+
+    def _forget(self, pid: int) -> None:
+        """Drop every per-PID cache entry for a process that is gone."""
+        self._pid_cache.pop(pid, None)
+        self._identity.pop(pid, None)
+        self._io_denied_pids.discard(pid)
+
+    def _read_process(
+        self,
+        pid: int,
+        proc: psutil.Process,
+        *,
+        read_fds: bool,
+        need_identity: bool,
+    ) -> _Reading:
+        """Read one process's metrics inside a single ``oneshot()`` block.
+
+        Name and cmdline are only read for a PID without a cached identity
+        (they never change for a live process).  Per-attribute AccessDenied /
+        zombie errors degrade just that column to None; NoSuchProcess and a
+        process-wide AccessDenied propagate to the caller.
+        """
+        name: Optional[str] = None
+        cmdline: list[str] = []
+        with proc.oneshot():
+            if need_identity:
+                name = proc.name()
+                try:
+                    cmdline = proc.cmdline()
+                except _DENIED_OR_ZOMBIE:
+                    cmdline = []
+            cpu = proc.cpu_percent()
+            try:
+                rss: Optional[int] = proc.memory_info().rss
+            except _DENIED_OR_ZOMBIE:
+                rss = None
+            try:
+                num_threads: Optional[int] = proc.num_threads()
+            except _DENIED_OR_ZOMBIE:
+                num_threads = None
+            num_fds: Optional[int] = None
+            if read_fds:
+                try:
+                    num_fds = proc.num_fds()
+                except (*_DENIED_OR_ZOMBIE, AttributeError):
+                    num_fds = None
+            io = self._read_io(pid, proc)
+        return _Reading(name, cmdline, cpu, rss, num_threads, num_fds, io)
+
+    def _read_io(self, pid: int, proc: psutil.Process) -> Optional[Tuple[int, int]]:
+        """Return cumulative ``(read_bytes, write_bytes)``, or None if unreadable.
+
+        AccessDenied is expected for processes owned by other users when
+        running non-root.  A once-denied PID stays denied, so the read (and its
+        exception cost — one per process per tick) is skipped from then on;
+        the missing-rate counters still tick for the quality report.
+        """
+        self.io_total += 1
+        if pid in self._io_denied_pids:
+            self.io_denied += 1
+            return None
+        try:
+            io = proc.io_counters()
+            return io.read_bytes, io.write_bytes
+        except (psutil.AccessDenied, AttributeError):
+            self.io_denied += 1
+            self._io_denied_pids.add(pid)
+            return None
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            return None
+
+    def _register(self, pid: int, reading: _Reading, ts: float, ctx: RunContext) -> int:
+        """Resolve and cache the registry ``proc_id`` for a newly seen PID."""
+        hash12, sample = normalize_cmdline(
+            reading.cmdline,
+            replace_digits=ctx.config.sampling.cmdline_normalize,
+        )
+        proc_id = self._resolve_proc(reading.name, hash12, sample, ts)
+        self._identity[pid] = (reading.name, proc_id)
+        return proc_id
+
+    def _io_deltas(
+        self,
+        key: Tuple[int, int],
+        io: Optional[Tuple[int, int]],
+        is_first_tick: bool,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Return clamped I/O deltas for ``(proc_id, pid)`` and update the baseline.
+
+        The first tick only records the baseline.  When I/O is unreadable on
+        the first tick a ``(0, 0)`` sentinel is stored anyway, so the next tick
+        is no longer treated as "first" (its delta stays None while unreadable).
+        """
+        if io is None:
+            if is_first_tick:
+                self._prev_io[key] = (0, 0)
+            return None, None
+
+        cur_r, cur_w = io
+        deltas: Tuple[Optional[int], Optional[int]] = (None, None)
+        if not is_first_tick:
+            prev_r, prev_w = self._prev_io.get(key, io)
+            deltas = (max(0, cur_r - prev_r), max(0, cur_w - prev_w))
+        self._prev_io[key] = io
+        return deltas

@@ -250,9 +250,10 @@ class CpuSinglecoreRule(Rule):
             for row in proc_rows:
                 pid = row["proc_id"]
                 cpu = row["cpu_max"]
-                if cpu is not None:
-                    if pid not in cpu_by_proc or cpu > cpu_by_proc[pid]:
-                        cpu_by_proc[pid] = cpu
+                if cpu is not None and (
+                    pid not in cpu_by_proc or cpu > cpu_by_proc[pid]
+                ):
+                    cpu_by_proc[pid] = cpu
 
             top_procs_ids = sorted(
                 cpu_by_proc, key=lambda p: cpu_by_proc[p], reverse=True
@@ -263,7 +264,7 @@ class CpuSinglecoreRule(Rule):
             for proc_id in top_procs_ids:
                 name = store.proc_name(proc_id)
                 top_process_names.append(name)
-                if "python" in name.lower() or name.lower() in ("python", "python3"):
+                if "python" in name.lower():
                     has_python = True
 
             # Get representative values from sys_rollup for this episode.

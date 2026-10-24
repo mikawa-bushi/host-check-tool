@@ -16,10 +16,8 @@ exercise the PSI-less code path.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Optional
-from unittest.mock import patch
 
 import pytest
 
@@ -374,7 +372,6 @@ class TestSelfMeter:
         )
 
         # Phase 1: drive over budget to trigger throttle_down.
-        calls = []
 
         def phase1_sample():
             return 50.0, 1024

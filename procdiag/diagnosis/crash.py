@@ -34,12 +34,15 @@ Design doc reference: procdiag_extension_proposal.md EXT-01 / OOM-KILL-01.
 
 from __future__ import annotations
 
+import bisect
 import subprocess
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from ..core import (
     Confidence,
     Finding,
+    MiB,
     Rule,
     Severity,
     Window,
@@ -99,9 +102,8 @@ def _read_oom_journal(since: float, until: float) -> list[str]:
     caller lacks permission, or the subprocess times out.  This keeps
     OOM-KILL-01 silent rather than crashing when journal access is unavailable.
     """
-    # Format timestamps as "YYYY-MM-DD HH:MM:SS" in UTC for journalctl.
-    from datetime import datetime, timezone
 
+    # Format timestamps as "YYYY-MM-DD HH:MM:SS" in UTC for journalctl.
     def _fmt(ts: float) -> str:
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -264,8 +266,8 @@ class OomKillRule(Rule):
                 "process_name": process_name,
                 "last_seen": last_ts,
                 "last_rss_bytes": last_rss,
-                "last_rss_mb": round(last_rss / (1024 * 1024), 1),
-                "mem_total_mb": round(mem_total / (1024 * 1024), 1),
+                "last_rss_mb": round(last_rss / MiB, 1),
+                "mem_total_mb": round(mem_total / MiB, 1),
                 "lifetime_minutes": lifetime_minutes,
                 "gap_to_window_end_s": round(gap, 1),
                 "crisis_indicator": crisis_indicator["type"],
@@ -318,8 +320,6 @@ class OomKillRule(Rule):
         if not sys_ts_list:
             return None
         # Binary-search for the closest timestamp.
-        import bisect
-
         idx = bisect.bisect_left(sys_ts_list, ts)
         if idx == 0:
             return sys_rows[0]

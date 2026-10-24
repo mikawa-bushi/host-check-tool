@@ -14,7 +14,7 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Hashable, Iterable, Iterator, Mapping, Optional
 
 from ..core import Confidence
 
@@ -112,6 +112,65 @@ def fit_linear(
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
 
     return TrendFit(slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours)
+
+
+# ---------------------------------------------------------------------------
+# Per-subject series helpers (shared by the regression-based leak rules)
+# ---------------------------------------------------------------------------
+
+
+def group_series(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    key: str,
+    value: str,
+    ts: str = "ts_min",
+) -> dict[Any, list[tuple[float, float]]]:
+    """Group rows into ``{row[key]: [(row[ts], float(row[value])), ...]}``.
+
+    Rows whose *value* is NULL are skipped; row order (time order, as returned
+    by ``Storage.rows``) is preserved within each group.
+    """
+    out: dict[Any, list[tuple[float, float]]] = {}
+    for row in rows:
+        v = row[value]
+        if v is not None:
+            out.setdefault(row[key], []).append((row[ts], float(v)))
+    return out
+
+
+def fit_each(
+    series_by_key: Mapping[Hashable, list[tuple[float, float]]],
+    *,
+    min_points: int,
+    min_span_hours: float,
+    min_r2: float,
+) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
+    """Yield ``(key, series, fit)`` for every series whose line fit is reliable.
+
+    A series is skipped when :func:`fit_linear` declines it (too few points or
+    too short a span) or when its R² is below *min_r2* — i.e. the growth is
+    not a sustained trend.  The slope threshold stays with the caller because
+    each rule states it in its own unit (MB/h, FDs/h, threads/h).
+    """
+    for key, series in series_by_key.items():
+        fit = fit_linear(series, min_points=min_points, min_span_hours=min_span_hours)
+        if fit is None or fit.r2 < min_r2:
+            continue
+        yield key, series, fit
+
+
+def days_until(current: float, limit: float, slope_per_hour: float) -> Optional[float]:
+    """Days until a value growing at *slope_per_hour* reaches *limit*.
+
+    ``None`` when the value is not growing or is already at/over the limit.
+    """
+    if slope_per_hour <= 0:
+        return None
+    remaining = limit - current
+    if remaining <= 0:
+        return None
+    return remaining / (slope_per_hour * 24.0)
 
 
 # ---------------------------------------------------------------------------
@@ -278,47 +337,66 @@ def detect_periodicity(
     if len(timestamps) < min_events:
         return None
 
-    # --- daily check ---
-    # Group events by calendar date.  For each date, collect the seconds-since-midnight.
-    day_seconds: dict[str, list[float]] = {}
-    for ts in timestamps:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        day_key = dt.strftime("%Y-%m-%d")
-        sod = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
-        day_seconds.setdefault(day_key, []).append(sod)
+    times = [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in timestamps]
 
-    # Try every observed second-of-day as a candidate anchor.
-    all_sods = [s for sods in day_seconds.values() for s in sods]
-    for anchor_sod in all_sods:
-        matching_days = 0
-        for sods in day_seconds.values():
-            if any(abs(s - anchor_sod) <= tol_sec for s in sods):
-                matching_days += 1
-        if matching_days >= min_events:
-            h = int(anchor_sod // 3600)
-            m = int((anchor_sod % 3600) // 60)
-            return Period(kind="daily", anchor=f"{h:02d}:{m:02d}", count=matching_days)
+    # --- daily check: same second-of-day on distinct calendar dates ---
+    daily = _recurring_offset(
+        times,
+        slot=lambda dt: dt.strftime("%Y-%m-%d"),
+        offset=lambda dt: (
+            dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+        ),
+        tol_sec=tol_sec,
+        min_events=min_events,
+    )
+    if daily is not None:
+        sod, count = daily
+        h = int(sod // 3600)
+        m = int((sod % 3600) // 60)
+        return Period(kind="daily", anchor=f"{h:02d}:{m:02d}", count=count)
 
-    # --- hourly check ---
-    # Group events by (date, hour).  For each hour-slot, collect the
-    # seconds-within-the-hour.
-    hour_seconds: dict[str, list[float]] = {}
-    for ts in timestamps:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        hour_key = dt.strftime("%Y-%m-%dT%H")
-        soh = dt.minute * 60 + dt.second + dt.microsecond / 1e6
-        hour_seconds.setdefault(hour_key, []).append(soh)
+    # --- hourly check: same second-of-hour in distinct clock-hours ---
+    hourly = _recurring_offset(
+        times,
+        slot=lambda dt: dt.strftime("%Y-%m-%dT%H"),
+        offset=lambda dt: dt.minute * 60 + dt.second + dt.microsecond / 1e6,
+        tol_sec=tol_sec,
+        min_events=min_events,
+    )
+    if hourly is not None:
+        soh, count = hourly
+        return Period(kind="hourly", anchor=f":{int(soh // 60):02d}", count=count)
 
-    all_sohs = [s for sohs in hour_seconds.values() for s in sohs]
-    for anchor_soh in all_sohs:
-        matching_hours = 0
-        for sohs in hour_seconds.values():
-            if any(abs(s - anchor_soh) <= tol_sec for s in sohs):
-                matching_hours += 1
-        if matching_hours >= min_events:
-            m = int(anchor_soh // 60)
-            return Period(kind="hourly", anchor=f":{m:02d}", count=matching_hours)
+    return None
 
+
+def _recurring_offset(
+    times: list[datetime],
+    *,
+    slot: Callable[[datetime], str],
+    offset: Callable[[datetime], float],
+    tol_sec: float,
+    min_events: int,
+) -> Optional[tuple[float, int]]:
+    """Find an offset that recurs (±*tol_sec*) in at least *min_events* slots.
+
+    Events are grouped by ``slot(dt)`` (a calendar day or a clock-hour) and
+    reduced to ``offset(dt)`` seconds within that slot.  Every observed offset
+    is tried as a candidate anchor, in observation order; the first one matched
+    by enough distinct slots is returned as ``(offset, matching_slots)``.
+    """
+    by_slot: dict[str, list[float]] = {}
+    for dt in times:
+        by_slot.setdefault(slot(dt), []).append(offset(dt))
+
+    for anchor in (o for offsets in by_slot.values() for o in offsets):
+        matching = sum(
+            1
+            for offsets in by_slot.values()
+            if any(abs(o - anchor) <= tol_sec for o in offsets)
+        )
+        if matching >= min_events:
+            return anchor, matching
     return None
 
 
@@ -344,7 +422,7 @@ def detect_recurrence(events_by_day: dict[str, bool]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# host-specific baseline (weekday × hour median / MAD)
+# confidence_from_span
 # ---------------------------------------------------------------------------
 
 
@@ -368,6 +446,11 @@ def confidence_from_span(
     if span_hours >= medium_hours:
         return Confidence.MEDIUM
     return Confidence.LOW
+
+
+# ---------------------------------------------------------------------------
+# host-specific baseline (weekday × hour median / MAD)
+# ---------------------------------------------------------------------------
 
 
 def learn_baseline(

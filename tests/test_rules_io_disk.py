@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from synth import (
     add_cg_io_series,
     add_dir_series,

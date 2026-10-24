@@ -8,8 +8,17 @@ imports, docstrings in English, user-visible strings in Japanese.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import sys
+from collections.abc import Hashable
 from typing import Optional
+
+# Binary byte units, shared by the samplers, rules and reports so every module
+# converts sizes the same way as ``df -h`` / ``free -h`` (powers of 1024).
+KiB = 1024
+MiB = 1024**2
+GiB = 1024**3
 
 
 def parse_duration(s: str) -> float:
@@ -61,9 +70,9 @@ def humanize_bytes(n: Optional[int]) -> str:
         sign = ""
     for unit, threshold in [
         ("TB", 1024**4),
-        ("GB", 1024**3),
-        ("MB", 1024**2),
-        ("KB", 1024),
+        ("GB", GiB),
+        ("MB", MiB),
+        ("KB", KiB),
     ]:
         if n >= threshold:
             return f"{sign}{n / threshold:.1f}{unit}"
@@ -127,15 +136,8 @@ def normalize_cmdline(
     The hash is *stable*: calling with the same logical command always returns
     the same ``hash12``, which is what ``proc_id_for`` relies on.
     """
-    if not cmdline:
-        raw_text = ""
-    else:
-        raw_text = " ".join(cmdline)
-
-    if replace_digits:
-        normalised = re.sub(r"\d+", "#", raw_text)
-    else:
-        normalised = raw_text
+    raw_text = " ".join(cmdline) if cmdline else ""
+    normalised = re.sub(r"\d+", "#", raw_text) if replace_digits else raw_text
 
     hash12 = hashlib.sha1(normalised.encode("utf-8", errors="replace")).hexdigest()[:12]
 
@@ -153,9 +155,29 @@ def should_use_color(no_color: bool = False) -> bool:
     Centralises the decision so every command treats colour consistently and
     output copied into tickets/log captures stays free of escape codes.
     """
-    import os
-    import sys
-
     if no_color or os.environ.get("NO_COLOR"):
         return False
     return sys.stdout.isatty()
+
+
+class CounterDelta:
+    """Turn cumulative OS counters into per-tick deltas, keyed by any hashable.
+
+    ``update(key, value)`` returns ``None`` the first time a key is seen (there
+    is no baseline to diff against) and ``max(0, value - previous)`` afterwards.
+    The clamp is the single policy for counter resets — a restarted cgroup unit
+    or a wrapped kernel counter restarts from 0, and a raw negative delta would
+    corrupt every rollup sum built on it.  Keeping the clamp here means a new
+    sampler cannot forget it (the v0.3 cgroup bug C-01 was exactly that).
+    """
+
+    def __init__(self) -> None:
+        self._prev: dict[Hashable, int] = {}
+
+    def update(self, key: Hashable, value: int) -> Optional[int]:
+        """Record *value* for *key* and return the clamped delta (None at first)."""
+        prev = self._prev.get(key)
+        self._prev[key] = value
+        if prev is None:
+            return None
+        return max(0, value - prev)

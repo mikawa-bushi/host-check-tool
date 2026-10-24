@@ -501,3 +501,74 @@ def test_cg_last_seen_update_is_throttled(tmp_db):
     # Past the throttle window: last_seen advances.
     tmp_db.cg_id_for(unit, 1100.0)
     assert _last_seen() == 1100.0
+
+
+# ---------------------------------------------------------------------------
+# make_row — name-keyed row construction for samplers
+# ---------------------------------------------------------------------------
+
+
+def test_make_row_orders_columns_by_table_columns():
+    from procdiag.storage import make_row
+
+    row = make_row("disk_samples", used=40, mountpoint="/", ts=1.0, total=100)
+    assert row == (1.0, "/", 100, 40)
+
+
+def test_make_row_rejects_missing_and_unknown_columns():
+    from procdiag.storage import make_row
+
+    with pytest.raises(ValueError, match="不足"):
+        make_row("disk_samples", ts=1.0, mountpoint="/", total=100)
+    with pytest.raises(ValueError, match="不明"):
+        make_row("disk_samples", ts=1.0, mountpoint="/", total=1, used=1, bogus=2)
+
+
+# ---------------------------------------------------------------------------
+# Aggregate read helpers (status / engine quality)
+# ---------------------------------------------------------------------------
+
+
+def test_time_bounds_and_self_cpu_stats(tmp_db):
+    assert tmp_db.time_bounds("sys_samples") is None
+    assert tmp_db.self_cpu_stats() == (None, None)
+
+    rows = [_sys_row(10.0), _sys_row(20.0), _sys_row(30.0)]
+    rows[2] = rows[2][:-2] + (2.0, rows[2][-1])  # self_cpu 0.5, 0.5, 2.0
+    tmp_db.buffer("sys_samples", rows)
+    tmp_db.flush()
+
+    assert tmp_db.time_bounds("sys_samples") == (10.0, 30.0)
+    assert tmp_db.self_cpu_stats() == (pytest.approx(1.0), 2.0)
+    assert tmp_db.self_cpu_stats(since=15.0, until=25.0) == (0.5, 0.5)
+
+
+def test_missing_io_ratio(tmp_db):
+    assert tmp_db.missing_io_ratio(0.0, 100.0) == 0.0
+    readable = _proc_row(1.0, pid=1)[:-2] + (10, 20)
+    tmp_db.buffer("proc_samples", [readable, _proc_row(1.0, pid=2)])
+    tmp_db.flush()
+    assert tmp_db.missing_io_ratio(0.0, 100.0) == pytest.approx(0.5)
+
+
+def test_recent_events_returns_newest_oldest_first(tmp_db):
+    for i in range(7):
+        tmp_db.conn.execute(
+            "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, '')",
+            (float(i), f"k{i}"),
+        )
+    tmp_db.conn.commit()
+    assert [r["kind"] for r in tmp_db.recent_events(3)] == ["k4", "k5", "k6"]
+
+
+def test_record_spike_and_write_meta(tmp_db):
+    tmp_db.write_meta({"hostname": "edge-01", "kernel": "6.8"})
+    tmp_db.record_spike(
+        trigger_type="cpu",
+        psi_snapshot="{}",
+        top_processes='{"by_cpu": [], "by_rss": []}',
+        top_cgroups='{"by_mem": []}',
+    )
+    assert tmp_db.meta()["hostname"] == "edge-01"
+    (spike,) = tmp_db.rows("spike_events")
+    assert spike["trigger_type"] == "cpu"

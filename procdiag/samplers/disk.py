@@ -27,6 +27,7 @@ import time
 import psutil
 
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
+from ..storage import make_row
 
 # Filesystem types that carry no persistent data and should be excluded from
 # disk-usage monitoring to avoid misleading "full" readings.
@@ -98,12 +99,17 @@ class DiskSampler(Sampler):
                 continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
-            except PermissionError:
+            except OSError:  # incl. PermissionError
                 continue
-            except OSError:
-                continue
-            # Column order: ts, mountpoint, total, used  (contract §T04)
-            rows.append((ts, part.mountpoint, usage.total, usage.used))
+            rows.append(
+                make_row(
+                    "disk_samples",
+                    ts=ts,
+                    mountpoint=part.mountpoint,
+                    total=usage.total,
+                    used=usage.used,
+                )
+            )
 
         return [SampleBatch(table="disk_samples", rows=rows)]
 
@@ -120,8 +126,15 @@ class DiskSampler(Sampler):
         watch_dirs = ctx.config.sampling.watch_dirs
         for wd in watch_dirs:
             size_bytes, is_estimate = _scan_dir(wd.path, wd.time_budget_sec)
-            # Column order: ts, path, size_bytes, is_estimate  (contract §T04)
-            rows.append((ts, wd.path, size_bytes, int(is_estimate)))
+            rows.append(
+                make_row(
+                    "dir_samples",
+                    ts=ts,
+                    path=wd.path,
+                    size_bytes=size_bytes,
+                    is_estimate=int(is_estimate),
+                )
+            )
 
         return [SampleBatch(table="dir_samples", rows=rows)]
 
@@ -152,9 +165,7 @@ def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:
                     try:
                         # Use lstat to avoid following symlinks.
                         stat = entry.stat(follow_symlinks=False)
-                    except PermissionError:
-                        continue
-                    except OSError:
+                    except OSError:  # incl. PermissionError
                         continue
                     if entry.is_symlink():
                         # Count the symlink itself but do not follow it.
@@ -163,9 +174,7 @@ def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:
                         stack.append(entry.path)
                     else:
                         total += stat.st_size
-        except PermissionError:
-            continue
-        except OSError:
+        except OSError:  # incl. PermissionError
             continue
 
     return total, is_estimate

@@ -22,9 +22,7 @@ import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
-
-import pytest
+from typing import List, Optional
 
 from procdiag.config import ProcdiagConfig, SamplingConfig
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler, SystemSnapshot

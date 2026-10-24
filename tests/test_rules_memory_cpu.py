@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from synth import (
     add_cpu_saturation_samples,
     add_mem_pressure_days,

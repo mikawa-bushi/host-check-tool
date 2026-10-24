@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 from ..core import (
     Confidence,
     Finding,
+    GiB,
+    MiB,
     Rule,
     Severity,
     Window,
@@ -51,7 +53,7 @@ _IO_PSI_THRESHOLD: float = 30.0
 _IO_MIN_DURATION_MINUTES: float = 15.0
 
 # DISK-GROWTH-01
-_DISK_GROWTH_THRESHOLD_BYTES_PER_DAY: int = 100 * 1024 * 1024  # 100 MB/day
+_DISK_GROWTH_THRESHOLD_BYTES_PER_DAY: int = 100 * MiB  # 100 MB/day
 
 
 @register
@@ -137,7 +139,6 @@ class DiskFullRule(Rule):
                 daily_growth_bytes = 0.0
 
             last_used = triples[-1][1]
-            _gb = 1024**3
 
             evidence = {
                 "mountpoint": mountpoint,
@@ -145,13 +146,13 @@ class DiskFullRule(Rule):
                 "daily_growth_bytes": daily_growth_bytes,
                 "used_bytes": last_used,
                 "total_bytes": capacity,
-                "used_gb": last_used / _gb,
-                "total_gb": capacity / _gb,
+                "used_gb": last_used / GiB,
+                "total_gb": capacity / GiB,
             }
 
             summary = (
                 f"{mountpoint}: 残り {days_left:.1f}日で満杯"
-                f" ({daily_growth_bytes / 1024 / 1024 / 1024:.2f} GB/日の増加)"
+                f" ({daily_growth_bytes / GiB:.2f} GB/日の増加)"
             )
 
             # Confidence based on observation span and number of points
@@ -334,7 +335,7 @@ class IoBottleneckRule(Rule):
                     top_writers.append(
                         {
                             "name": name,
-                            "write_mb_total": total_bytes / (1024 * 1024),
+                            "write_mb_total": total_bytes / MiB,
                         }
                     )
 
@@ -374,7 +375,7 @@ class IoBottleneckRule(Rule):
                     top_cg_writers.append(
                         {
                             "unit_path": unit_path,
-                            "write_mb_total": total_bytes / (1024 * 1024),
+                            "write_mb_total": total_bytes / MiB,
                         }
                     )
 
@@ -507,26 +508,23 @@ class DiskGrowthRule(Rule):
                     mountpoint = mp
                     break
 
-            _mb = 1024 * 1024
-            _gb = 1024**3
-
             evidence = {
                 "path": path,
-                "daily_growth_mb": daily_growth / _mb,
+                "daily_growth_mb": daily_growth / MiB,
                 "daily_growth_bytes": daily_growth,
-                "threshold_mb": self.threshold_bytes_per_day // _mb,
+                "threshold_mb": self.threshold_bytes_per_day // MiB,
                 "observation_days": span_days,
-                "start_gb": size_start / _gb,
-                "end_gb": size_end / _gb,
+                "start_gb": size_start / GiB,
+                "end_gb": size_end / GiB,
                 "mountpoint": mountpoint,
             }
 
-            # Subject includes mountpoint when known so _fold can match.
+            # Subject includes mountpoint when known so engine.fold can match.
             subject = mountpoint if mountpoint is not None else path
 
             summary = (
-                f"{path}: 日次増分 {daily_growth / _mb:.0f} MB/日"
-                f" (閾値 {self.threshold_bytes_per_day // _mb} MB/日)"
+                f"{path}: 日次増分 {daily_growth / MiB:.0f} MB/日"
+                f" (閾値 {self.threshold_bytes_per_day // MiB} MB/日)"
             )
 
             # Confidence based on observation span.
@@ -611,13 +609,13 @@ class DiskJournalRule(Rule):
                 latest[path] = (ts, int(size))
 
         findings: list[Finding] = []
-        warn_bytes = self.journal_size_warn_gb * (1024**3)
+        warn_bytes = self.journal_size_warn_gb * GiB
 
         for path, (ts, size_bytes) in latest.items():
             if size_bytes <= warn_bytes:
                 continue
 
-            size_gb = size_bytes / (1024**3)
+            size_gb = size_bytes / GiB
             latest_ts_str = datetime.datetime.fromtimestamp(ts).strftime(
                 "%Y-%m-%d %H:%M"
             )

@@ -25,7 +25,6 @@ DISK-JOURNAL-01), and T12 (FD-LEAK-01, THREAD-LEAK-01, ZOMBIE-01).
 
 from __future__ import annotations
 
-import math
 import random
 import time
 from pathlib import Path
@@ -694,7 +693,6 @@ def add_psi_io_series(
         start_ts = time.time() - hours * 3600.0
 
     n_minutes = int(hours * 60)
-    rng = random.Random(99)
     rows: list[tuple] = []
     for i in range(n_minutes):
         ts = start_ts + i * 60.0

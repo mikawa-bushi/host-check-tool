@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 
@@ -32,7 +32,8 @@ from ..core.sampler import (
     SystemSnapshot,
     register_sampler,
 )
-from ..storage import TABLE_COLUMNS
+from ..core.util import CounterDelta
+from ..storage import make_row
 
 # ---------------------------------------------------------------------------
 # PSI parser — pure function, tested directly
@@ -43,6 +44,14 @@ _PSI_AVG_KEYS = ("avg10", "avg60", "avg300")
 # The sampler only consumes the 10-second averages (some_avg10 / full_avg10);
 # restrict per-tick parsing to these to skip avg60/avg300/total conversions.
 _PSI_USED_KEYS = frozenset({"avg10"})
+# /proc/pressure/<file> -> (snapshot key prefix, PSI kinds recorded for it).
+# The cpu file's "full" line is meaningless at the system level, so only
+# "some" is kept for it.
+_PSI_SOURCES = (
+    ("cpu", "cpu", ("some",)),
+    ("memory", "mem", ("some", "full")),
+    ("io", "io", ("some", "full")),
+)
 
 
 def parse_psi(text: str, *, keys: "frozenset[str] | None" = None) -> Dict[str, float]:
@@ -135,12 +144,8 @@ class SystemSampler(Sampler):
     # ------------------------------------------------------------------
 
     def __init__(self) -> None:
-        # Previous swap counters for delta computation.
-        self._prev_swap_in: Optional[int] = None
-        self._prev_swap_out: Optional[int] = None
-        # Previous disk I/O counters for delta computation.
-        self._prev_disk_read: Optional[int] = None
-        self._prev_disk_write: Optional[int] = None
+        # Cumulative swap / disk-I/O counters -> per-tick deltas.
+        self._deltas = CounterDelta()
         # Most recent snapshot exposed to the trigger / recorder.
         self.last_snapshot: Optional[SystemSnapshot] = None
 
@@ -170,8 +175,6 @@ class SystemSampler(Sampler):
         """Collect one tick of system-wide metrics.
 
         Returns a single-element list: ``[SampleBatch("sys_samples", [row])]``.
-        The row tuple follows the column order defined in
-        ``storage.TABLE_COLUMNS["sys_samples"]``.
 
         On the *first* call, swap and disk delta columns are 0 (the baseline is
         recorded for the next call).  Subsequent calls return true deltas.
@@ -187,62 +190,20 @@ class SystemSampler(Sampler):
             cpu_total = psutil.cpu_percent()
             cpu_max_core = cpu_total
 
-        # --- Memory ---
+        # --- Memory / swap (swap_in / swap_out are cumulative bytes) ---
         vmem = psutil.virtual_memory()
-        mem_used: int = vmem.used
-        mem_available: int = vmem.available
-
-        # --- Swap ---
         swap = psutil.swap_memory()
-        swap_used: int = swap.used
-        raw_swap_in: int = swap.sin  # cumulative bytes
-        raw_swap_out: int = swap.sout
-
-        if self._prev_swap_in is None:
-            swap_in_delta = 0
-            swap_out_delta = 0
-        else:
-            swap_in_delta = max(0, raw_swap_in - self._prev_swap_in)
-            swap_out_delta = max(0, raw_swap_out - self._prev_swap_out)  # type: ignore[operator]
-        self._prev_swap_in = raw_swap_in
-        self._prev_swap_out = raw_swap_out
+        swap_in_delta = self._delta("swap_in", swap.sin)
+        swap_out_delta = self._delta("swap_out", swap.sout)
 
         # --- Disk I/O ---
         disk_read_delta, disk_write_delta = self._disk_io_deltas()
 
-        # --- Load average (direct /proc read) ---
-        load1 = self._read_load1(ctx.proc_root)
-
         # --- PSI (direct /proc read) ---
-        psi_cpu_some10: Optional[float] = None
-        psi_mem_some10: Optional[float] = None
-        psi_mem_full10: Optional[float] = None
-        psi_io_some10: Optional[float] = None
-        psi_io_full10: Optional[float] = None
-        psi_dict: Optional[Dict[str, float]] = None
-
+        psi: Optional[Dict[str, Optional[float]]] = None
         if ctx.capabilities.get("psi", False):
-            psi_dict = {}
-            pressure_dir = ctx.proc_root / "pressure"
-
-            cpu_vals = self._read_psi(pressure_dir / "cpu")
-            if cpu_vals is not None:
-                psi_cpu_some10 = cpu_vals.get("some_avg10")
-                psi_dict["cpu_some10"] = psi_cpu_some10  # type: ignore[assignment]
-
-            mem_vals = self._read_psi(pressure_dir / "memory")
-            if mem_vals is not None:
-                psi_mem_some10 = mem_vals.get("some_avg10")
-                psi_mem_full10 = mem_vals.get("full_avg10")
-                psi_dict["mem_some10"] = psi_mem_some10  # type: ignore[assignment]
-                psi_dict["mem_full10"] = psi_mem_full10  # type: ignore[assignment]
-
-            io_vals = self._read_psi(pressure_dir / "io")
-            if io_vals is not None:
-                psi_io_some10 = io_vals.get("some_avg10")
-                psi_io_full10 = io_vals.get("full_avg10")
-                psi_dict["io_some10"] = psi_io_some10  # type: ignore[assignment]
-                psi_dict["io_full10"] = psi_io_full10  # type: ignore[assignment]
+            psi = self._read_pressure(ctx.proc_root / "pressure")
+        psi_cols = psi or {}
 
         # --- Self metrics ---
         self_cpu: Optional[float] = None
@@ -256,44 +217,42 @@ class SystemSampler(Sampler):
             cpu_total=cpu_total,
             cpu_max_core=cpu_max_core,
             mem_total=vmem.total,
-            mem_available=mem_available,
+            mem_available=vmem.available,
             swap_out_delta=swap_out_delta,
-            psi=psi_dict,
+            psi=psi,
         )
 
-        # --- Assemble row in TABLE_COLUMNS order ---
-        # ts, cpu_total, cpu_max_core, mem_used, mem_available,
-        # swap_used, swap_in, swap_out,
-        # load1,
-        # psi_cpu_some10, psi_mem_some10, psi_mem_full10, psi_io_some10, psi_io_full10,
-        # disk_read_bytes, disk_write_bytes,
-        # self_cpu, self_rss
-        row: tuple = (
-            ts,
-            cpu_total,
-            cpu_max_core,
-            mem_used,
-            mem_available,
-            swap_used,
-            swap_in_delta,
-            swap_out_delta,
-            load1,
-            psi_cpu_some10,
-            psi_mem_some10,
-            psi_mem_full10,
-            psi_io_some10,
-            psi_io_full10,
-            disk_read_delta,
-            disk_write_delta,
-            self_cpu,
-            self_rss,
+        row = make_row(
+            "sys_samples",
+            ts=ts,
+            cpu_total=cpu_total,
+            cpu_max_core=cpu_max_core,
+            mem_used=vmem.used,
+            mem_available=vmem.available,
+            swap_used=swap.used,
+            swap_in=swap_in_delta,
+            swap_out=swap_out_delta,
+            load1=self._read_load1(ctx.proc_root),
+            psi_cpu_some10=psi_cols.get("cpu_some10"),
+            psi_mem_some10=psi_cols.get("mem_some10"),
+            psi_mem_full10=psi_cols.get("mem_full10"),
+            psi_io_some10=psi_cols.get("io_some10"),
+            psi_io_full10=psi_cols.get("io_full10"),
+            disk_read_bytes=disk_read_delta,
+            disk_write_bytes=disk_write_delta,
+            self_cpu=self_cpu,
+            self_rss=self_rss,
         )
-
         return [SampleBatch("sys_samples", [row])]
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _delta(self, key: str, value: int) -> int:
+        """Clamped per-tick delta of a cumulative counter (0 on the first tick)."""
+        delta = self._deltas.update(key, value)
+        return 0 if delta is None else delta
 
     def _disk_io_deltas(self) -> Tuple[int, int]:
         """Return ``(read_bytes_delta, write_bytes_delta)`` since the last call.
@@ -308,17 +267,23 @@ class SystemSampler(Sampler):
             raw_write: int = counters.write_bytes
         except (AttributeError, OSError):
             return 0, 0
+        return self._delta("disk_read", raw_read), self._delta("disk_write", raw_write)
 
-        if self._prev_disk_read is None:
-            self._prev_disk_read = raw_read
-            self._prev_disk_write = raw_write
-            return 0, 0
+    @classmethod
+    def _read_pressure(cls, pressure_dir: Path) -> Dict[str, Optional[float]]:
+        """Read the 10-second PSI averages into snapshot keys (``cpu_some10`` …).
 
-        read_delta = max(0, raw_read - self._prev_disk_read)
-        write_delta = max(0, raw_write - self._prev_disk_write)  # type: ignore[operator]
-        self._prev_disk_read = raw_read
-        self._prev_disk_write = raw_write
-        return read_delta, write_delta
+        A file that cannot be read contributes no keys, so the matching
+        ``sys_samples`` columns are recorded as NULL for that tick.
+        """
+        psi: Dict[str, Optional[float]] = {}
+        for filename, prefix, kinds in _PSI_SOURCES:
+            vals = cls._read_psi(pressure_dir / filename)
+            if vals is None:
+                continue
+            for kind in kinds:
+                psi[f"{prefix}_{kind}10"] = vals.get(f"{kind}_avg10")
+        return psi
 
     @staticmethod
     def _read_load1(proc_root: Path) -> Optional[float]:

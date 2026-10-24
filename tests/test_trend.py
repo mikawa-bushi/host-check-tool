@@ -16,7 +16,6 @@ import pytest
 
 from procdiag.core import Confidence
 from procdiag.diagnosis.trend import (
-    Period,
     TrendFit,
     baseline_deviation,
     confidence_from_fit,
@@ -458,3 +457,46 @@ class TestBaseline:
         t0 = 1_700_000_000.0
         bl = learn_baseline([(t0, 10.0), (t0, 12.0)], min_per_bin=3)
         assert bl == {}  # only 2 points in the bin, below min_per_bin
+
+
+# ---------------------------------------------------------------------------
+# group_series / fit_each / days_until (shared by the leak rules)
+# ---------------------------------------------------------------------------
+
+
+class TestSeriesHelpers:
+    def test_group_series_skips_null_and_keeps_order(self):
+        from procdiag.diagnosis.trend import group_series
+
+        rows = [
+            {"ts_min": 1.0, "proc_id": 1, "rss_avg": 10},
+            {"ts_min": 1.0, "proc_id": 2, "rss_avg": None},
+            {"ts_min": 2.0, "proc_id": 1, "rss_avg": 12},
+            {"ts_min": 2.0, "proc_id": 2, "rss_avg": 5},
+        ]
+        out = group_series(rows, key="proc_id", value="rss_avg")
+        assert out == {1: [(1.0, 10.0), (2.0, 12.0)], 2: [(2.0, 5.0)]}
+
+    def test_fit_each_keeps_only_reliable_fits(self):
+        from procdiag.diagnosis.trend import fit_each
+
+        steady = _linear_series(1.0, 12, n=48)
+        too_short = steady[:3]
+        noisy = [(t, (i % 2) * 100.0) for i, (t, _) in enumerate(steady)]
+        kept = list(
+            fit_each(
+                {"steady": steady, "short": too_short, "noisy": noisy},
+                min_points=12,
+                min_span_hours=6.0,
+                min_r2=0.9,
+            )
+        )
+        assert [k for k, _s, _f in kept] == ["steady"]
+        assert kept[0][2].slope_per_hour == pytest.approx(1.0, rel=1e-6)
+
+    def test_days_until(self):
+        from procdiag.diagnosis.trend import days_until
+
+        assert days_until(100.0, 124.0, 1.0) == pytest.approx(1.0)
+        assert days_until(100.0, 50.0, 1.0) is None  # already past the limit
+        assert days_until(100.0, 200.0, 0.0) is None  # not growing

@@ -15,8 +15,9 @@ Design choices:
   and ``user.slice`` directly) is cached for five minutes to avoid redundant
   directory scans between ticks.
 * CPU and I/O columns are recorded as *deltas* relative to the previous
-  observation.  The first collect after start (or after a new unit appears)
-  skips those columns (``None``) because there is no baseline to diff against.
+  observation (clamped at 0 across unit restarts, see ``CounterDelta``).  The
+  first collect after start (or after a new unit appears) skips those columns
+  (``None``) because there is no baseline to diff against.
 * Any single file read failure (permission error, missing file) degrades only
   that column to ``None`` — the rest of the row is still emitted.  This is the
   "partial demotion" strategy described in design §2.1.
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
+from ..core.util import CounterDelta
+from ..storage import make_row
 
 # How long to cache the unit enumeration result (seconds).
 _ENUM_CACHE_TTL = 300.0
@@ -114,10 +117,8 @@ class CgroupSampler(Sampler):
         resolve_cg: Callable[[str, float], int],
     ) -> None:
         self._resolve_cg = resolve_cg
-        # Previous cpu_usec and io cumulative values keyed by unit_path.
-        self._prev_cpu: dict[str, int] = {}
-        self._prev_io_r: dict[str, int] = {}
-        self._prev_io_w: dict[str, int] = {}
+        # Cumulative cpu_usec / io bytes per (unit_path, counter) -> deltas.
+        self._deltas = CounterDelta()
         # Cached list of unit paths and the time it was last refreshed.
         self._units: list[str] = []
         self._units_refreshed: float = 0.0
@@ -177,60 +178,34 @@ class CgroupSampler(Sampler):
 
         for unit_path in self._units:
             unit_dir = ctx.cgroup_root / unit_path
-
-            # --- CPU ---
-            cpu_usec_delta: Optional[int] = None
-            cpu_raw = _parse_cpu_stat(unit_dir / "cpu.stat")
-            if cpu_raw is not None:
-                if unit_path in self._prev_cpu:
-                    # Clamp to >=0: when a unit restarts the cgroup is recreated
-                    # and its cumulative counter resets to 0, so raw-prev would be
-                    # a large negative value that corrupts cg_rollup_1m sums.
-                    # max(0, …) treats the reset tick as 0 and resumes from the
-                    # new baseline (set below) — matches system/process samplers.
-                    cpu_usec_delta = max(0, cpu_raw - self._prev_cpu[unit_path])
-                self._prev_cpu[unit_path] = cpu_raw
-
-            # --- Memory ---
-            mem_current = _read_int(unit_dir / "memory.current")
-            mem_swap = _read_int(unit_dir / "memory.swap.current")
-
-            # --- I/O ---
-            io_rbytes_delta: Optional[int] = None
-            io_wbytes_delta: Optional[int] = None
             rb_raw, wb_raw = _parse_io_stat(unit_dir / "io.stat")
-            if rb_raw is not None:
-                if unit_path in self._prev_io_r:
-                    # Clamp to >=0 against cgroup counter resets on unit restart
-                    # (see cpu.stat note above).
-                    io_rbytes_delta = max(0, rb_raw - self._prev_io_r[unit_path])
-                self._prev_io_r[unit_path] = rb_raw
-            if wb_raw is not None:
-                if unit_path in self._prev_io_w:
-                    io_wbytes_delta = max(0, wb_raw - self._prev_io_w[unit_path])
-                self._prev_io_w[unit_path] = wb_raw
 
-            # --- PIDs ---
-            pids = _read_int(unit_dir / "pids.current")
-
-            # Resolve registry ID via the injected callback.
-            cg_id = self._resolve_cg(unit_path, ts)
-
-            # Skip the row entirely on the very first collect (no deltas yet
-            # *and* cpu_raw was None means the file is unreadable).
-            # We always emit rows even if delta columns are None so that
-            # the first tick after restart still captures memory/pids.
+            # Rows are emitted even when the delta columns are still None (first
+            # tick for a unit) so that memory/pids are captured from the start.
             rows.append(
-                (
-                    ts,
-                    cg_id,
-                    cpu_usec_delta,
-                    mem_current,
-                    mem_swap,
-                    io_rbytes_delta,
-                    io_wbytes_delta,
-                    pids,
+                make_row(
+                    "cg_samples",
+                    ts=ts,
+                    cg_id=self._resolve_cg(unit_path, ts),
+                    cpu_usec_delta=self._delta(
+                        unit_path, "cpu", _parse_cpu_stat(unit_dir / "cpu.stat")
+                    ),
+                    mem_current=_read_int(unit_dir / "memory.current"),
+                    mem_swap=_read_int(unit_dir / "memory.swap.current"),
+                    io_rbytes_delta=self._delta(unit_path, "io_r", rb_raw),
+                    io_wbytes_delta=self._delta(unit_path, "io_w", wb_raw),
+                    pids=_read_int(unit_dir / "pids.current"),
                 )
             )
 
         return [SampleBatch(table="cg_samples", rows=rows)]
+
+    def _delta(self, unit_path: str, counter: str, raw: Optional[int]) -> Optional[int]:
+        """Per-tick delta of one cumulative counter; None when unreadable/first.
+
+        An unreadable tick leaves the previous baseline in place, so the next
+        readable tick still diffs against the last good value.
+        """
+        if raw is None:
+            return None
+        return self._deltas.update((unit_path, counter), raw)

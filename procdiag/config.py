@@ -13,11 +13,10 @@ approach as netdiag's scenario files.  If the file is absent, a
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .core.util import parse_duration
 
@@ -255,6 +254,7 @@ config = ProcdiagConfig(
         process_interval=10.0,        # Tier2b: プロセス走査 (秒)
         disk_interval=60.0,           # Tier3: ディスク使用量 (秒)
         dir_scan_interval=3600.0,     # Tier3: ディレクトリサイズ走査 (秒)
+        thermal_interval=10.0,        # Tier3: CPU温度・クロック (秒)
         watch_dirs=[
             # WatchDir(path="/var/log", time_budget_sec=10),
             # WatchDir(path="/opt/myapp/data"),

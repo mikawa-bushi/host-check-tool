@@ -10,7 +10,6 @@ Uses the synthetic DB builder from ``tests/synth.py`` and verifies:
 
 from __future__ import annotations
 
-import pytest
 from synth import (
     add_proc_series,
     add_sys_baseline,

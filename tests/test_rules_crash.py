@@ -18,7 +18,6 @@ from __future__ import annotations
 import time
 from unittest.mock import patch
 
-import pytest
 from synth import add_oom_scenario, make_db
 
 from procdiag.config import ProcdiagConfig, RulesConfig

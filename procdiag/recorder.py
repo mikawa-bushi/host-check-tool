@@ -18,18 +18,20 @@ Key design decisions (mirroring netdiag/Watcher):
 
 from __future__ import annotations
 
-import json
 import logging
 import platform
 import signal
 import socket
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from . import spikes
 from .config import ProcdiagConfig
-from .core.sampler import RunContext, Sampler
+from .core.sampler import RunContext, SampleBatch, Sampler
+from .core.util import MiB
 from .scheduler import TierScheduler
 from .storage import TABLE_COLUMNS, Storage
 
@@ -130,6 +132,7 @@ class Recorder:
         # Internal state ----------------------------------------------------
         self._start_mono: float = 0.0
         self._last_retention_mono: float = 0.0
+        self._last_gap_mono: float = float("-inf")
         self._flush_interval = 60.0
         self._retention_interval = 3600.0
 
@@ -202,129 +205,64 @@ class Recorder:
         except Exception:
             boot_time = 0.0
 
-        entries = {
-            "hostname": socket.gethostname(),
-            "kernel": platform.release(),
-            "boot_time": str(boot_time),
-            "procdiag_version": _VERSION,
-            "config": self._config.model_dump_json(),
-            "started_ts": str(time.time()),
-        }
-        for k, v in entries.items():
-            self._storage.set_meta(k, v)
-        self._storage.conn.commit()
+        self._storage.write_meta(
+            {
+                "hostname": socket.gethostname(),
+                "kernel": platform.release(),
+                "boot_time": str(boot_time),
+                "procdiag_version": _VERSION,
+                "config": self._config.model_dump_json(),
+                "started_ts": str(time.time()),
+            }
+        )
 
     # ------------------------------------------------------------------
-    # Buffer helpers
+    # Sampling helpers
     # ------------------------------------------------------------------
 
-    def _buffer_batches(self, batches: list) -> None:
+    def _run_sampler(self, name: str) -> list[SampleBatch]:
+        """Run the named sampler (when configured) and buffer its batches.
+
+        Returns the batches so callers (the spike handler) can also inspect the
+        rows they just recorded.  ``Sampler.run`` never raises.
+        """
+        sampler = self._samplers.get(name)
+        if sampler is None:
+            return []
+        batches = sampler.run(self._ctx)
         for batch in batches:
             self._storage.buffer(batch.table, batch.rows)
+        return batches
 
     # ------------------------------------------------------------------
     # Spike handling
     # ------------------------------------------------------------------
 
     def _handle_spike(self, decision: Any, snap: Any) -> None:
-        """Run T2a+T2b immediately and record a spike_events row."""
-        cg_sampler = self._samplers.get("cgroup")
-        proc_sampler = self._samplers.get("process")
+        """Run T2a+T2b immediately and record a spike_events row.
 
-        cg_batches = cg_sampler.run(self._ctx) if cg_sampler else []
-        proc_batches = proc_sampler.run(self._ctx) if proc_sampler else []
+        The spike_events row is self-contained: top_processes / top_cgroups
+        carry the culprit snapshot inline, so committing it atomically is
+        sufficient — a power cut can never leave a spike_events row that
+        "references" missing data.  The freshly buffered cg/proc samples are
+        persisted by the next interval flush; we deliberately do *not* force an
+        extra fsync here, since this runs on the 1-second T1 thread precisely
+        when the host is already under pressure (WAL + synchronous=NORMAL makes
+        the deferred flush equally durable).
+        """
+        cg_batches = self._run_sampler("cgroup")
+        proc_batches = self._run_sampler("process")
 
-        self._buffer_batches(cg_batches)
-        self._buffer_batches(proc_batches)
-
-        # Build top lists from the freshly buffered proc/cgroup rows.
-        top_procs_json = self._top_processes_json(proc_batches)
-        top_cgroups_json = self._top_cgroups_json(cg_batches)
-
-        psi_snap = decision.psi_snapshot if hasattr(decision, "psi_snapshot") else None
-        trigger_type = (
-            decision.trigger_type if hasattr(decision, "trigger_type") else "unknown"
+        self._storage.record_spike(
+            trigger_type=getattr(decision, "trigger_type", "unknown"),
+            psi_snapshot=spikes.encode_psi_snapshot(
+                getattr(decision, "psi_snapshot", None)
+            ),
+            top_processes=spikes.encode_top_processes(
+                _records(proc_batches, "proc_samples")
+            ),
+            top_cgroups=spikes.encode_top_cgroups(_records(cg_batches, "cg_samples")),
         )
-
-        # The spike_events row is self-contained: top_processes / top_cgroups
-        # carry the culprit snapshot inline (built above), so committing it
-        # atomically via `with conn` is sufficient — a power cut can never leave
-        # a spike_events row that "references" missing data.  The freshly
-        # buffered cg/proc samples are persisted by the next interval flush; we
-        # deliberately do *not* force an extra fsync here, since this runs on the
-        # 1-second T1 thread precisely when the host is already under pressure
-        # (WAL + synchronous=NORMAL makes the deferred flush equally durable).
-        with self._storage.conn:
-            self._storage.conn.execute(
-                "INSERT INTO spike_events "
-                "(ts, trigger_type, psi_snapshot, top_processes, top_cgroups) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    time.time(),
-                    trigger_type,
-                    json.dumps(psi_snap) if psi_snap is not None else "{}",
-                    top_procs_json,
-                    top_cgroups_json,
-                ),
-            )
-
-    def _top_processes_json(self, proc_batches: list) -> str:
-        """Extract top-10 processes by CPU and RSS from proc_samples batches."""
-        cols = TABLE_COLUMNS["proc_samples"]
-        rows = [
-            dict(zip(cols, r))
-            for b in proc_batches
-            if b.table == "proc_samples"
-            for r in b.rows
-        ]
-
-        by_cpu = sorted(
-            rows,
-            key=lambda d: d["cpu_pct"] if d["cpu_pct"] is not None else 0.0,
-            reverse=True,
-        )[:10]
-        by_rss = sorted(
-            rows,
-            key=lambda d: d["rss"] if d["rss"] is not None else 0,
-            reverse=True,
-        )[:10]
-
-        def _pick(d: dict) -> dict:
-            return {
-                "ts": d["ts"],
-                "proc_id": d["proc_id"],
-                "pid": d["pid"],
-                "cpu_pct": d["cpu_pct"],
-                "rss": d["rss"],
-            }
-
-        return json.dumps(
-            {
-                "by_cpu": [_pick(d) for d in by_cpu],
-                "by_rss": [_pick(d) for d in by_rss],
-            }
-        )
-
-    def _top_cgroups_json(self, cg_batches: list) -> str:
-        """Extract top-5 cgroups by memory from cg_samples batches."""
-        cols = TABLE_COLUMNS["cg_samples"]
-        rows = [
-            dict(zip(cols, r))
-            for b in cg_batches
-            if b.table == "cg_samples"
-            for r in b.rows
-        ]
-
-        by_mem = sorted(
-            rows,
-            key=lambda d: d["mem_current"] if d["mem_current"] is not None else 0,
-            reverse=True,
-        )[:5]
-
-        def _pick(d: dict) -> dict:
-            return {"ts": d["ts"], "cg_id": d["cg_id"], "mem_current": d["mem_current"]}
-
-        return json.dumps({"by_mem": [_pick(d) for d in by_mem]})
 
     # ------------------------------------------------------------------
     # Scheduled job callables
@@ -336,10 +274,9 @@ class Recorder:
         if sampler is None:
             return
 
-        batches = sampler.run(self._ctx)
-        self._buffer_batches(batches)
+        self._run_sampler("system")
 
-        # Retrieve the snapshot that T1 deposits on the context.
+        # Retrieve the snapshot that T1 deposits on the sampler.
         snap = getattr(sampler, "last_snapshot", None)
 
         # Spike-trigger check.
@@ -357,46 +294,14 @@ class Recorder:
             if throttle_result is not None:
                 self._storage.record_event(throttle_result, "selfmeter自動減速")
 
-    def _job_cgroup(self) -> None:
-        """Tier-2a job: cgroup sampling."""
-        sampler = self._samplers.get("cgroup")
-        if sampler is None:
-            return
-        batches = sampler.run(self._ctx)
-        self._buffer_batches(batches)
-
-    def _job_process(self) -> None:
-        """Tier-2b job: process sampling."""
-        sampler = self._samplers.get("process")
-        if sampler is None:
-            return
-        batches = sampler.run(self._ctx)
-        self._buffer_batches(batches)
-
-    def _job_disk(self) -> None:
-        """Tier-3 job: disk usage sampling."""
-        sampler = self._samplers.get("disk")
-        if sampler is None:
-            return
-        batches = sampler.run(self._ctx)
-        self._buffer_batches(batches)
-
-    def _job_thermal(self) -> None:
-        """Tier-3 job: temperature / cpufreq sampling (capability-gated)."""
-        sampler = self._samplers.get("thermal")
-        if sampler is None:
-            return
-        batches = sampler.run(self._ctx)
-        self._buffer_batches(batches)
-
     def _job_dir_scan(self) -> None:
         """Tier-3 dir job: watch-dir size scan."""
         sampler = self._samplers.get("disk")
         if sampler is None or not hasattr(sampler, "collect_dirs"):
             return
         try:
-            batches = sampler.collect_dirs(self._ctx)
-            self._buffer_batches(batches)
+            for batch in sampler.collect_dirs(self._ctx):
+                self._storage.buffer(batch.table, batch.rows)
         except Exception:
             logger.exception("ディレクトリ走査例外")
 
@@ -420,15 +325,13 @@ class Recorder:
             # are already gone before we compute the size.
             try:
                 ret = self._config.retention
-                max_bytes: int | None = (
-                    int(ret.db_max_size_mb * 1024 * 1024)
-                    if ret.db_max_size_mb is not None
-                    else None
-                )
-                min_free_bytes: int | None = int(ret.min_free_disk_mb * 1024 * 1024)
                 self._storage.enforce_size_budget(
-                    max_bytes=max_bytes,
-                    min_free_bytes=min_free_bytes,
+                    max_bytes=(
+                        int(ret.db_max_size_mb * MiB)
+                        if ret.db_max_size_mb is not None
+                        else None
+                    ),
+                    min_free_bytes=int(ret.min_free_disk_mb * MiB),
                 )
             except Exception:
                 logger.exception("DBサイズガード実行例外")
@@ -436,82 +339,49 @@ class Recorder:
     def _job_pss_precheck(self) -> None:
         """PSS pre-check job: update pss_targets on the process sampler.
 
-        Reads the last 6 hours of proc_rollup_1m, fits a line to each
-        process's rss_avg series, and writes the top-5 leaking candidates
-        (slope > 1 MB/h and r2 > 0.8) back to the process sampler's
-        pss_targets attribute.  Uses hasattr to remain a no-op when the
-        injected sampler does not expose pss_targets (e.g. fake samplers
-        in test_recorder.py).
+        Reads the recent proc_rollup_1m window and lets
+        :func:`~procdiag.diagnosis.memory.select_pss_targets` pick the
+        fastest-growing RSS series; the result becomes the process sampler's
+        pss_targets.  A changed target set is logged as a ``pss_scrutiny``
+        event.  Uses hasattr to remain a no-op when the injected sampler does
+        not expose pss_targets (e.g. fake samplers in test_recorder.py).
         """
-        from .diagnosis.trend import fit_linear  # local import
+        from .diagnosis.memory import (  # local import: keeps startup light
+            PSS_PRECHECK_WINDOW_HOURS,
+            select_pss_targets,
+        )
 
         sampler = self._samplers.get("process")
         if sampler is None or not hasattr(sampler, "pss_targets"):
             return
 
-        _PSS_PRECHECK_MIN_POINTS = 60
-        _PSS_PRECHECK_MIN_SPAN_HOURS = 2.0
-        _PSS_PRECHECK_SLOPE_THRESHOLD_MB_H = 1.0
-        _PSS_PRECHECK_R2_THRESHOLD = 0.8
-        _PSS_PRECHECK_WINDOW_HOURS = 6.0
-        _BYTES_PER_MB = 1024 * 1024
-        _PSS_MAX_TARGETS = 5
-
         now = time.time()
-        since = now - _PSS_PRECHECK_WINDOW_HOURS * 3600.0
-
         try:
             proc_rows = self._storage.rows(
                 "proc_rollup_1m",
-                since=since,
+                since=now - PSS_PRECHECK_WINDOW_HOURS * 3600.0,
                 until=now,
             )
         except Exception:
             logger.exception("PSS事前チェック: proc_rollup_1m 読み取り例外")
             return
 
-        # Group rss_avg by proc_id.
-        rss_by_proc: dict[int, list[tuple[float, float]]] = {}
-        for row in proc_rows:
-            pid = row["proc_id"]
-            rss = row["rss_avg"]
-            ts = row["ts_min"]
-            if rss is not None:
-                rss_by_proc.setdefault(pid, []).append((ts, float(rss)))
-
-        candidates: list[tuple[float, int]] = []  # (slope_mb_h, proc_id)
-        for proc_id, series in rss_by_proc.items():
-            fit = fit_linear(
-                series,
-                min_points=_PSS_PRECHECK_MIN_POINTS,
-                min_span_hours=_PSS_PRECHECK_MIN_SPAN_HOURS,
+        ranked = select_pss_targets(proc_rows)
+        new_targets = set(ranked)
+        if new_targets != set(sampler.pss_targets):
+            labels = [f"proc_id={pid} name={self._proc_label(pid)}" for pid in ranked]
+            self._storage.record_event(
+                "pss_scrutiny", "; ".join(labels) if labels else "(なし)"
             )
-            if fit is None:
-                continue
-            if fit.r2 < _PSS_PRECHECK_R2_THRESHOLD:
-                continue
-            slope_mb_h = fit.slope_per_hour / _BYTES_PER_MB
-            if slope_mb_h < _PSS_PRECHECK_SLOPE_THRESHOLD_MB_H:
-                continue
-            candidates.append((slope_mb_h, proc_id))
-
-        candidates.sort(reverse=True)
-        new_targets = {proc_id for _, proc_id in candidates[:_PSS_MAX_TARGETS]}
-
-        old_targets: set[int] = set(sampler.pss_targets)
-        if new_targets != old_targets:
-            # Build human-readable label for ops_events.
-            labels: list[str] = []
-            for _, pid in candidates[:_PSS_MAX_TARGETS]:
-                try:
-                    name = self._storage.proc_name(pid)
-                except Exception:
-                    name = f"proc_{pid}"
-                labels.append(f"proc_id={pid} name={name}")
-            detail = "; ".join(labels) if labels else "(なし)"
-            self._storage.record_event("pss_scrutiny", detail)
 
         sampler.pss_targets = new_targets
+
+    def _proc_label(self, proc_id: int) -> str:
+        """Registered process name for an ops_events label (never raises)."""
+        try:
+            return self._storage.proc_name(proc_id)
+        except Exception:
+            return f"proc_{proc_id}"
 
     def _on_gap(self, delay: float, job_name: str) -> None:
         """Record a gap event when a job fires more than 3× its interval late.
@@ -524,7 +394,7 @@ class Recorder:
         preserving genuinely separate gaps (≥ the 1 s T1 interval apart).
         """
         mono = time.monotonic()
-        if mono - getattr(self, "_last_gap_mono", float("-inf")) < 0.5:
+        if mono - self._last_gap_mono < 0.5:
             return
         self._last_gap_mono = mono
         # The leading "<delay>s" token is parsed back by
@@ -567,7 +437,10 @@ class Recorder:
 
         sc = self._config.sampling
         sched.add("t1_system", sc.system_interval, self._job_system)
-        sched.add("t2a_cgroup", sc.cgroup_interval, self._job_cgroup)
+        sched.add(
+            "t2a_cgroup", sc.cgroup_interval, partial(self._run_sampler, "cgroup")
+        )
+        job_process = partial(self._run_sampler, "process")
 
         # T2b interval is a callable so the selfmeter factor is evaluated
         # each scheduling cycle.  The widened interval is capped at the
@@ -577,13 +450,15 @@ class Recorder:
             sched.add(
                 "t2b_process",
                 lambda: min(sc.process_interval * self._selfmeter.factor, max_interval),
-                self._job_process,
+                job_process,
             )
         else:
-            sched.add("t2b_process", sc.process_interval, self._job_process)
+            sched.add("t2b_process", sc.process_interval, job_process)
 
-        sched.add("t3_disk", sc.disk_interval, self._job_disk)
-        sched.add("t3_thermal", sc.thermal_interval, self._job_thermal)
+        sched.add("t3_disk", sc.disk_interval, partial(self._run_sampler, "disk"))
+        sched.add(
+            "t3_thermal", sc.thermal_interval, partial(self._run_sampler, "thermal")
+        )
         sched.add("t3_dir", sc.dir_scan_interval, self._job_dir_scan)
         sched.add("flush", self._flush_interval, self._job_flush)
 
@@ -657,3 +532,9 @@ class Recorder:
         except (OSError, ValueError):
             # Can happen in non-main threads or restricted environments.
             pass
+
+
+def _records(batches: list[SampleBatch], table: str) -> list[dict]:
+    """Rows of *table* from *batches* as column-name dicts."""
+    cols = TABLE_COLUMNS[table]
+    return [dict(zip(cols, row)) for b in batches if b.table == table for row in b.rows]

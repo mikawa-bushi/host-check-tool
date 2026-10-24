@@ -10,13 +10,10 @@ Covers:
 
 from __future__ import annotations
 
-import shutil
 import time
 from pathlib import Path
 from typing import NamedTuple
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from procdiag.config import ProcdiagConfig, RetentionConfig, SamplingConfig
 from procdiag.storage import Storage
@@ -208,8 +205,6 @@ class TestRecorderDbGuard:
         )
         store = Storage(tmp_path / "rec_guard.db")
         called_args: list[dict] = []
-
-        original_enforce = store.enforce_size_budget
 
         def fake_enforce(**kwargs):
             called_args.append(kwargs)

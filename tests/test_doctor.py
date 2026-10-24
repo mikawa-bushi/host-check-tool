@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -275,7 +274,6 @@ class TestCheckJournal:
 
     def test_journal_degraded_when_missing(self, tmp_path):
         # Patch Path("/var/log/journal") to point to a non-existent path.
-        nonexistent = tmp_path / "no_journal"
 
         original_path = __builtins__  # noqa: F841 — we'll use patch
 

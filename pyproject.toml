@@ -50,14 +50,20 @@ build-backend = "poetry.core.masonry.api"
 line-length = 88
 target-version = ["py310"]
 
-# ruff は import 整列(I)のみに限定。select 未指定だと既定規則が広く適用され、
-# 既存コードで F821 等が想定外に多発するため、リポジトリ方針(black中心)に合わせ最小化。
+# ruff は import 整列(I)と pyflakes(F: 未使用 import/変数・未定義名)に限定。
+# 整形は black が担うため、スタイル系の規則は入れずリポジトリ方針(black中心)に合わせる。
 [tool.ruff]
 line-length = 88
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["I"]
+select = ["I", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# 利用者向けの設定テンプレート: コメントアウト例 (WatchDir など) のために
+# 未使用の import を意図的に残している。
+"config.py" = ["F401"]
+"examples/*.config.py" = ["F401"]
 
 [tool.pytest.ini_options]
 markers = [

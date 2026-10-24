@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 from synth import (
@@ -30,7 +28,7 @@ from synth import (
 )
 
 from procdiag.config import ProcdiagConfig, RulesConfig
-from procdiag.core import Confidence, Finding, Rule, Severity, Window, register
+from procdiag.core import Confidence, Finding, Rule, Severity
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.engine import fold
 

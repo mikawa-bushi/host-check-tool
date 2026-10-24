@@ -17,14 +17,6 @@ process accumulation.
   reported at ``confidence=LOW``.
 
 Design doc reference: §6.2 FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01.
-
-NOTE — shared-asset contract for Phase 4 agents
--------------------------------------------------
-This file is a shared asset.  Phase 4 tasks (T10/T11/T12) **may append new
-@register rule classes** to this file but **must not change any existing
-code** (no signature changes, no import removal, no reformatting of existing
-lines).  Adding new imports at the top of the file for new rules is
-permitted.
 """
 
 from __future__ import annotations
@@ -39,7 +31,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import confidence_from_fit, fit_linear
+from .trend import confidence_from_fit, days_until, fit_each, fit_linear, group_series
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -110,32 +102,18 @@ class FdLeakRule(Rule):
         """Run FD-LEAK-01 against the observation window."""
         findings: list[Finding] = []
 
-        proc_rows = store.rows(
-            "proc_rollup_1m",
-            since=window.start_ts,
-            until=window.end_ts,
+        fds_by_proc = group_series(
+            store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
+            key="proc_id",
+            value="fds_max",
         )
 
-        # Group fds_max by proc_id.
-        fds_by_proc: dict[int, list[tuple[float, float]]] = {}
-        for row in proc_rows:
-            pid = row["proc_id"]
-            fds = row["fds_max"]
-            ts = row["ts_min"]
-            if fds is not None:
-                fds_by_proc.setdefault(pid, []).append((ts, float(fds)))
-
-        for proc_id, series in fds_by_proc.items():
-            fit = fit_linear(
-                series,
-                min_points=12,
-                min_span_hours=self.min_observation_hours,
-            )
-            if fit is None:
-                continue
-            if fit.r2 < self.min_r2:
-                continue
-
+        for proc_id, series, fit in fit_each(
+            fds_by_proc,
+            min_points=12,
+            min_span_hours=self.min_observation_hours,
+            min_r2=self.min_r2,
+        ):
             slope_fd_h = fit.slope_per_hour
             if slope_fd_h < self.slope_warning_fd_h:
                 continue
@@ -145,17 +123,14 @@ class FdLeakRule(Rule):
                 fit, min_observation_hours=self.min_observation_hours
             )
 
-            # Estimate days until soft/hard FD limit is reached.
+            # Estimate days until the default soft/hard FD limit is reached.
             current_fds = series[-1][1]
-            days_to_soft_limit: float | None = None
-            days_to_hard_limit: float | None = None
-            if slope_fd_h > 0:
-                remaining_soft = _FD_SOFT_LIMIT_DEFAULT - current_fds
-                if remaining_soft > 0:
-                    days_to_soft_limit = remaining_soft / (slope_fd_h * 24.0)
-                remaining_hard = _FD_HARD_LIMIT_DEFAULT - current_fds
-                if remaining_hard > 0:
-                    days_to_hard_limit = remaining_hard / (slope_fd_h * 24.0)
+            days_to_soft_limit = days_until(
+                current_fds, _FD_SOFT_LIMIT_DEFAULT, slope_fd_h
+            )
+            days_to_hard_limit = days_until(
+                current_fds, _FD_HARD_LIMIT_DEFAULT, slope_fd_h
+            )
 
             evidence = {
                 "proc_id": proc_id,
@@ -226,32 +201,18 @@ class ThreadLeakRule(Rule):
         """Run THREAD-LEAK-01 against the observation window."""
         findings: list[Finding] = []
 
-        proc_rows = store.rows(
-            "proc_rollup_1m",
-            since=window.start_ts,
-            until=window.end_ts,
+        threads_by_proc = group_series(
+            store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
+            key="proc_id",
+            value="threads_max",
         )
 
-        # Group threads_max by proc_id.
-        threads_by_proc: dict[int, list[tuple[float, float]]] = {}
-        for row in proc_rows:
-            pid = row["proc_id"]
-            threads = row["threads_max"]
-            ts = row["ts_min"]
-            if threads is not None:
-                threads_by_proc.setdefault(pid, []).append((ts, float(threads)))
-
-        for proc_id, series in threads_by_proc.items():
-            fit = fit_linear(
-                series,
-                min_points=12,
-                min_span_hours=self.min_observation_hours,
-            )
-            if fit is None:
-                continue
-            if fit.r2 < self.min_r2:
-                continue
-
+        for proc_id, series, fit in fit_each(
+            threads_by_proc,
+            min_points=12,
+            min_span_hours=self.min_observation_hours,
+            min_r2=self.min_r2,
+        ):
             slope_h = fit.slope_per_hour
             if slope_h < self.slope_warning_h:
                 continue
@@ -263,11 +224,9 @@ class ThreadLeakRule(Rule):
 
             # Estimate days until a nominal thread-max limit is reached.
             current_threads = series[-1][1]
-            days_to_thread_max: float | None = None
-            if slope_h > 0:
-                remaining = _THREADS_MAX_DEFAULT - current_threads
-                if remaining > 0:
-                    days_to_thread_max = remaining / (slope_h * 24.0)
+            days_to_thread_max = days_until(
+                current_threads, _THREADS_MAX_DEFAULT, slope_h
+            )
 
             evidence = {
                 "proc_id": proc_id,

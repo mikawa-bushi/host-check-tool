@@ -13,8 +13,7 @@ swappable for tests, capability flags) analogous to netdiag's ``Context``.
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
@@ -28,6 +27,8 @@ class SampleBatch:
 
     ``table`` must be a key in ``storage.TABLE_COLUMNS``; ``rows`` are tuples
     whose element order exactly matches the column list for that table.
+    Samplers build them with ``storage.make_row`` (named columns) rather than
+    ordering tuples by hand.
     """
 
     table: str
