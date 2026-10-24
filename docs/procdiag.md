@@ -138,8 +138,10 @@ host-check-tool/
 │   ├── config.py         # Pydantic 設定モデル (ProcdiagConfig)
 │   ├── recorder.py       # 常駐ループ (Recorder) — サンプラーを束ねる
 │   ├── scheduler.py      # TierScheduler — 多間隔ジョブの軽量実行
-│   ├── storage.py        # SQLite 時系列ストア (WAL/バッファ/ロールアップ)
+│   ├── storage.py        # SQLite 時系列ストア (WAL/バッファ/ロールアップ)。make_row で名前付き行を生成
+│   ├── spikes.py         # spike_events の JSON ペイロード契約 (記録側と読取側で共有)
 │   ├── plugins.py        # entry_points ベースのプラグイン読み込み
+│   ├── doctor.py         # 記録前の観測能力チェック (procdiag doctor)
 │   ├── export.py         # CSV / JSON エクスポート
 │   ├── service.py        # systemd ユニット生成
 │   ├── report.py         # terminal / JSON / HTML+SVG レポート生成
@@ -149,20 +151,23 @@ host-check-tool/
 │   │   ├── cgroup.py     # Tier-2a: cgroup v2 サービス統計
 │   │   ├── process.py    # Tier-2b: 全プロセス走査 + PID キャッシュ
 │   │   ├── disk.py       # Tier-3: ディスク使用量 / ディレクトリサイズ
+│   │   ├── thermal.py    # Tier-3: CPU 温度 / クロック (センサ有りのみ)
 │   │   ├── trigger.py    # SpikeTrigger — PSI スパイク検出・デバウンス
 │   │   └── selfmeter.py  # SelfMeter — 自己オーバーヘッド計測・自動減速
 │   ├── core/
 │   │   ├── sampler.py    # Sampler 基底クラス・レジストリ・RunContext
-│   │   ├── rule.py       # Rule 基底クラス・レジストリ
+│   │   ├── rule.py       # Rule 基底クラス (configure / evaluate)・レジストリ
 │   │   ├── result.py     # Finding / Diagnosis / ObservationQuality 型
-│   │   └── util.py       # parse_duration / normalize_cmdline / ...
+│   │   └── util.py       # parse_duration / CounterDelta / バイト単位 / ...
 │   └── diagnosis/
 │       ├── engine.py     # Engine — ルールを順に実行し Diagnosis を組み立てる
-│       ├── trend.py      # 線形回帰・外挿・周期検出 (純関数群)
-│       ├── cpu.py        # CPU-SINGLECORE-01 / CPU-PERIODIC-01
-│       ├── memory.py     # MEM-LEAK-01
-│       ├── io_disk.py    # DISK-FULL-01
-│       └── leak.py       # FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 (T12)
+│       ├── trend.py      # 線形回帰・外挿・周期検出・系列ヘルパ (純関数群)
+│       ├── cpu.py        # CPU-PERIODIC-01 / CPU-SINGLECORE-01 / CPU-SATURATION-01
+│       ├── memory.py     # MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01 (+ PSS 事前選定)
+│       ├── io_disk.py    # DISK-FULL-01 / IO-BOTTLENECK-01 / DISK-GROWTH-01 / DISK-JOURNAL-01
+│       ├── leak.py       # FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01
+│       ├── crash.py      # OOM-KILL-01
+│       └── thermal.py    # THERMAL-01
 └── tests/
     ├── test_e2e.py       # E2E: init→record→check→report の通し検証
     ├── test_recorder.py  # Recorder / TierScheduler の単体テスト

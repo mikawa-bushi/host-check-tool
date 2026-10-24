@@ -2,6 +2,33 @@
 
 本プロジェクトの主な変更点を記録します。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、[セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 
+## [Unreleased]
+
+### Fixed
+- **CPU-SATURATION-01 が実データで常に失敗していた**: 飽和区間にスパイクイベントが 1 件でもあると `sqlite3.Row.get()` で `AttributeError` となり、エンジンの防御壁に握り潰されて検出結果が出なかった (v0.1.0 から)。加えてレコーダーが書く `top_processes` の形式 (`{"by_cpu": [...]}`) を読めていなかった。記録形式を `procdiag/spikes.py` に一本化し、各スパイクの上位プロセス (proc_id→名前解決) を集計して犯人プロセスを示すようにした。
+- 設定 `rules.journal_size_warn_gb` が DISK-JOURNAL-01 に反映されず、常に既定の 4GB で判定していた。`Rule.configure(config)` フックを追加し、エンジンが評価前に設定を渡すようにした。
+- `procdiag list-samplers` / `procdiag explain` に thermal サンプラーが表示されなかった (サンプラーパッケージの登録漏れ)。
+- HTML レポートのディスクチャート見出しでマウントポイント名が二重エスケープされていた。
+- README の systemd 手順のユニット名を実体 (`procdiag-record.service`) に合わせた。
+- `procdiag doctor` の温度センサ未検出時の説明を、実装済みの THERMAL-01 が無効になる旨に更新。
+
+### Changed
+- `status` / `export` / `prune` が `--config` を受け付け、DB の場所や保持期間を設定ファイルから解決するようになった (`--db` 指定が優先)。
+- `procdiag status` が sys_samples 全行を読み込まず SQL 集計 (期間・自己負荷・直近イベント) で表示するようになった。長期記録の DB でも即座に応答する。
+- `procdiag --version` が `procdiag.__version__` を表示するようになった (レポート/JSON の版数表記と一致)。
+
+### Internal (挙動不変のリファクタリング)
+- サンプラーの行生成を位置タプル手書きから `storage.make_row(table, **columns)` による列名指定に変更 (列の過不足は即例外)。
+- 累積カウンタ→差分の非負クランプを `core.util.CounterDelta` に集約 (system / cgroup サンプラー)。
+- `ProcessSampler.collect` を PID キャッシュ更新・oneshot 読取・I/O 読取・識別子登録・I/O 差分の各ステップに分割。
+- `Recorder` の Tier ジョブを `_run_sampler(name)` に統合。スパイク行の書き込みは `Storage.record_spike`、メタ情報は `Storage.write_meta` 経由に。
+- PSS 精査対象の選定ロジックを recorder から `diagnosis.memory.select_pss_targets` へ移し、MEM-LEAK / FD-LEAK / THREAD-LEAK と共通の `trend.group_series` / `fit_each` / `days_until` を使用。
+- エンジンの観測品質集計を `Storage.self_cpu_stats` / `missing_io_ratio` に置き換え、`Storage.conn` の直接参照を削減。
+- `report.py`: SVG 描画の共通部 (枠・座標変換・しきい値線・時刻ラベル) を共通化し、`render_html` をセクション単位の関数に分割。チャートのしきい値線はルールクラスの値を参照 (出力は従来とバイト単位で同一)。
+- `cli.py`: `--db` / `--config` / `--quiet` オプション定義、レジストリ読み込み、check/report の診断処理、終了コード判定を共通関数化。
+- `doctor.py`: 各チェックの名前/ラベル付与と例外の降格処理をデコレータに集約 (出力文言は不変)。
+- バイト単位 (`KiB`/`MiB`/`GiB`) を `core.util` に集約。未使用 import・変数を除去し、ruff の検査対象に pyflakes (`F`) を追加。
+
 ## [0.3.0] - 2026-06-14
 
 ### Changed
