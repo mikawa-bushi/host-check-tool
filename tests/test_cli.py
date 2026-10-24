@@ -312,6 +312,18 @@ class TestListSamplers:
         result = runner.invoke(cli, ["list-samplers"])
         assert result.exit_code == 0
 
+    def test_lists_every_builtin_sampler(self, runner):
+        """All recorder samplers are listed (thermal used to be missing)."""
+        result = runner.invoke(cli, ["list-samplers"])
+        assert result.exit_code == 0
+        for name in ("system", "cgroup", "process", "disk", "thermal"):
+            assert name in result.output
+
+    def test_explain_thermal_sampler(self, runner):
+        result = runner.invoke(cli, ["explain", "thermal"])
+        assert result.exit_code == 0
+        assert "thermal_interval" in result.output
+
 
 # ---------------------------------------------------------------------------
 # status

@@ -506,7 +506,11 @@ class TestDiskJournal:
         store.close()
 
     def test_custom_warn_threshold(self, tmp_path):
-        """A custom journal_size_warn_gb should override the default."""
+        """config.rules.journal_size_warn_gb alone changes the threshold.
+
+        Regression: the rule used to ignore the config value (only patching the
+        class attribute worked), so the documented setting had no effect.
+        """
         days = 2.0
         store = make_db(tmp_path, hours=days * 24)
         add_sys_baseline(store, hours=days * 24)
@@ -520,18 +524,18 @@ class TestDiskJournal:
         )
         store.conn.commit()
 
-        from procdiag.diagnosis.io_disk import DiskJournalRule
+        lenient = Engine(_cfg(min_obs_hours=0.5, journal_size_warn_gb=4.0))
+        strict = Engine(_cfg(min_obs_hours=0.5, journal_size_warn_gb=1.0))
+        lenient_ids = [f.rule_id for f in lenient.run(store).findings]
+        strict_findings = [
+            f
+            for f in strict.run(store, only=["DISK-JOURNAL-01"]).findings
+            if f.rule_id == "DISK-JOURNAL-01"
+        ]
 
-        orig = DiskJournalRule.journal_size_warn_gb
-        DiskJournalRule.journal_size_warn_gb = 1.0
-        try:
-            engine = Engine(_cfg(min_obs_hours=0.5, journal_size_warn_gb=1.0))
-            diag = engine.run(store, only=["DISK-JOURNAL-01"])
-        finally:
-            DiskJournalRule.journal_size_warn_gb = orig
-
-        findings = [f for f in diag.findings if f.rule_id == "DISK-JOURNAL-01"]
-        assert len(findings) >= 1
+        assert "DISK-JOURNAL-01" not in lenient_ids
+        assert len(strict_findings) >= 1
+        assert strict_findings[0].evidence["warn_gb"] == 1.0
         store.close()
 
     def test_proposal_five_sections(self, tmp_path):

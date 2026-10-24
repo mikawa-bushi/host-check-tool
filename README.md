@@ -91,7 +91,7 @@ procdiag service install --config /etc/procdiag/config.py
 
 # 有効化
 systemctl --user daemon-reload
-systemctl --user enable --now procdiag.service
+systemctl --user enable --now procdiag-record.service
 
 # ログアウト後も継続する場合
 sudo loginctl enable-linger $USER
@@ -100,7 +100,7 @@ sudo loginctl enable-linger $USER
 system ユニット (root) として配置する場合:
 
 ```bash
-procdiag service print --system | sudo tee /etc/systemd/system/procdiag.service
+procdiag service print --system | sudo tee /etc/systemd/system/procdiag-record.service
 ```
 
 ## 設定

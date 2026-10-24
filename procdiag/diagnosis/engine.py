@@ -210,6 +210,7 @@ class Engine:
 
         for rule_cls in rule_classes:
             rule = rule_cls()
+            rule.configure(self.config)
             eff_min = (
                 self.config.rules.min_observation_hours
                 if rule.min_observation_hours == base_min_hours

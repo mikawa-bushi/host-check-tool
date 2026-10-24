@@ -39,6 +39,7 @@ from ..core import (
 from .trend import confidence_from_span, extrapolate_full
 
 if TYPE_CHECKING:
+    from ..config import ProcdiagConfig
     from ..storage import Storage
 
 # ---------------------------------------------------------------------------
@@ -583,9 +584,14 @@ class DiskJournalRule(Rule):
         "du -sh /var/log/journal/",
     ]
 
-    # Allow tests to override.
+    # Default threshold; ``configure`` replaces it with
+    # ``config.rules.journal_size_warn_gb`` when the engine runs the rule.
     journal_size_warn_gb: float = 4.0
     journal_path_prefix: str = "/var/log/journal"
+
+    def configure(self, config: "ProcdiagConfig") -> None:
+        """Take the warning threshold from ``config.rules.journal_size_warn_gb``."""
+        self.journal_size_warn_gb = config.rules.journal_size_warn_gb
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-JOURNAL-01 against the observation window."""

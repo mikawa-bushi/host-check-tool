@@ -22,7 +22,6 @@ Design doc reference: §6.2 CPU-PERIODIC-01 / CPU-SINGLECORE-01 / CPU-SATURATION
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
 from ..core import (
@@ -33,6 +32,7 @@ from ..core import (
     Window,
     register,
 )
+from ..spikes import culprits
 from .trend import detect_periodicity, find_sustained_episodes
 
 if TYPE_CHECKING:
@@ -425,22 +425,11 @@ class CpuSaturationRule(Rule):
                 until=ep_end,
             )
 
-            # Aggregate process names from the JSON top_processes column.
+            # Tally how often each process was a spike culprit in the episode.
             proc_counts: dict[str, int] = {}
             for row in spike_rows:
-                raw = row.get("top_processes") or "[]"
-                try:
-                    procs = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    procs = []
-                for entry in procs:
-                    # top_processes items may be strings or dicts with a "name" key.
-                    if isinstance(entry, str):
-                        name = entry
-                    elif isinstance(entry, dict):
-                        name = entry.get("name") or entry.get("proc", "unknown")
-                    else:
-                        continue
+                for culprit in culprits(row["top_processes"], store):
+                    name = culprit["name"]
                     proc_counts[name] = proc_counts.get(name, 0) + 1
 
             top_procs = sorted(proc_counts, key=lambda k: proc_counts[k], reverse=True)[

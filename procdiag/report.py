@@ -792,7 +792,7 @@ def _charts_section(charts: "ChartData | None") -> str:
         svgs.append(
             _polyline_svg(
                 series,
-                label=f"ディスク {_esc(mp)}",
+                label=f"ディスク {mp}",  # escaped once, by the SVG title helper
                 unit="%",
                 y_max=100.0,
                 color="#8e44ad",

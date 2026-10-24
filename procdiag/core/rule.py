@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Type
 from .result import Finding, Severity, Window
 
 if TYPE_CHECKING:
-    # Avoid circular import at runtime; Storage is only referenced in type hints.
+    # Avoid circular imports at runtime; both are only referenced in type hints.
+    from ..config import ProcdiagConfig
     from ..storage import Storage
 
 
@@ -35,6 +36,15 @@ class Rule:
     what: str = ""  # what pattern is detected (Japanese)
     why: str = ""  # why this detection method (Japanese)
     manual_commands: list[str] = []
+
+    def configure(self, config: "ProcdiagConfig") -> None:
+        """Apply operator settings from ``config`` before ``evaluate`` runs.
+
+        The engine calls this once per run on every instantiated rule.  The
+        default does nothing; a rule whose threshold is exposed in
+        ``config.rules`` overrides it to copy that value onto the instance, so
+        the setting written in ``config.py`` actually takes effect.
+        """
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run the rule against *store* over *window*.

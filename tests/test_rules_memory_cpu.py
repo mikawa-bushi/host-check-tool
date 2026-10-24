@@ -415,6 +415,54 @@ class TestCpuSaturation:
             assert header in proposal, f"Missing section {header!r}"
         store.close()
 
+    def test_names_culprit_from_recorded_spike_payload(self, tmp_path):
+        """Spikes recorded by the recorder name the episode's top process.
+
+        Regression: the rule used to call ``.get()`` on ``sqlite3.Row`` and
+        expect a list payload, so any spike inside the episode crashed it
+        (the finding was silently dropped by the engine's firewall).
+        """
+        from procdiag.diagnosis.cpu import CpuSaturationRule
+        from procdiag.spikes import encode_top_processes
+
+        store = make_db(tmp_path, hours=1.0)
+        start_ts = time.time() - 30 * 60.0
+        add_cpu_saturation_samples(
+            store,
+            start_ts=start_ts,
+            psi_cpu_high=35.0,
+            duration_minutes=20,
+            baseline_minutes=5,
+        )
+        hog = store.proc_id_for("hogd", "h1", "hogd --busy", start_ts)
+        idle = store.proc_id_for("idled", "h2", "idled", start_ts)
+        for i in range(3):
+            ts = start_ts + (6 + i * 5) * 60.0  # inside the 20-minute episode
+            payload = encode_top_processes(
+                [
+                    {"ts": ts, "proc_id": hog, "pid": 42, "cpu_pct": 97.0, "rss": 1},
+                    {"ts": ts, "proc_id": idle, "pid": 7, "cpu_pct": 0.5, "rss": 1},
+                ]
+            )
+            store.conn.execute(
+                "INSERT INTO spike_events (ts, trigger_type, psi_snapshot, "
+                "top_processes, top_cgroups) VALUES (?, 'cpu', '{}', ?, '{}')",
+                (ts, payload),
+            )
+        store.conn.commit()
+
+        now = time.time()
+        findings = CpuSaturationRule().evaluate(
+            store, Window(start_ts=now - _HOUR, end_ts=now)
+        )
+
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.subject == "hogd"
+        assert f.evidence["top_processes"][0] == "hogd"
+        assert f.evidence["spike_event_count"] == 3
+        store.close()
+
     def test_high_confidence_for_long_episode(self, tmp_path):
         """Episode >= 30 minutes should produce HIGH confidence."""
         store = make_db(tmp_path, hours=2.0)
