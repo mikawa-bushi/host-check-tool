@@ -364,6 +364,30 @@ class TestOomJournalFailures:
         result = _read_oom_journal(0.0, 1.0)
         assert result == []
 
+    def test_read_oom_journal_passes_epoch_range(self, monkeypatch):
+        """The range goes to journalctl as @epoch, so the host time zone cannot
+        shift it (a UTC wall-clock string is read as local time), and only the
+        OOM lines come back."""
+        import subprocess
+
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            out = (
+                "1000.5 host kernel: Out of memory: Killed process 42 (app)\n"
+                "1001.0 host kernel: usb 1-1: USB disconnect, device number 3\n"
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert _read_oom_journal(999.7, 1100.2) == [
+            "Out of memory: Killed process 42 (app)"
+        ]
+        args = seen["args"]
+        assert args[args.index("--since") + 1] == "@999"
+        assert args[args.index("--until") + 1] == "@1101"
+
 
 # ---------------------------------------------------------------------------
 # Engine / proposal template

@@ -37,8 +37,6 @@ Design doc reference: procdiag_extension_proposal.md EXT-01 / OOM-KILL-01.
 from __future__ import annotations
 
 import bisect
-import subprocess
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from .. import kernlog
@@ -86,9 +84,6 @@ _MEM_AVAIL_FRACTION: float = 0.05
 # Maximum number of findings to emit (sorted by last_rss descending).
 _MAX_FINDINGS: int = 5
 
-# Timeout for the optional journalctl subprocess probe.
-_JOURNAL_TIMEOUT_S: float = 5.0
-
 
 # ---------------------------------------------------------------------------
 # Journal helper (extracted for monkeypatching in tests)
@@ -96,44 +91,14 @@ _JOURNAL_TIMEOUT_S: float = 5.0
 
 
 def _read_oom_journal(since: float, until: float) -> list[str]:
-    """Return OOM-kill related kernel log lines between *since* and *until*.
-
-    Runs ``journalctl -k -q --no-pager --since <ts> --until <ts>`` with a
-    5-second timeout and returns lines matching the OOM-kill patterns.
+    """Return OOM-kill kernel log messages between *since* and *until*.
 
     Returns an empty list — without raising — if journalctl is absent, the
     caller lacks permission, or the subprocess times out.  This keeps
     OOM-KILL-01 silent rather than crashing when journal access is unavailable.
     """
-
-    # Format timestamps as "YYYY-MM-DD HH:MM:SS" in UTC for journalctl.
-    def _fmt(ts: float) -> str:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        result = subprocess.run(
-            [
-                "journalctl",
-                "-k",
-                "-q",
-                "--no-pager",
-                "--since",
-                _fmt(since),
-                "--until",
-                _fmt(until),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_JOURNAL_TIMEOUT_S,
-        )
-        lines = result.stdout.splitlines()
-        # Keep only lines that contain OOM-kill markers.
-        patterns = ("oom-kill", "Out of memory", "Killed process")
-        return [ln for ln in lines if any(p.lower() in ln.lower() for p in patterns)]
-    except Exception:
-        # FileNotFoundError, PermissionError, TimeoutExpired, etc.
-        return []
+    events, _cursor = kernlog.read_events(since=since, until=until)
+    return [e.message for e in events or [] if e.kind == "oom"]
 
 
 # ---------------------------------------------------------------------------
