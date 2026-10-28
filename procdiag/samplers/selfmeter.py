@@ -7,6 +7,13 @@ scheduler can widen the Tier-2b interval.  After 10 minutes of staying under
 budget, it signals a throttle-restore so the interval gradually returns to the
 configured baseline.
 
+The first ``BudgetConfig.warmup_sec`` seconds are excluded from the average:
+start-up pays one-off costs (sampler setup, a ``psutil.Process`` object for
+every PID on the first full scan) that say nothing about the steady-state
+overhead.  Measured at ~9% CPU in the first second on an idle host, that alone
+used to trip the 1% budget on every start, so every report showed a spurious
+throttle event and Tier-2b ran slower for the first 10+ minutes.
+
 The class is deliberately free of I/O: it only reads ``psutil.Process`` (self)
 and accepts a ``mono_now`` argument so tests can drive a fake clock without any
 monkeypatching of ``time.monotonic``.
@@ -78,6 +85,9 @@ class SelfMeter:
         self._last_sample: Optional[Tuple[float, int]] = None
         self._last_sample_mono: float = 0.0
 
+        # Monotonic time of the first update(); anchors the start-up grace.
+        self._first_update_mono: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -86,8 +96,9 @@ class SelfMeter:
         """Return ``(cpu_pct_since_last_sample, rss_bytes)`` for this process.
 
         ``cpu_pct`` is the CPU usage since the previous call (psutil interval=None
-        differential mode).  The first call after ``__init__`` always returns
-        0.0 because ``__init__`` already primed the counter.
+        differential mode).  ``__init__`` primes the counter, so the first call
+        reports the usage since construction — which includes start-up work
+        (see the module docstring on the warm-up grace).
 
         Calls spaced closer than ``_MIN_SAMPLE_INTERVAL_SEC`` return the cached
         reading: with interval=None the percentage is computed over the wall
@@ -125,10 +136,16 @@ class SelfMeter:
             following a throttle-down.  The caller should restore the Tier-2b
             interval to the baseline.
         ``None``
-            No state change; the caller need not act.
+            No state change (always during the start-up warm-up); the caller
+            need not act.
         """
-        # Obtain the latest CPU reading.
+        # Obtain the latest CPU reading (also keeps the differential baseline
+        # moving during the warm-up).
         cpu, _rss = self.sample()
+        if self._first_update_mono is None:
+            self._first_update_mono = mono_now
+        if mono_now - self._first_update_mono < self._cfg.warmup_sec:
+            return None  # start-up cost is not steady-state overhead
         self._window.append((mono_now, cpu))
 
         # Evict samples older than the window.

@@ -37,6 +37,10 @@ class ThermalThrottleRule(Rule):
         "watch -n1 'grep MHz /proc/cpuinfo'",
     ]
 
+    temp_hot_c: float = _TEMP_HOT_C
+    freq_throttle_ratio: float = _FREQ_THROTTLE_RATIO
+    min_points: int = _MIN_POINTS
+
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         rows = store.rows("thermal_samples", since=window.start_ts, until=window.end_ts)
         temps = [r["temp_max_c"] for r in rows if r["temp_max_c"] is not None]
@@ -45,19 +49,19 @@ class ThermalThrottleRule(Rule):
             for r in rows
             if r["cpu_freq_cur_mhz"] is not None and r["cpu_freq_max_mhz"]
         ]
-        if len(temps) < _MIN_POINTS or len(ratios) < _MIN_POINTS:
+        if len(temps) < self.min_points or len(ratios) < self.min_points:
             return []
 
         peak_temp = max(temps)
         med_ratio = statistics.median(ratios)
-        if peak_temp < _TEMP_HOT_C or med_ratio >= _FREQ_THROTTLE_RATIO:
+        if peak_temp < self.temp_hot_c or med_ratio >= self.freq_throttle_ratio:
             return []
 
         evidence = {
             "peak_temp_c": round(peak_temp, 1),
             "median_freq_ratio": round(med_ratio, 3),
-            "freq_throttle_ratio": _FREQ_THROTTLE_RATIO,
-            "temp_threshold_c": _TEMP_HOT_C,
+            "freq_throttle_ratio": self.freq_throttle_ratio,
+            "temp_threshold_c": self.temp_hot_c,
             "sample_count": len(ratios),
         }
         summary = (

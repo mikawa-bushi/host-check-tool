@@ -9,8 +9,10 @@ CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録�
 工場のエッジ PC・ラインサーバーなど IT 人材が常駐しない環境を主用途とする。
 
 - **オフライン・閉域網ファースト** — 外部通信ゼロ。レポートは CDN 参照なしの単一 HTML
-- **3 コマンドで動く** — `pip install` → `procdiag init` → `procdiag record`
-- **決定論的な診断** — 13 の検出ルール × テンプレートで提案を生成 (LLM 非依存)。
+- **まず 1 コマンドで現状確認** — `procdiag snapshot` が記録なしで数秒のうちに
+  CPU・メモリ・ディスク (容量/inode/読み取り専用化)・サービス・カーネル異常・温度などを網羅チェック
+- **3 コマンドで傾向診断** — `pip install` → `procdiag init` → `procdiag record`
+- **決定論的な診断** — 20 の検出ルール × テンプレートで提案を生成 (LLM 非依存)。
   出力は機械可読 (JSON) で、外部での活用は利用者に委ねる
 - **観測者効果の最小化と透明性** — 自身のオーバーヘッドを計測・報告し、
   予算超過時は自動減速する
@@ -21,8 +23,11 @@ CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録�
 ## Quick Start
 
 ```bash
-# インストール
+# インストール (閉域網の PC へは docs/offline-install.md の手順で)
 pip install host-check-tool
+
+# 記録なしで、いまの状態をその場でチェック (数秒)
+procdiag snapshot
 
 # 設定と data/ ディレクトリを生成
 procdiag init
@@ -38,12 +43,16 @@ procdiag check
 
 # HTML + JSON レポートを生成
 procdiag report --out report.html --json report.json
+
+# 記録 DB・レポート・現在の状態を 1 つの tar.gz に (USB で持ち出して解析)
+procdiag bundle
 ```
 
 ## コマンドリファレンス
 
 | コマンド | 内容 |
 |---|---|
+| `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェック (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成 |
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 |
@@ -55,6 +64,7 @@ procdiag report --out report.html --json report.json
 | `procdiag list-samplers` | 登録済みサンプラーを Tier 別に一覧表示 |
 | `procdiag export` | 記録データを CSV または JSON でエクスポート |
 | `procdiag prune` | 保持ポリシーの手動実行 |
+| `procdiag bundle` | 記録 DB・レポート・snapshot・doctor を 1 つの tar.gz に (コマンドラインは既定で削除) |
 | `procdiag service print` | systemd ユニットファイルを表示 |
 | `procdiag service install` | user systemd ユニットを配置 |
 
@@ -67,8 +77,12 @@ procdiag check  --only MEM-LEAK-01,DISK-FULL-01
 procdiag status --config /etc/procdiag/config.py   # DB の場所は config の db_path から
 ```
 
-`check` / `report` / `status` / `export` / `prune` は `--config` を受け取り、
+`check` / `report` / `status` / `export` / `prune` / `bundle` は `--config` を受け取り、
 DB の場所 (`db_path`) と保持期間などを設定ファイルから解決する (`--db` 指定が優先)。
+
+記録時間が短いと、長期の観測が必要なルール (リーク系は 6 時間、慢性メモリ圧迫は 24 時間)
+は評価されない。`check` はその場合「評価範囲: 20 ルール中 N 件のみ評価」と未評価の
+ルール・必要な残り時間を表示する (JSON では `skipped_rules`)。
 
 ## 終了コード
 
@@ -122,6 +136,19 @@ config = ProcdiagConfig(
     ),
     retention=RetentionConfig(raw="48h", rollup="90d"),
 )
+```
+
+現場ごとに判定のしきい値を変えたい場合は `rules.overrides` で上書きできる。
+調整できる項目と既定値は `procdiag explain <RULE-ID>` で確認できる。存在しない
+ルール ID や項目名を書くと起動時にエラーになる。
+
+```python
+rules=RulesConfig(
+    overrides={
+        "CPU-SATURATION-01": {"psi_threshold": 30.0},  # CPU 待ち 30% 超を飽和とみなす
+        "DISK-FULL-01": {"warning_days": 14},          # 満杯 14 日前から警告
+    },
+),
 ```
 
 ## 依存関係

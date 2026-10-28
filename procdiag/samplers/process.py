@@ -22,6 +22,13 @@ Key design choices:
 * **num_fds throttling** — ``num_fds()`` scans ``/proc/<pid>/fd`` and is the
   most expensive per-process call; it is sampled ~once per minute since
   FD-LEAK-01 only reads fds at 1-minute rollup granularity.
+* **process counts** — each scan also emits one ``proc_counts`` row (processes
+  scanned, zombies).  The state comes from ``/proc/<pid>/stat``, which
+  ``cpu_percent()`` already parses inside ``oneshot()``, so it is free; it lets
+  ZOMBIE-01 count real zombies instead of approximating them.
+* **FD limits** — when a PID is first seen its RLIMIT_NOFILE is recorded on the
+  identity (``record_fd_limits``), so FD-LEAK-01 extrapolates to the process's
+  real limit rather than a guessed 1024/4096.
 
 Process identity uses ``normalize_cmdline`` + ``resolve_proc`` (injected
 callable) following the proc_registry contract from design §5.2.
@@ -55,6 +62,7 @@ class _Reading(NamedTuple):
     num_threads: Optional[int]
     num_fds: Optional[int]
     io: Optional[Tuple[int, int]]  # cumulative (read_bytes, write_bytes)
+    status: Optional[str]  # psutil.STATUS_* ("zombie", "running", ...)
 
 
 def _read_pss_bytes(smaps_rollup: Path) -> Optional[int]:
@@ -104,9 +112,14 @@ class ProcessSampler(Sampler):
     def __init__(
         self,
         resolve_proc: Callable[[str, str, str, float], int],
+        record_fd_limits: Optional[Callable[[int, int, int], None]] = None,
     ) -> None:
         # resolve_proc(name, hash12, cmdline_sample, ts) -> proc_id
         self._resolve_proc = resolve_proc
+        # record_fd_limits(proc_id, soft, hard); None disables limit capture.
+        self._record_fd_limits = record_fd_limits
+        # proc_ids whose FD limits are already recorded.
+        self._fd_limits_known: set[int] = set()
         # PID -> psutil.Process object cache.
         self._pid_cache: dict[int, psutil.Process] = {}
         # PID -> (name, proc_id): name/cmdline are immutable per process, so
@@ -134,9 +147,10 @@ class ProcessSampler(Sampler):
         """No capability detection needed for process scanning."""
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
-        """Scan all processes and return ``proc_samples`` rows."""
+        """Scan all processes; return ``proc_samples`` rows + a ``proc_counts`` row."""
         ts = time.time()
         rows: list[tuple] = []
+        zombies = 0
         read_fds = self._should_read_fds(ctx)
         self._refresh_pid_cache()
 
@@ -156,9 +170,11 @@ class ProcessSampler(Sampler):
                 continue
 
             if identity is None:
-                proc_id = self._register(pid, reading, ts, ctx)
+                proc_id = self._register(pid, proc, reading, ts, ctx)
             else:
                 _, proc_id = identity
+            if reading.status == psutil.STATUS_ZOMBIE:
+                zombies += 1
 
             # psutil's first cpu_percent() on a fresh Process object returns 0.0
             # without a baseline, so 0% and "no baseline" are indistinguishable.
@@ -197,7 +213,11 @@ class ProcessSampler(Sampler):
             if key[1] not in self._pid_cache:
                 del self._prev_io[key]
 
-        return [SampleBatch(table="proc_samples", rows=rows)]
+        counts = make_row("proc_counts", ts=ts, total=len(rows), zombies=zombies)
+        return [
+            SampleBatch(table="proc_samples", rows=rows),
+            SampleBatch(table="proc_counts", rows=[counts]),
+        ]
 
     # ------------------------------------------------------------------
     # collect() steps
@@ -258,6 +278,10 @@ class ProcessSampler(Sampler):
         name: Optional[str] = None
         cmdline: list[str] = []
         with proc.oneshot():
+            try:
+                status: Optional[str] = proc.status()  # stat is cached in oneshot
+            except _DENIED_OR_ZOMBIE:
+                status = None
             if need_identity:
                 name = proc.name()
                 try:
@@ -280,7 +304,7 @@ class ProcessSampler(Sampler):
                 except (*_DENIED_OR_ZOMBIE, AttributeError):
                     num_fds = None
             io = self._read_io(pid, proc)
-        return _Reading(name, cmdline, cpu, rss, num_threads, num_fds, io)
+        return _Reading(name, cmdline, cpu, rss, num_threads, num_fds, io, status)
 
     def _read_io(self, pid: int, proc: psutil.Process) -> Optional[Tuple[int, int]]:
         """Return cumulative ``(read_bytes, write_bytes)``, or None if unreadable.
@@ -304,7 +328,14 @@ class ProcessSampler(Sampler):
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
 
-    def _register(self, pid: int, reading: _Reading, ts: float, ctx: RunContext) -> int:
+    def _register(
+        self,
+        pid: int,
+        proc: psutil.Process,
+        reading: _Reading,
+        ts: float,
+        ctx: RunContext,
+    ) -> int:
         """Resolve and cache the registry ``proc_id`` for a newly seen PID."""
         hash12, sample = normalize_cmdline(
             reading.cmdline,
@@ -312,7 +343,23 @@ class ProcessSampler(Sampler):
         )
         proc_id = self._resolve_proc(reading.name, hash12, sample, ts)
         self._identity[pid] = (reading.name, proc_id)
+        self._capture_fd_limits(proc_id, proc)
         return proc_id
+
+    def _capture_fd_limits(self, proc_id: int, proc: psutil.Process) -> None:
+        """Record RLIMIT_NOFILE once per identity (best effort).
+
+        Reading another user's limits needs root, so failures are expected when
+        recording non-root; a later PID of the same identity may still succeed.
+        """
+        if self._record_fd_limits is None or proc_id in self._fd_limits_known:
+            return
+        try:
+            soft, hard = proc.rlimit(psutil.RLIMIT_NOFILE)
+        except Exception:  # AccessDenied / NoSuchProcess / platform without rlimit
+            return
+        self._record_fd_limits(proc_id, int(soft), int(hard))
+        self._fd_limits_known.add(proc_id)
 
     def _io_deltas(
         self,

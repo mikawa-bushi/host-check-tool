@@ -404,3 +404,26 @@ class TestSelfMeter:
 
         assert restore_event == "throttle_restore"
         assert meter.factor == pytest.approx(1.0)
+
+
+class TestSelfMeterWarmup:
+    def _meter(self, warmup_sec: float) -> SelfMeter:
+        meter = SelfMeter(BudgetConfig(warmup_sec=warmup_sec))
+        meter.sample = lambda: (50.0, 1024)  # type: ignore[method-assign]
+        return meter
+
+    def test_startup_cost_does_not_throttle(self):
+        """A start-up CPU burst inside the warm-up never emits throttle_down."""
+        meter = self._meter(warmup_sec=60.0)
+        events = [meter.update(1000.0 + i) for i in range(60)]
+        assert events == [None] * 60
+        assert meter.factor == pytest.approx(1.0)
+
+    def test_sustained_overhead_after_warmup_still_throttles(self):
+        meter = self._meter(warmup_sec=60.0)
+        events = [meter.update(1000.0 + i) for i in range(62)]
+        assert events.index("throttle_down") == 60
+
+    def test_zero_warmup_restores_immediate_judgement(self):
+        meter = self._meter(warmup_sec=0.0)
+        assert meter.update(1000.0) == "throttle_down"

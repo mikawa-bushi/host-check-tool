@@ -3,10 +3,10 @@ name: Black Code Formatter
 on:
   push:
     branches:
-      - '*'  # Run on all branches
+      - '**'  # Run on all branches ('*' does not match names containing '/')
   pull_request:
     branches:
-      - '*'  # Run on all branches for PRs
+      - '**'  # Run on all branches for PRs
 
 # The auto-format fallback job commits and pushes; the default GITHUB_TOKEN
 # is read-only on this repo, so grant write explicitly.

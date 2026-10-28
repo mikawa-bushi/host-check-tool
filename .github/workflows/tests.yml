@@ -1,0 +1,59 @@
+name: Tests
+
+# Lint (ruff) and the full pytest suite on every push and PR.  The Black
+# workflow only checks formatting; this one guards behaviour.
+on:
+  push:
+    branches:
+      - '**'  # '*' would not match branch names containing '/'
+  pull_request:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: pytest (Python ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 = the minimum supported version (pyproject: python = "^3.10").
+        python-version: ['3.10', '3.12']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Cache Poetry dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-tests-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+    # Installs runtime + dev dependencies and the package itself, so the
+    # ``procdiag`` console script used by the E2E tests is on the venv PATH.
+    - name: Install dependencies
+      run: poetry install
+
+    - name: Lint (ruff)
+      run: poetry run ruff check .
+
+    - name: Run tests
+      # 92% at the time of writing; the margin absorbs runner differences
+      # (e.g. no readable journal / systemd in the CI container).
+      run: poetry run pytest -q --cov=procdiag --cov-report=term-missing:skip-covered --cov-fail-under=85

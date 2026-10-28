@@ -48,8 +48,6 @@ _DB_MISSING_MSG = (
     "先に procdiag record を実行してください。"
 )
 
-_TIME_FMT = "%Y-%m-%d %H:%M:%S"
-
 
 def _db_option(help_text: str) -> Callable:
     """``--db PATH`` option (overrides ``config.db_path``)."""
@@ -84,7 +82,27 @@ def _load_config(
     cfg = load_config(Path(config_path) if config_path else None)
     if db_path:
         cfg = cfg.model_copy(update={"db_path": db_path})
+    if cfg.rules.overrides:
+        _validate_overrides(cfg)
     return cfg
+
+
+def _validate_overrides(cfg: ProcdiagConfig) -> None:
+    """Exit (code 4) when ``rules.overrides`` names an unknown rule/threshold.
+
+    A typo there would otherwise silently keep the default threshold, so it is
+    treated like any other config error: reported at start-up.
+    """
+    from .core import validate_rule_overrides
+    from .plugins import load_extra_rules
+
+    _load_registries()
+    load_extra_rules(cfg.rules.extra_rules)
+    problems = validate_rule_overrides(cfg.rules.overrides)
+    if problems:
+        for msg in problems:
+            click.echo(f"エラー: {msg}", err=True)
+        sys.exit(_EXIT_USAGE)
 
 
 def _ensure_db_and_config(
@@ -114,20 +132,25 @@ def _is_quiet(flag: bool) -> bool:
 
 
 def _can_show_unicode() -> bool:
-    """Best-effort check that stdout can render the ✔/⚠/ℹ status glyphs.
+    """Best-effort check that stdout can render the ✔/⚠/✘/ℹ status glyphs.
 
     A POSIX/ascii locale (common on minimal serial consoles / journald pipes)
-    cannot, so doctor falls back to ASCII labels there.  When the encoding is
-    unknown we assume a modern UTF-8 terminal and return True.
+    cannot, so doctor / snapshot fall back to ASCII labels there.  When the
+    encoding is unknown we assume a modern UTF-8 terminal and return True.
     """
     enc = getattr(sys.stdout, "encoding", None)
     if not enc:
         return True
     try:
-        "✔⚠ℹ".encode(enc)
+        "✔⚠✘ℹ".encode(enc)
         return True
     except (LookupError, UnicodeEncodeError):
         return False
+
+
+def _use_ascii(flag: bool) -> bool:
+    """ASCII status labels: ``--ascii``, ``NO_COLOR``, or a non-Unicode stdout."""
+    return flag or bool(os.environ.get("NO_COLOR")) or not _can_show_unicode()
 
 
 def _split_ids(value: Optional[str]) -> Optional[list[str]]:
@@ -164,7 +187,7 @@ def _diagnose(
     with Storage(db, read_only=True) as store:
         diag = Engine(cfg, verbose=verbose).run(store, only=only, skip=skip)
         if with_charts:
-            charts = build_charts(store)
+            charts = build_charts(store, config=cfg)
             meta_hostname = store.meta().get("hostname")
     return diag, charts, meta_hostname
 
@@ -230,6 +253,60 @@ def init(dir: str) -> None:
         "  2. procdiag doctor --config config.py で観測能力を確認してください\n"
         "  3. procdiag record --config config.py で記録を開始してください"
     )
+
+
+# ---------------------------------------------------------------------------
+# snapshot
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@_config_option()
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="出力フォーマット (既定: text)。",
+)
+@click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
+@click.option(
+    "--ascii",
+    "ascii_",
+    is_flag=True,
+    help="記号を ASCII ([OK]/[WARN]/[CRIT]/[INFO]) で出力する。",
+)
+def snapshot(
+    config_path: Optional[str], fmt: str, no_color: bool, ascii_: bool
+) -> None:
+    """記録なしで、いまのホストの状態をその場で網羅チェックします (数秒)。
+
+    CPU・メモリ・I/O の圧迫、ディスク容量・inode・読み取り専用化、ファイルハンドル、
+    ゾンビ・上位プロセス、failed / 自動再起動したサービス、直近24時間のカーネル異常、
+    温度、時刻同期、記録の稼働状況を確認します。
+
+    終了コード: 0=警告なし / 1=warning・critical あり
+    """
+    import socket
+
+    from . import snapshot as snapshot_mod
+    from .core.util import should_use_color
+
+    cfg = _load_config(config_path)
+    items = snapshot_mod.run_snapshot(cfg)
+    hostname = cfg.report.hostname_label or socket.gethostname()
+    if fmt == "json":
+        click.echo(snapshot_mod.render_json(items, hostname=hostname))
+    else:
+        click.echo(
+            snapshot_mod.render_text(
+                items,
+                hostname=hostname,
+                color=should_use_color(no_color),
+                ascii_only=_use_ascii(ascii_),
+            )
+        )
+    sys.exit(snapshot_mod.exit_code(items))
 
 
 # ---------------------------------------------------------------------------
@@ -422,70 +499,103 @@ def report(
 )
 def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None:
     """記録済み DB の概況 (期間、サンプル数、自己負荷) を表示します。"""
-    from .core.util import humanize_bytes, humanize_duration
+    from .core.util import humanize_bytes
+    from .status import TIME_FMT, collect_status
     from .storage import Storage
 
     _cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-
-    # Everything below is a SQL aggregate / bounded query, so status stays
-    # instant even on a long recording (no full sys_samples load).
     with Storage(resolved_db, read_only=True) as store:
-        counts = store.counts()
-        meta_dict = store.meta()
-        self_cpu_avg, self_cpu_max = store.self_cpu_stats()
-        bounds = store.time_bounds("sys_samples")
-        recent_events = store.recent_events(5)
-
-    span_str = start_str = end_str = "—"
-    if bounds is not None:
-        lo, hi = bounds
-        span_str = humanize_duration(hi - lo)
-        start_str = time.strftime(_TIME_FMT, time.localtime(lo))
-        end_str = time.strftime(_TIME_FMT, time.localtime(hi))
+        info = collect_status(store)
 
     if fmt == "json":
-        payload = {
-            "meta": meta_dict,
-            "counts": counts,
-            "has_data": counts.get("sys_samples", 0) > 0,
-            "span": span_str,
-            "start": start_str,
-            "end": end_str,
-            "self_cpu_avg": self_cpu_avg,
-            "self_cpu_max": self_cpu_max,
-            "recent_events": [
-                {"ts": r["ts"], "kind": r["kind"], "detail": r["detail"]}
-                for r in recent_events
-            ],
-        }
-        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        click.echo(json.dumps(info, ensure_ascii=False, indent=2))
         return
 
+    counts = info["counts"]
     click.echo(f"DB: {resolved_db}  ({humanize_bytes(counts.get('db_bytes'))})")
-    click.echo(f"期間: {start_str} 〜 {end_str}  ({span_str})")
+    click.echo(f"期間: {info['start']} 〜 {info['end']}  ({info['span']})")
     click.echo(
         f"サンプル数: sys={counts.get('sys_samples', 0)},  "
         f"proc={counts.get('proc_samples', 0)},  "
         f"cg={counts.get('cg_samples', 0)}"
     )
     click.echo(f"ロールアップ: sys_rollup_1m={counts.get('sys_rollup_1m', 0)}")
-    if self_cpu_avg is not None:
-        click.echo(f"自己負荷: avg={self_cpu_avg:.2f}%  max={self_cpu_max:.2f}%")
+    if info["self_cpu_avg"] is not None:
+        click.echo(
+            f"自己負荷: avg={info['self_cpu_avg']:.2f}%  max={info['self_cpu_max']:.2f}%"
+        )
     else:
         click.echo("自己負荷: —")
 
-    if recent_events:
+    if info["recent_events"]:
         click.echo("\n直近イベント (最大5件):")
-        for ev in recent_events:
-            ts_str = time.strftime(_TIME_FMT, time.localtime(ev["ts"]))
+        for ev in info["recent_events"]:
+            ts_str = time.strftime(TIME_FMT, time.localtime(ev["ts"]))
             click.echo(f"  [{ts_str}] {ev['kind']}  {ev['detail'] or ''}")
 
-    if counts.get("sys_samples", 0) == 0:
+    if not info["has_data"]:
         click.echo(
             "\n⚠ まだサンプルがありません。procdiag record が稼働しているか、"
             "--db のパスが正しいかを確認してください。",
             err=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# bundle
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@_config_option()
+@_db_option("同梱する DB ファイル (既定: config の db_path)。")
+@click.option(
+    "--out",
+    "out_path",
+    default=None,
+    type=click.Path(),
+    help="出力先 (既定: procdiag-bundle-<ホスト名>-<日時>.tar.gz)。",
+)
+@click.option(
+    "--keep-cmdline",
+    is_flag=True,
+    help="DB にプロセスのコマンドラインを残す (既定は秘密情報保護のため削除)。",
+)
+@_quiet_option
+def bundle(
+    config_path: Optional[str],
+    db_path: Optional[str],
+    out_path: Optional[str],
+    keep_cmdline: bool,
+    quiet: bool,
+) -> None:
+    """記録 DB・レポート・現在の状態を 1 つの tar.gz にまとめます (USB 持ち出し用)。
+
+    記録中でも実行できます。DB が無い場合も、その場の状態 (snapshot) と
+    観測能力 (doctor) だけを収録したバンドルを作成します。
+    """
+    from .bundle import create_bundle
+    from .core.util import humanize_bytes
+
+    cfg = _load_config(config_path, db_path)
+    result = create_bundle(
+        cfg,
+        config_path=config_path,
+        out=Path(out_path) if out_path else None,
+        keep_cmdline=keep_cmdline,
+    )
+    if not _is_quiet(quiet):
+        size = humanize_bytes(result.path.stat().st_size)
+        click.echo(f"バンドルを作成しました: {result.path} ({size})")
+        click.echo(f"  収録: {', '.join(result.files)}")
+        if not result.has_db:
+            click.echo(
+                f"  ※ 記録 DB ({cfg.db_path}) が無いため、傾向の診断は含まれません"
+            )
+        if result.cmdline_redacted:
+            click.echo(
+                "  ※ DB からプロセスのコマンドラインを削除しました (--keep-cmdline で保持)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +666,13 @@ def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
         click.echo("\n手動確認コマンド:")
         for cmd in cmds:
             click.echo(f"  $ {cmd}")
+    tunables = cls.tunables() if hasattr(cls, "tunables") else {}
+    if tunables:
+        click.echo(
+            "\n調整可能なしきい値 (config.py の rules.overrides で上書き、括弧内は既定値):"
+        )
+        for name, default in tunables.items():
+            click.echo(f"  {name} ({default})")
 
 
 # ---------------------------------------------------------------------------
@@ -824,25 +941,10 @@ def doctor(
 
     if fmt == "json":
         click.echo(
-            json.dumps(
-                [
-                    {
-                        "name": c.name,
-                        "label": c.label,
-                        "status": c.status,
-                        "detail": c.detail,
-                    }
-                    for c in checks
-                ],
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dumps([c.to_dict() for c in checks], ensure_ascii=False, indent=2)
         )
     else:
-        use_ascii = (
-            ascii_ or bool(os.environ.get("NO_COLOR")) or not _can_show_unicode()
-        )
-        symbols = _DOCTOR_SYMBOLS[use_ascii]
+        symbols = _DOCTOR_SYMBOLS[_use_ascii(ascii_)]
         for c in checks:
             click.echo(f"{symbols.get(c.status, '?')} [{c.label}] {c.detail}")
 

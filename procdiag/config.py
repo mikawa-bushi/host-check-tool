@@ -58,6 +58,8 @@ class SamplingConfig(BaseModel):
     disk_interval: float = 60.0  # T3 disk_usage
     dir_scan_interval: float = 3600.0  # T3 watch_dirs
     thermal_interval: float = 10.0  # T3 温度 / cpufreq
+    service_interval: float = 300.0  # T3 systemd 自動再起動 / failed
+    kernel_log_interval: float = 300.0  # T3 カーネルログの異常
     watch_dirs: list[WatchDir] = Field(default_factory=list)
     cmdline_normalize: bool = True
     # PSS pre-check interval (seconds). 0 disables the job.
@@ -70,6 +72,8 @@ class SamplingConfig(BaseModel):
         "disk_interval",
         "dir_scan_interval",
         "thermal_interval",
+        "service_interval",
+        "kernel_log_interval",
     )
     @classmethod
     def _positive_interval(cls, v: float) -> float:
@@ -122,12 +126,21 @@ class BudgetConfig(BaseModel):
     overhead_budget_pct: float = 1.0
     throttle_factor: float = 1.5
     throttle_max_interval: float = 60.0
+    # Seconds after start excluded from the overhead average (start-up cost).
+    warmup_sec: float = 60.0
 
     @field_validator("overhead_budget_pct", "throttle_factor", "throttle_max_interval")
     @classmethod
     def _positive_float(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"値は正の数でなければなりません: {v}")
+        return v
+
+    @field_validator("warmup_sec")
+    @classmethod
+    def _non_negative_warmup(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"warmup_sec は0以上でなければなりません: {v}")
         return v
 
 
@@ -176,6 +189,9 @@ class RulesConfig(BaseModel):
     extra_rules: list[str] = Field(default_factory=list)  # importlib paths
     min_observation_hours: float = 6.0
     journal_size_warn_gb: float = 4.0
+    # Per-rule threshold overrides: {"CPU-SATURATION-01": {"psi_threshold": 30}}.
+    # Keys are checked against each rule's tunables at start-up.
+    overrides: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @field_validator("min_observation_hours")
     @classmethod
@@ -255,6 +271,8 @@ config = ProcdiagConfig(
         disk_interval=60.0,           # Tier3: ディスク使用量 (秒)
         dir_scan_interval=3600.0,     # Tier3: ディレクトリサイズ走査 (秒)
         thermal_interval=10.0,        # Tier3: CPU温度・クロック (秒)
+        service_interval=300.0,       # Tier3: systemd サービスの自動再起動・failed (秒)
+        kernel_log_interval=300.0,    # Tier3: カーネルログの異常 (秒)
         watch_dirs=[
             # WatchDir(path="/var/log", time_budget_sec=10),
             # WatchDir(path="/opt/myapp/data"),
@@ -276,6 +294,7 @@ config = ProcdiagConfig(
         overhead_budget_pct=1.0,   # 自己CPUオーバーヘッド上限 (%)
         throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数
         throttle_max_interval=60.0, # Tier2b間隔の上限 (秒)
+        warmup_sec=60.0,           # 起動直後この秒数は自己負荷の判定から除外
     ),
 
     retention=RetentionConfig(
@@ -290,6 +309,11 @@ config = ProcdiagConfig(
         extra_rules=[],             # ユーザー定義ルールのimportパス
         min_observation_hours=6.0,  # ルール発火に必要な最低観測時間
         journal_size_warn_gb=4.0,   # journald警告閾値 (GB)
+        # ルールごとのしきい値上書き。調整可能な項目は procdiag explain <RULE-ID> で確認
+        overrides={
+            # "CPU-SATURATION-01": {"psi_threshold": 30.0},
+            # "DISK-FULL-01": {"warning_days": 14},
+        },
     ),
 
     report=ReportConfig(

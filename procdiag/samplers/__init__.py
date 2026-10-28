@@ -15,9 +15,11 @@ are not samplers and are wired up directly by the
 from . import (  # noqa: F401  (imported for @register_sampler side-effects)
     cgroup,
     disk,
+    kernel_log,
     process,
+    service,
     system,
     thermal,
 )
 
-__all__ = ["system", "cgroup", "process", "disk", "thermal"]
+__all__ = ["system", "cgroup", "process", "disk", "thermal", "service", "kernel_log"]

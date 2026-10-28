@@ -189,7 +189,7 @@ def _proc_row(ts: float = 1.0, proc_id: int = 1, pid: int = 100):
 
 
 def _disk_row(ts: float = 1.0):
-    return (ts, "/", 100_000_000_000, 40_000_000_000)
+    return (ts, "/", 100_000_000_000, 40_000_000_000, 1_000_000, 250_000, 0)
 
 
 def _dir_row(ts: float = 1.0):
@@ -297,8 +297,8 @@ def test_rows_with_where(tmp_db):
     tmp_db.buffer(
         "disk_samples",
         [
-            (1.0, "/", 100_000_000_000, 10_000_000_000),
-            (2.0, "/var", 50_000_000_000, 5_000_000_000),
+            (1.0, "/", 100_000_000_000, 10_000_000_000, None, None, 0),
+            (2.0, "/var", 50_000_000_000, 5_000_000_000, None, None, 0),
         ],
     )
     tmp_db.flush()
@@ -511,17 +511,17 @@ def test_cg_last_seen_update_is_throttled(tmp_db):
 def test_make_row_orders_columns_by_table_columns():
     from procdiag.storage import make_row
 
-    row = make_row("disk_samples", used=40, mountpoint="/", ts=1.0, total=100)
-    assert row == (1.0, "/", 100, 40)
+    row = make_row("dir_samples", size_bytes=40, path="/var/log", ts=1.0, is_estimate=0)
+    assert row == (1.0, "/var/log", 40, 0)
 
 
 def test_make_row_rejects_missing_and_unknown_columns():
     from procdiag.storage import make_row
 
     with pytest.raises(ValueError, match="不足"):
-        make_row("disk_samples", ts=1.0, mountpoint="/", total=100)
+        make_row("dir_samples", ts=1.0, path="/", size_bytes=100)
     with pytest.raises(ValueError, match="不明"):
-        make_row("disk_samples", ts=1.0, mountpoint="/", total=1, used=1, bogus=2)
+        make_row("dir_samples", ts=1.0, path="/", size_bytes=1, is_estimate=0, bogus=2)
 
 
 # ---------------------------------------------------------------------------

@@ -278,7 +278,8 @@ def add_disk_series(
         ts = start_ts + i * 3600.0
         used = int(used_start + hourly_growth * i)
         used = min(used, total)
-        rows.append((ts, mountpoint, total, used))
+        # inode / read-only columns (schema v4) are left NULL: not measured.
+        rows.append((ts, mountpoint, total, used, None, None, None))
 
     store.buffer("disk_samples", rows)
     store.flush(reason="synth")

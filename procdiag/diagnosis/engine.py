@@ -36,8 +36,10 @@ from ..core import (
     ObservationQuality,
     Rule,
     Severity,
+    SkippedRule,
     Window,
     all_rules,
+    configure_rule,
 )
 from ..plugins import load_extra_rules
 
@@ -207,10 +209,16 @@ class Engine:
         base_min_hours = Rule.min_observation_hours
         rule_classes = self.select(only=only, skip=skip)
         raw_findings: list[Finding] = []
+        evaluated: list[str] = []
+        skipped: list[SkippedRule] = []
+        errored: list[str] = []
 
         for rule_cls in rule_classes:
-            rule = rule_cls()
-            rule.configure(self.config)
+            rule, config_error = configure_rule(rule_cls, self.config)
+            if config_error is not None:
+                reasoning.append(
+                    f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
+                )
             eff_min = (
                 self.config.rules.min_observation_hours
                 if rule.min_observation_hours == base_min_hours
@@ -220,6 +228,14 @@ class Engine:
                 reasoning.append(
                     f"{rule.rule_id}: 観測時間不足のためスキップ "
                     f"({window.span_hours:.1f}h < {eff_min:.1f}h)"
+                )
+                skipped.append(
+                    SkippedRule(
+                        rule_id=rule.rule_id,
+                        title=rule.title,
+                        required_hours=eff_min,
+                        remaining_hours=eff_min - window.span_hours,
+                    )
                 )
                 continue
             try:
@@ -232,7 +248,9 @@ class Engine:
                 reasoning.append(msg)
                 if self.verbose:
                     reasoning.append(traceback.format_exc())
+                errored.append(rule.rule_id)
                 continue
+            evaluated.append(rule.rule_id)
 
             if self.verbose and found:
                 for f in found:
@@ -270,6 +288,9 @@ class Engine:
             reasoning=reasoning,
             quality=quality,
             no_data=not has_data,
+            evaluated_rules=evaluated,
+            skipped_rules=skipped,
+            errored_rules=errored,
         )
 
     # ------------------------------------------------------------------

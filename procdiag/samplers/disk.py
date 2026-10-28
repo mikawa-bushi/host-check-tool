@@ -5,7 +5,10 @@ drive them at different intervals (``disk_interval`` for partition snapshots,
 ``dir_scan_interval`` for directory walks) with a single sampler instance:
 
 * ``collect`` — fast path (60 s default).  Calls ``psutil.disk_partitions``
-  and ``psutil.disk_usage`` for every *real* filesystem (pseudo-fs excluded).
+  and ``psutil.disk_usage`` for every *real* filesystem (pseudo-fs excluded),
+  plus ``os.statvfs`` for inode usage and the mount options for a read-only
+  flag — "space left but cannot write" (inode exhaustion, or a filesystem
+  error that remounted it read-only) is invisible in byte counts alone.
   Produces ``disk_samples`` rows.
 
 * ``collect_dirs`` — slow path (1 h default).  Walks each ``WatchDir`` in
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Optional, Tuple
 
 import psutil
 
@@ -101,6 +105,7 @@ class DiskSampler(Sampler):
                 usage = psutil.disk_usage(part.mountpoint)
             except OSError:  # incl. PermissionError
                 continue
+            inodes_total, inodes_used = _inode_usage(part.mountpoint)
             rows.append(
                 make_row(
                     "disk_samples",
@@ -108,6 +113,9 @@ class DiskSampler(Sampler):
                     mountpoint=part.mountpoint,
                     total=usage.total,
                     used=usage.used,
+                    inodes_total=inodes_total,
+                    inodes_used=inodes_used,
+                    read_only=int(is_read_only(part.opts)),
                 )
             )
 
@@ -137,6 +145,26 @@ class DiskSampler(Sampler):
             )
 
         return [SampleBatch(table="dir_samples", rows=rows)]
+
+
+def is_read_only(mount_opts: str) -> bool:
+    """Whether a mount-options string (``"rw,relatime"``) says read-only."""
+    return "ro" in (mount_opts or "").split(",")
+
+
+def _inode_usage(mountpoint: str) -> Tuple[Optional[int], Optional[int]]:
+    """Return ``(inodes_total, inodes_used)``; ``(None, None)`` if unknown.
+
+    Filesystems without a fixed inode table (btrfs, some FUSE/network mounts)
+    report ``f_files == 0``; that means "not applicable", not "full".
+    """
+    try:
+        st = os.statvfs(mountpoint)
+    except OSError:
+        return None, None
+    if st.f_files <= 0:
+        return None, None
+    return st.f_files, st.f_files - st.f_ffree
 
 
 def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:

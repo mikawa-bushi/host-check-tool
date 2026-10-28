@@ -25,20 +25,47 @@ import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from .core.util import MiB, parse_duration
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+_Migration = Union[str, Callable[[sqlite3.Connection], None]]
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of *table* (empty when the table does not exist)."""
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column(
+    table: str, column: str, decl: str
+) -> Callable[[sqlite3.Connection], None]:
+    """Migration step adding *column* to *table* only when it is missing.
+
+    ``ALTER TABLE … ADD COLUMN`` is not idempotent and SQLite runs DDL outside
+    the migration's transaction, so a crash between the ALTER and the version
+    bump would otherwise make the next open fail with "duplicate column".
+    """
+
+    def step(conn: sqlite3.Connection) -> None:
+        if column not in _table_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    return step
+
 
 # Forward migrations keyed by the schema version they produce.  Each value is a
-# list of idempotent DDL statements that upgrade a DB from (version - 1) to
-# version, applied in order on the write path by ``_ensure_schema_version``.
-# ``_SCHEMA`` already contains the *current* shape, so a brand-new DB never runs
-# these — they exist only to bring an older on-disk DB forward.
-_MIGRATIONS: "dict[int, list[str]]" = {
+# list of idempotent steps (SQL text or a callable taking the connection) that
+# upgrade a DB from (version - 1) to version, applied in order on the write
+# path by ``_ensure_schema_version``.  ``_SCHEMA`` already contains the
+# *current* shape (and is executed before migrating, so new tables already
+# exist), so a brand-new DB never runs these — they exist only to bring an
+# older on-disk DB forward.
+_MIGRATIONS: Dict[int, List[_Migration]] = {
     2: [
         "CREATE INDEX IF NOT EXISTS idx_ops_events_kind_ts ON ops_events(kind, ts)",
     ],
@@ -46,6 +73,13 @@ _MIGRATIONS: "dict[int, list[str]]" = {
         "CREATE TABLE IF NOT EXISTS thermal_samples ("
         " ts REAL PRIMARY KEY, temp_max_c REAL,"
         " cpu_freq_cur_mhz REAL, cpu_freq_max_mhz REAL)",
+    ],
+    4: [
+        _add_column("disk_samples", "inodes_total", "INTEGER"),
+        _add_column("disk_samples", "inodes_used", "INTEGER"),
+        _add_column("disk_samples", "read_only", "INTEGER"),
+        _add_column("proc_registry", "fd_soft_limit", "INTEGER"),
+        _add_column("proc_registry", "fd_hard_limit", "INTEGER"),
     ],
 }
 
@@ -74,6 +108,7 @@ CREATE TABLE IF NOT EXISTS proc_registry (
   cmdline_hash TEXT NOT NULL,
   cmdline_sample TEXT,
   first_seen REAL, last_seen REAL,
+  fd_soft_limit INTEGER, fd_hard_limit INTEGER,
   UNIQUE(name, cmdline_hash)
 );
 
@@ -119,6 +154,7 @@ CREATE TABLE IF NOT EXISTS proc_samples (
 -- Tier3: ディスクサンプル
 CREATE TABLE IF NOT EXISTS disk_samples (
   ts REAL, mountpoint TEXT, total INTEGER, used INTEGER,
+  inodes_total INTEGER, inodes_used INTEGER, read_only INTEGER,
   PRIMARY KEY (ts, mountpoint)
 );
 CREATE TABLE IF NOT EXISTS dir_samples (
@@ -129,6 +165,25 @@ CREATE TABLE IF NOT EXISTS dir_samples (
 CREATE TABLE IF NOT EXISTS thermal_samples (
   ts REAL PRIMARY KEY,
   temp_max_c REAL, cpu_freq_cur_mhz REAL, cpu_freq_max_mhz REAL
+);
+
+-- プロセス数・ゾンビ数 (Tier-2b の走査ごと)
+CREATE TABLE IF NOT EXISTS proc_counts (
+  ts REAL PRIMARY KEY, total INTEGER, zombies INTEGER
+);
+-- systemd サービスの自動再起動 / failed 遷移
+CREATE TABLE IF NOT EXISTS service_events (
+  ts REAL, unit TEXT, kind TEXT, n_restarts INTEGER, result TEXT
+);
+-- カーネルログの異常行 (I/O エラー・ハングタスク等)
+CREATE TABLE IF NOT EXISTS kernel_events (
+  ts REAL, kind TEXT, message TEXT
+);
+-- 記録セッション (開始・生存・正常停止; 予期しない再起動の検出に使う)
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id INTEGER PRIMARY KEY,
+  started_ts REAL, boot_time REAL, hostname TEXT, procdiag_version TEXT,
+  last_alive_ts REAL, stopped_ts REAL
 );
 
 -- スパイクイベント
@@ -225,6 +280,9 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "mountpoint",
         "total",
         "used",
+        "inodes_total",
+        "inodes_used",
+        "read_only",
     ],
     "dir_samples": [
         "ts",
@@ -238,6 +296,9 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "cpu_freq_cur_mhz",
         "cpu_freq_max_mhz",
     ],
+    "proc_counts": ["ts", "total", "zombies"],
+    "service_events": ["ts", "unit", "kind", "n_restarts", "result"],
+    "kernel_events": ["ts", "kind", "message"],
     "sys_rollup_1m": [
         "ts_min",
         "cpu_avg",
@@ -297,13 +358,20 @@ def make_row(table: str, **values: Any) -> tuple:
 # ---------------------------------------------------------------------------
 
 # Raw high-frequency samples: kept for ``retention.raw`` (e.g. 48h).
-_RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples")
+_RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
 # 1-minute rollups: keyed by ``ts_min`` and kept for ``retention.rollup``.
 _ROLLUP_TABLES = ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m")
 # Low-frequency raw samples that are cheap enough to keep as long as rollups.
-_LONG_LIVED_TABLES = ("disk_samples", "dir_samples", "thermal_samples")
-# Lookup tables without a timestamp column.
-_NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry")
+_LONG_LIVED_TABLES = (
+    "disk_samples",
+    "dir_samples",
+    "thermal_samples",
+    "service_events",
+    "kernel_events",
+)
+# Tables without a ``ts`` column (lookups, and the tiny session history that is
+# kept for good so reboots can be compared across the whole recording).
+_NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry", "sessions")
 # Every table, in the order ``counts()`` reports them.
 _ALL_TABLES = (
     *_NO_TS_TABLES,
@@ -349,15 +417,12 @@ class Storage:
             self.conn = sqlite3.connect(str(self.path))
 
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-
-        if not read_only:
-            self.conn.executescript(_SCHEMA)
-            self.conn.commit()
-            self._ensure_schema_version()
-        else:
-            self._check_read_only_version()
+        try:
+            self._prepare(read_only)
+        except BaseException:
+            # e.g. StorageVersionError: do not leak the connection to the caller.
+            self.conn.close()
+            raise
 
         # In-memory write buffer: table_name -> list[tuple]
         self._buffer: Dict[str, List[tuple]] = defaultdict(list)
@@ -380,6 +445,22 @@ class Storage:
     # ------------------------------------------------------------------
     # Schema versioning / migrations
     # ------------------------------------------------------------------
+
+    def _prepare(self, read_only: bool) -> None:
+        """Set pragmas and bring the schema up to date (write) or check it (read)."""
+        if read_only:
+            # A read-only connection cannot switch the journal mode (it raises
+            # on a DB that is not already WAL, e.g. a copy made by another
+            # tool); a WAL DB is read in WAL mode regardless.
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self._check_read_only_version()
+            return
+
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.executescript(_SCHEMA)
+        self.conn.commit()
+        self._ensure_schema_version()
 
     def _ensure_schema_version(self) -> None:
         """Read the stored schema version and migrate forward if needed.
@@ -410,8 +491,11 @@ class Storage:
             )
 
         for target in range(stored + 1, SCHEMA_VERSION + 1):
-            for stmt in _MIGRATIONS.get(target, []):
-                self.conn.execute(stmt)
+            for step in _MIGRATIONS.get(target, []):
+                if callable(step):
+                    step(self.conn)
+                else:
+                    self.conn.execute(step)
             self.conn.execute(
                 "UPDATE meta SET value=? WHERE key='schema_version'",
                 (str(target),),
@@ -1077,6 +1161,23 @@ class Storage:
             return bounds[0], bounds[1], True
         return None
 
+    def proc_fd_limits(self, proc_id: int) -> Optional[Tuple[int, int]]:
+        """Return the recorded ``(soft, hard)`` RLIMIT_NOFILE for *proc_id*.
+
+        ``None`` when it was never readable (other user's process while
+        recording non-root) or the DB predates schema v4.
+        """
+        if not self.has_column("proc_registry", "fd_soft_limit"):
+            return None
+        row = self.conn.execute(
+            "SELECT fd_soft_limit AS soft, fd_hard_limit AS hard "
+            "FROM proc_registry WHERE proc_id = ?",
+            (proc_id,),
+        ).fetchone()
+        if row is None or row["soft"] is None:
+            return None
+        return int(row["soft"]), int(row["hard"])
+
     def cg_unit_path(self, cg_id: int) -> str:
         """Return the registered cgroup unit path for *cg_id*.
 
@@ -1086,6 +1187,75 @@ class Storage:
             "SELECT unit_path FROM cgroup_registry WHERE cg_id = ?", (cg_id,)
         ).fetchone()
         return row["unit_path"] if row else str(cg_id)
+
+    def set_proc_fd_limits(self, proc_id: int, soft: int, hard: int) -> None:
+        """Record a process identity's FD limits (caller's next flush commits)."""
+        self.conn.execute(
+            "UPDATE proc_registry SET fd_soft_limit=?, fd_hard_limit=? "
+            "WHERE proc_id=?",
+            (soft, hard, proc_id),
+        )
+
+    # ------------------------------------------------------------------
+    # Recording sessions (unclean-shutdown detection)
+    # ------------------------------------------------------------------
+
+    def start_session(
+        self, *, boot_time: float, hostname: str, procdiag_version: str
+    ) -> int:
+        """Open a ``sessions`` row for this record run and return its id."""
+        now = time.time()
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO sessions (started_ts, boot_time, hostname, "
+                "procdiag_version, last_alive_ts) VALUES (?, ?, ?, ?, ?)",
+                (now, boot_time, hostname, procdiag_version, now),
+            )
+        return int(cur.lastrowid)
+
+    def touch_session(self, session_id: int) -> None:
+        """Advance the session's ``last_alive_ts`` (a cheap heartbeat).
+
+        After a power cut this is the last moment the recorder was known to be
+        running — the best estimate of when the host went down.
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET last_alive_ts=? WHERE session_id=?",
+                (time.time(), session_id),
+            )
+
+    def end_session(self, session_id: int) -> None:
+        """Mark the session as stopped cleanly (SIGTERM/SIGINT/duration)."""
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET last_alive_ts=?, stopped_ts=? WHERE session_id=?",
+                (now, now, session_id),
+            )
+
+    def sessions(self) -> List[sqlite3.Row]:
+        """All recording sessions, oldest first ([] for a pre-v4 DB)."""
+        if not self.has_table("sessions"):
+            return []
+        return self.conn.execute(
+            "SELECT * FROM sessions ORDER BY started_ts"
+        ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Schema introspection (old DBs opened read-only lack newer objects)
+    # ------------------------------------------------------------------
+
+    def has_table(self, table: str) -> bool:
+        """Whether *table* exists — False for objects added after this DB's version."""
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        return row is not None
+
+    def has_column(self, table: str, column: str) -> bool:
+        """Whether *table* has *column* (see :meth:`has_table`)."""
+        return column in _table_columns(self.conn, table)
 
     # ------------------------------------------------------------------
     # Lifecycle

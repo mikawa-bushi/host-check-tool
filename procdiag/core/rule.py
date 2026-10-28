@@ -9,7 +9,17 @@ filtered subset) against a Storage instance.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Type
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 from .result import Finding, Severity, Window
 
@@ -37,14 +47,39 @@ class Rule:
     why: str = ""  # why this detection method (Japanese)
     manual_commands: list[str] = []
 
+    @classmethod
+    def tunables(cls) -> Dict[str, Union[int, float]]:
+        """Numeric thresholds an operator may override, with their defaults.
+
+        Every public int/float class attribute (inherited ones included, e.g.
+        ``min_observation_hours``) is tunable through
+        ``config.rules.overrides[<rule_id>]``; ``procdiag explain`` lists them.
+        """
+        names = {
+            name
+            for klass in cls.__mro__
+            if klass is not object
+            for name, value in vars(klass).items()
+            if not name.startswith("_")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        }
+        return {name: getattr(cls, name) for name in sorted(names)}
+
     def configure(self, config: "ProcdiagConfig") -> None:
         """Apply operator settings from ``config`` before ``evaluate`` runs.
 
         The engine calls this once per run on every instantiated rule.  The
-        default does nothing; a rule whose threshold is exposed in
-        ``config.rules`` overrides it to copy that value onto the instance, so
-        the setting written in ``config.py`` actually takes effect.
+        base implementation applies ``config.rules.overrides[self.rule_id]``
+        onto the instance; a rule with a dedicated setting in ``config.rules``
+        overrides this to copy that value first and then calls ``super()``, so
+        an explicit override still wins.  Raises :class:`ValueError` for an
+        unknown or ill-typed override (nothing is applied in that case).
         """
+        overrides = config.rules.overrides.get(self.rule_id, {})
+        resolved = resolve_overrides(type(self), overrides)
+        for name, value in resolved.items():
+            setattr(self, name, value)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run the rule against *store* over *window*.
@@ -56,6 +91,71 @@ class Rule:
         raise NotImplementedError(
             f"ルール {self.__class__.__name__} は evaluate() を実装していません"
         )
+
+
+def resolve_overrides(
+    cls: Type[Rule], overrides: Mapping[str, float]
+) -> Dict[str, Union[int, float]]:
+    """Validate *overrides* against ``cls.tunables()`` and coerce their types.
+
+    An int threshold (counts, minutes) only accepts a whole number.  Raises
+    :class:`ValueError` (Japanese message) on the first invalid entry.
+    """
+    tunables = cls.tunables()
+    resolved: Dict[str, Union[int, float]] = {}
+    for name, value in overrides.items():
+        if name not in tunables:
+            raise ValueError(
+                f"{cls.rule_id}: '{name}' は調整可能なしきい値ではありません"
+                f" (調整可能: {', '.join(tunables)})"
+            )
+        if isinstance(tunables[name], int):
+            if not float(value).is_integer():
+                raise ValueError(
+                    f"{cls.rule_id}: '{name}' は整数で指定してください: {value}"
+                )
+            resolved[name] = int(value)
+        else:
+            resolved[name] = float(value)
+    return resolved
+
+
+_R = TypeVar("_R", bound=Rule)
+
+
+def configure_rule(cls: Type[_R], config: "ProcdiagConfig") -> Tuple[_R, Optional[str]]:
+    """Instantiate *cls* with *config* applied; ``(rule, error)``.
+
+    An invalid override (the CLI rejects those at start-up, library callers
+    may not) leaves the rule at its defaults and is returned as *error* so the
+    caller can say so instead of aborting.
+    """
+    rule = cls()
+    try:
+        rule.configure(config)
+    except ValueError as exc:
+        return cls(), str(exc)
+    return rule, None
+
+
+def validate_rule_overrides(overrides: Mapping[str, Mapping[str, float]]) -> List[str]:
+    """Return a message for every problem in ``config.rules.overrides``.
+
+    Unknown rule IDs and non-tunable / ill-typed attributes are reported, so a
+    typo in ``config.py`` fails at start-up instead of silently keeping the
+    default threshold.  The rule registry must already be populated.
+    """
+    problems: List[str] = []
+    for rule_id, values in overrides.items():
+        cls = _REGISTRY.get(rule_id)
+        if cls is None:
+            problems.append(f"rules.overrides: 不明なルール ID です: {rule_id}")
+            continue
+        try:
+            resolve_overrides(cls, values)
+        except ValueError as exc:
+            problems.append(f"rules.overrides: {exc}")
+    return problems
 
 
 # --- registry -----------------------------------------------------------------

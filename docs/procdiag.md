@@ -72,6 +72,7 @@ procdiag report --out report.html --json report.json
 
 | コマンド | 目的 |
 |---|---|
+| `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェックする (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成する |
 | `procdiag record` | 常駐ループで 3 層サンプリングを実行する |
 | `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する |
@@ -83,6 +84,7 @@ procdiag report --out report.html --json report.json
 | `procdiag list-samplers` | 登録済みサンプラーを Tier 別に一覧表示する |
 | `procdiag export` | 記録データを CSV または JSON でエクスポートする |
 | `procdiag prune` | 保持ポリシーを手動実行する |
+| `procdiag bundle` | 記録 DB・レポート・snapshot・doctor を 1 つの tar.gz にまとめる (持ち出し解析用) |
 | `procdiag service print` | systemd ユニットファイルを標準出力に表示する |
 | `procdiag service install` | user systemd ユニットを `~/.config/systemd/user/` に配置する |
 
@@ -142,6 +144,11 @@ host-check-tool/
 │   ├── spikes.py         # spike_events の JSON ペイロード契約 (記録側と読取側で共有)
 │   ├── plugins.py        # entry_points ベースのプラグイン読み込み
 │   ├── doctor.py         # 記録前の観測能力チェック (procdiag doctor)
+│   ├── snapshot.py       # 記録なしの即時ヘルスチェック (procdiag snapshot)
+│   ├── bundle.py         # 持ち出し用バンドル (procdiag bundle)
+│   ├── status.py         # 記録 DB の概況 (status / bundle で共用)
+│   ├── systemd.py        # systemctl / timedatectl / journalctl の読み取り専用ラッパー
+│   ├── kernlog.py        # カーネルログ (journalctl -k) の異常行の分類
 │   ├── export.py         # CSV / JSON エクスポート
 │   ├── service.py        # systemd ユニット生成
 │   ├── report.py         # terminal / JSON / HTML+SVG レポート生成
@@ -152,6 +159,8 @@ host-check-tool/
 │   │   ├── process.py    # Tier-2b: 全プロセス走査 + PID キャッシュ
 │   │   ├── disk.py       # Tier-3: ディスク使用量 / ディレクトリサイズ
 │   │   ├── thermal.py    # Tier-3: CPU 温度 / クロック (センサ有りのみ)
+│   │   ├── service.py    # Tier-3: systemd の自動再起動・failed (systemd 有りのみ)
+│   │   ├── kernel_log.py # Tier-3: カーネルログの異常 (journal 読取可のみ)
 │   │   ├── trigger.py    # SpikeTrigger — PSI スパイク検出・デバウンス
 │   │   └── selfmeter.py  # SelfMeter — 自己オーバーヘッド計測・自動減速
 │   ├── core/
@@ -164,9 +173,9 @@ host-check-tool/
 │       ├── trend.py      # 線形回帰・外挿・周期検出・系列ヘルパ (純関数群)
 │       ├── cpu.py        # CPU-PERIODIC-01 / CPU-SINGLECORE-01 / CPU-SATURATION-01
 │       ├── memory.py     # MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01 (+ PSS 事前選定)
-│       ├── io_disk.py    # DISK-FULL-01 / IO-BOTTLENECK-01 / DISK-GROWTH-01 / DISK-JOURNAL-01
+│       ├── io_disk.py    # DISK-FULL-01 / IO-BOTTLENECK-01 / DISK-GROWTH-01 / DISK-JOURNAL-01 / DISK-INODE-01 / FS-READONLY-01
 │       ├── leak.py       # FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01
-│       ├── crash.py      # OOM-KILL-01
+│       ├── crash.py      # OOM-KILL-01 / UNCLEAN-SHUTDOWN-01 / SERVICE-RESTART-01 / KERNEL-ERROR-01
 │       └── thermal.py    # THERMAL-01
 └── tests/
     ├── test_e2e.py       # E2E: init→record→check→report の通し検証
@@ -216,9 +225,24 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
 
 `DiskSampler` が:
 
-- `collect()`: 60 秒毎にパーティション使用量を記録 (`disk_samples`)
+- `collect()`: 60 秒毎にパーティション使用量・inode 使用量・読み取り専用フラグを記録 (`disk_samples`)
 - `collect_dirs()`: 1 時間毎に `watch_dirs` を走査 (`dir_samples`)。
   時間予算内に完了しない場合は `is_estimate=1` で打ち切り結果を記録。
+
+### Tier-3 — サービス / カーネルログ (5 分)
+
+- `ServiceSampler`: systemd が数える自動再起動回数 (`NRestarts`) の増加と failed 遷移だけを
+  `service_events` に記録する (cgroup の作り直しは timer 起動の oneshot でも起きるため使わない)。
+- `KernelLogSampler`: `journalctl -k` を前回の続き (cursor) から読み、I/O エラー・FS エラー・
+  ハングタスク・MCE・segfault・USB 切断・温度制限の行だけを `kernel_events` に記録する。
+  読み取りには root または systemd-journal / adm グループが必要。
+
+### 記録セッション
+
+`record` の各実行は `sessions` に開始時刻・boot 時刻を記録し、60 秒毎に生存時刻を更新、
+正常停止 (SIGTERM / SIGINT / SIGHUP / `--duration` 満了) で停止時刻を記録する。
+停止記録のないまま別の boot の記録が始まっていれば、電源断などの異常停止
+(UNCLEAN-SHUTDOWN-01) と判定できる。
 
 ### SpikeTrigger — PSI スパイク検出
 
@@ -268,10 +292,20 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 | `OOM-KILL-01` | crash | プロセス台帳の途絶×直前のメモリ危機の相関で OOM kill を検出。journal 読取可なら確証度を昇格 |
 | `FD-LEAK-01` | leak | fds_max の線形回帰で fd リークと ulimit 到達予測日数を算出 |
 | `THREAD-LEAK-01` | leak | threads_max の単調増加を検出 |
-| `ZOMBIE-01` | leak | ゾンビ近似プロセス数の増加傾向を検出 (confidence=low の近似検出) |
+| `ZOMBIE-01` | leak | プロセス走査ごとのゾンビ数の増加傾向を検出 (v4 より前の DB は近似、confidence=low) |
+| `DISK-INODE-01` | io_disk | inode 使用率の高止まり・増加を検出 (容量に空きがあっても書けない状態) |
+| `FS-READONLY-01` | io_disk | 記録中にファイルシステムが読み取り専用へ切り替わったことを検出 |
+| `UNCLEAN-SHUTDOWN-01` | crash | 記録セッション履歴から、停止処理なしの再起動 (電源断・パニック) を検出 |
+| `SERVICE-RESTART-01` | crash | systemd の自動再起動 (NRestarts) の増加・failed 遷移からクラッシュループを検出 |
+| `KERNEL-ERROR-01` | crash | カーネルログの I/O エラー・FS エラー・ハングタスク・MCE・segfault・USB 切断を集計 |
+| `THERMAL-01` | cpu | 高温下での継続的なクロック低下 (サーマルスロットリング) を検出 |
 
 最低観測時間はルールごとに異なる (瞬時型 0h 〜 日次反復型 24h)。線形回帰系ルールの
 既定 6 時間は `config.rules.min_observation_hours` で一括調整できる (0 で無効)。
+観測時間不足で評価できなかったルールは、診断結果に「評価範囲」として必ず表示される。
+
+各ルールのしきい値 (クラス属性の数値) は `config.rules.overrides[<RULE-ID>]` で上書きでき、
+一覧と既定値は `procdiag explain <RULE-ID>` で確認できる。
 
 record 常駐中は毎時の軽量プレチェックがリーク疑いプロセス (最大5件) を選び、
 smaps_rollup から PSS を自動精査する — MEM-LEAK-01 は PSS でも増加が確認できた場合に

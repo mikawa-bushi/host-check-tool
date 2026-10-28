@@ -10,10 +10,10 @@ process accumulation.
 - **THREAD-LEAK-01**: Detect thread count growing monotonically per process,
   using linear regression on ``proc_rollup_1m.threads_max``.
 
-- **ZOMBIE-01**: Approximate zombie process accumulation by counting per-tick
-  samples where ``cpu_pct=0``, ``rss=0``, and ``num_threads=0`` in
-  ``proc_samples``, then fitting a trend to that count series.  Because the
-  schema does not store a ``status`` column, this is an approximation and is
+- **ZOMBIE-01**: Detect zombie process accumulation by fitting a trend to the
+  per-scan zombie count in ``proc_counts`` (schema v4, from the real process
+  state).  DBs recorded before v4 fall back to approximating zombies as
+  ``proc_samples`` rows with ``cpu_pct=0``, ``rss=0`` and ``num_threads=0``,
   reported at ``confidence=LOW``.
 
 Design doc reference: §6.2 FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01.
@@ -50,9 +50,9 @@ _THREAD_LEAK_SLOPE_WARNING_H: float = 0.5
 # Minimum R² for the regression to be considered reliable.
 _THREAD_LEAK_MIN_R2: float = 0.9
 
-# Common FD soft/hard limits used for "days to limit" estimates.
-# These are fallback constants; the actual per-process limit is in
-# /proc/<pid>/limits, which we cannot read for arbitrary processes.
+# Common FD soft/hard limits used for "days to limit" estimates when the
+# process's real RLIMIT_NOFILE was not recorded (other users' processes when
+# recording non-root, or a DB from before schema v4).
 _FD_SOFT_LIMIT_DEFAULT: int = 1024
 _FD_HARD_LIMIT_DEFAULT: int = 4096
 
@@ -123,14 +123,13 @@ class FdLeakRule(Rule):
                 fit, min_observation_hours=self.min_observation_hours
             )
 
-            # Estimate days until the default soft/hard FD limit is reached.
+            # Estimate days until the soft/hard FD limit is reached — the
+            # process's recorded RLIMIT_NOFILE when known, else common defaults.
             current_fds = series[-1][1]
-            days_to_soft_limit = days_until(
-                current_fds, _FD_SOFT_LIMIT_DEFAULT, slope_fd_h
-            )
-            days_to_hard_limit = days_until(
-                current_fds, _FD_HARD_LIMIT_DEFAULT, slope_fd_h
-            )
+            limits = store.proc_fd_limits(proc_id)
+            soft, hard = limits or (_FD_SOFT_LIMIT_DEFAULT, _FD_HARD_LIMIT_DEFAULT)
+            days_to_soft_limit = days_until(current_fds, soft, slope_fd_h)
+            days_to_hard_limit = days_until(current_fds, hard, slope_fd_h)
 
             evidence = {
                 "proc_id": proc_id,
@@ -142,6 +141,9 @@ class FdLeakRule(Rule):
                 "current_fds": current_fds,
                 "days_to_soft_limit": days_to_soft_limit,
                 "days_to_hard_limit": days_to_hard_limit,
+                "fd_soft_limit": soft,
+                "fd_hard_limit": hard,
+                "fd_limit_source": "measured" if limits else "default",
             }
 
             summary = (
@@ -267,18 +269,14 @@ class ThreadLeakRule(Rule):
 
 @register
 class ZombieRule(Rule):
-    """Detect accumulating zombie processes via proc_samples approximation.
+    """Detect accumulating zombie processes from the per-scan zombie count.
 
-    Because ``proc_samples`` does not record a ``status`` column, zombie
-    processes are approximated by rows where ``cpu_pct=0``, ``rss=0``, and
-    ``num_threads=0`` simultaneously.  The count per timestamp is
-    time-serialised and a linear trend is fitted.  A positive slope fires
-    INFO severity.
-
-    This is a heuristic approximation; ``confidence`` is always LOW and the
-    proposal notes this explicitly.  If the T03 sampler ever adds a zombie
-    count to ``ops_events``, that source should be preferred (see design-doc
-    note in T12 goal file).
+    The process sampler records the number of processes in the zombie state on
+    every scan (``proc_counts``); a linear trend is fitted to that series and a
+    positive slope fires INFO (confidence MEDIUM — the counts are exact, the
+    trend is a regression).  For DBs recorded before schema v4 the count is
+    approximated as rows with ``cpu_pct=0``, ``rss=0`` and ``num_threads=0``,
+    and the finding is marked ``confidence=LOW`` / ``method="approx"``.
     """
 
     rule_id = "ZOMBIE-01"
@@ -287,12 +285,12 @@ class ZombieRule(Rule):
     default_severity = Severity.INFO
     min_observation_hours = 6.0
     what = (
-        "proc_samples の cpu_pct=0・rss=0・num_threads=0 のプロセス数を"
-        "ゾンビ近似として時系列化し、増加傾向を線形回帰で検出する"
+        "プロセス走査ごとのゾンビ数 (proc_counts) を時系列化し、"
+        "増加傾向を線形回帰で検出する"
     )
     why = (
-        "ゾンビプロセスは親が wait() を呼ばないことで蓄積する。"
-        "statusカラム非記録のため cpu_pct/rss/num_threads の組み合わせで近似する"
+        "ゾンビプロセスは親が wait() を呼ばないことで蓄積し、PID の枠を占有する。"
+        "旧形式の DB では cpu_pct/rss/num_threads=0 の組み合わせで近似する"
     )
     manual_commands = [
         "ps aux | grep ' Z '",
@@ -304,8 +302,70 @@ class ZombieRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run ZOMBIE-01 against the observation window."""
-        findings: list[Finding] = []
+        series = self._counted_series(store, window)
+        exact = bool(series)
+        if not exact:
+            series = self._approx_series(store, window)
+        if not series:
+            return []
 
+        fit = fit_linear(
+            series,
+            min_points=12,
+            min_span_hours=self.min_observation_hours,
+        )
+        if fit is None:
+            return []
+
+        slope_h = fit.slope_per_hour
+        if slope_h <= self.slope_warning_h:
+            return []
+
+        if exact:
+            summary = (
+                f"ゾンビプロセス数が +{slope_h:.2f}/h の傾向で増加中"
+                f" (現在 {series[-1][1]:.0f} 個, R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
+            )
+        else:
+            summary = (
+                f"ゾンビ近似プロセス数が +{slope_h:.2f}/h の傾向で増加中"
+                f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測、近似値)"
+            )
+        confidence = Confidence.MEDIUM if exact else Confidence.LOW
+
+        evidence = {
+            "slope_per_h": slope_h,
+            "r2": fit.r2,
+            "n": fit.n,
+            "span_hours": fit.span_hours,
+            "method": "status" if exact else "approx",
+            "current_zombies": series[-1][1] if exact else None,
+            "confidence": confidence.value,
+        }
+
+        return [
+            Finding(
+                rule_id=self.rule_id,
+                severity=Severity.INFO,
+                subject="zombie_processes",
+                summary=summary,
+                evidence=evidence,
+                detected_at=(window.start_ts, window.end_ts),
+                confidence=confidence,
+            )
+        ]
+
+    @staticmethod
+    def _counted_series(store: "Storage", window: Window) -> list[tuple[float, float]]:
+        """Exact per-scan zombie counts (schema v4); [] when not recorded."""
+        if not store.has_table("proc_counts"):
+            return []
+        rows = store.rows("proc_counts", since=window.start_ts, until=window.end_ts)
+        return [(float(r["ts"]), float(r["zombies"])) for r in rows]
+
+    @staticmethod
+    def _approx_series(store: "Storage", window: Window) -> list[tuple[float, float]]:
+        """Pre-v4 fallback: count rows that look like zombies per scan."""
         # Query proc_samples for zombie approximation:
         # rows with cpu_pct=0 (or NULL), rss=0 (or NULL), num_threads=0 (or NULL).
         # We aggregate per distinct timestamp.
@@ -326,50 +386,5 @@ class ZombieRule(Rule):
             ).fetchall()
         except Exception:
             # Defensive: if query fails, skip gracefully.
-            return findings
-
-        if not rows:
-            return findings
-
-        series: list[tuple[float, float]] = [
-            (float(r["ts"]), float(r["zombie_approx"])) for r in rows
-        ]
-
-        fit = fit_linear(
-            series,
-            min_points=12,
-            min_span_hours=self.min_observation_hours,
-        )
-        if fit is None:
-            return findings
-
-        slope_h = fit.slope_per_hour
-        if slope_h <= self.slope_warning_h:
-            return findings
-
-        summary = (
-            f"ゾンビ近似プロセス数が +{slope_h:.2f}/h の傾向で増加中"
-            f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測、近似値)"
-        )
-
-        evidence = {
-            "slope_per_h": slope_h,
-            "r2": fit.r2,
-            "n": fit.n,
-            "span_hours": fit.span_hours,
-            "confidence": "low",
-        }
-
-        findings.append(
-            Finding(
-                rule_id=self.rule_id,
-                severity=Severity.INFO,
-                subject="zombie_processes",
-                summary=summary,
-                evidence=evidence,
-                detected_at=(window.start_ts, window.end_ts),
-                confidence=Confidence.LOW,
-            )
-        )
-
-        return findings
+            return []
+        return [(float(r["ts"]), float(r["zombie_approx"])) for r in rows]

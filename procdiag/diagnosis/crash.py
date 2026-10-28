@@ -1,15 +1,17 @@
 """Crash diagnostic rules.
 
-Currently implements:
-
 - **OOM-KILL-01**: Detect OOM-killed processes by correlating process
   disappearance with memory crisis indicators in ``sys_samples``.  The rule
   operates entirely on the recorded DB so it works offline without any
   privilege escalation.  An optional ``journalctl`` probe can elevate
   confidence to HIGH when an OOM-kill log line matching the process name or
   PID is found.
+- **UNCLEAN-SHUTDOWN-01**: Recording sessions that ended without a clean stop
+  and were followed by a new boot (power loss, panic, hard reset).
+- **SERVICE-RESTART-01**: systemd services in a crash/restart loop or failed.
+- **KERNEL-ERROR-01**: Disk / filesystem / hardware errors from the kernel log.
 
-Design:
+OOM-KILL-01 design:
 
 1. Identify proc_ids whose last sample is significantly before the window
    end (> ``GAP_THRESHOLD_S`` seconds) — the process disappeared while
@@ -39,6 +41,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from .. import kernlog
 from ..core import (
     Confidence,
     Finding,
@@ -420,3 +423,293 @@ class OomKillRule(Rule):
         # still store the first line as corroborating evidence but keep MEDIUM.
         if journal_lines:
             finding.evidence["journal_line_unmatched"] = journal_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# UNCLEAN-SHUTDOWN-01
+# ---------------------------------------------------------------------------
+
+
+@register
+class UncleanShutdownRule(Rule):
+    """Detect reboots / power losses that happened while recording.
+
+    Each ``procdiag record`` run opens a ``sessions`` row, refreshes its
+    ``last_alive_ts`` every flush and sets ``stopped_ts`` on a clean stop.  An
+    orderly OS shutdown sends SIGTERM to the recorder first, so a session that
+    was never stopped and is followed by a session on a *different* boot means
+    the host went down without shutting down: power loss, kernel panic, hard
+    reset or a hardware watchdog.  Unstopped sessions on the *same* boot mean
+    the recorder process itself was killed (``kill -9``, OOM killer) — reported
+    separately at INFO because the host stayed up.
+    """
+
+    rule_id = "UNCLEAN-SHUTDOWN-01"
+    category = "crash"
+    title = "予期しない再起動・電源断"
+    default_severity = Severity.WARNING
+    min_observation_hours = 0.0
+    what = (
+        "記録セッションの履歴 (sessions) で、正常停止せずに次の起動 (boot) へ"
+        "移ったセッションを検出する"
+    )
+    why = (
+        "OS の正常なシャットダウンでは記録プロセスに SIGTERM が届き停止が記録される。"
+        "停止記録がないまま再起動していれば、電源断・カーネルパニック等による異常停止である"
+    )
+    manual_commands = [
+        "journalctl --list-boots",
+        "journalctl -b -1 -e",
+        "last -x | head -20",
+    ]
+
+    # Boot times are derived from the uptime clock and jitter by a few
+    # seconds between reads; a larger difference is a different boot.
+    boot_tolerance_s: float = 120.0
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        """Run UNCLEAN-SHUTDOWN-01 against the observation window."""
+        sessions = store.sessions()
+        host_down: list[dict] = []
+        recorder_killed: list[dict] = []
+        for prev, nxt in zip(sessions, sessions[1:]):
+            if prev["stopped_ts"] is not None:
+                continue  # clean stop
+            if not window.start_ts <= nxt["started_ts"] <= window.end_ts:
+                continue
+            event = {
+                "last_alive": prev["last_alive_ts"] or prev["started_ts"],
+                "next_boot": nxt["boot_time"],
+                "restarted_at": nxt["started_ts"],
+            }
+            new_boot = abs((nxt["boot_time"] or 0.0) - (prev["boot_time"] or 0.0))
+            if new_boot > self.boot_tolerance_s:
+                host_down.append(event)
+            else:
+                recorder_killed.append(event)
+
+        findings = []
+        if host_down:
+            n = len(host_down)
+            findings.append(
+                self._finding(
+                    host_down,
+                    severity=Severity.WARNING,
+                    subject="host",
+                    summary=f"記録中に正常な停止処理なしでホストが再起動 ({n} 回)"
+                    " — 電源断・カーネルパニック・強制リセットの疑い",
+                    confidence=Confidence.HIGH,
+                    kind="host_down",
+                )
+            )
+        if recorder_killed:
+            n = len(recorder_killed)
+            findings.append(
+                self._finding(
+                    recorder_killed,
+                    severity=Severity.INFO,
+                    subject="procdiag",
+                    summary=f"記録プロセスが停止処理なしで終了 ({n} 回、ホストは稼働継続)",
+                    confidence=Confidence.MEDIUM,
+                    kind="recorder_killed",
+                )
+            )
+        return findings
+
+    def _finding(
+        self,
+        events: list[dict],
+        *,
+        severity: Severity,
+        subject: str,
+        summary: str,
+        confidence: Confidence,
+        kind: str,
+    ) -> Finding:
+        return Finding(
+            rule_id=self.rule_id,
+            severity=severity,
+            subject=subject,
+            summary=summary,
+            evidence={"kind": kind, "count": len(events), "events": events},
+            detected_at=(events[0]["last_alive"], events[-1]["restarted_at"]),
+            confidence=confidence,
+        )
+
+
+# ---------------------------------------------------------------------------
+# SERVICE-RESTART-01
+# ---------------------------------------------------------------------------
+
+
+@register
+class ServiceRestartRule(Rule):
+    """Detect crash-looping or failed systemd services.
+
+    Reads ``service_events`` (automatic restarts counted by systemd's
+    ``NRestarts``, and transitions into the ``failed`` state).  Restarts within
+    any one hour at or above ``loop_restarts_per_hour`` are a crash loop
+    (CRITICAL); ``warn_restarts`` in the window, or any failed transition, is a
+    WARNING.
+    """
+
+    rule_id = "SERVICE-RESTART-01"
+    category = "crash"
+    title = "サービスの再起動ループ・failed"
+    default_severity = Severity.WARNING
+    min_observation_hours = 0.0
+    what = "systemd の自動再起動回数 (NRestarts) の増加と failed 遷移をユニットごとに集計する"
+    why = (
+        "クラッシュ→自動再起動を繰り返すサービスは、その時点では active に見えるため"
+        "見落とされやすい。再起動の回数と頻度で異常を判断する"
+    )
+    manual_commands = [
+        "systemctl status <unit>",
+        "journalctl -u <unit> -n 100 --no-pager",
+        "systemctl show -p NRestarts,Result,ExecMainStatus <unit>",
+    ]
+
+    warn_restarts: int = 3
+    loop_restarts_per_hour: int = 3
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        """Run SERVICE-RESTART-01 against the observation window."""
+        if not store.has_table("service_events"):
+            return []
+        rows = store.rows("service_events", since=window.start_ts, until=window.end_ts)
+
+        by_unit: dict[str, list] = {}
+        for row in rows:
+            by_unit.setdefault(row["unit"], []).append(row)
+
+        findings: list[Finding] = []
+        for unit, events in by_unit.items():
+            restarts = [
+                (r["ts"], r["n_restarts"] or 0)
+                for r in events
+                if r["kind"] == "restart"
+            ]
+            n_restarts = sum(n for _, n in restarts)
+            n_failed = sum(1 for r in events if r["kind"] == "failed")
+            peak = _max_in_hour(restarts)
+            looping = peak >= self.loop_restarts_per_hour
+            if not (looping or n_restarts >= self.warn_restarts or n_failed):
+                continue
+
+            results = sorted({r["result"] for r in events if r["result"]} - {"success"})
+            parts = []
+            if n_restarts:
+                parts.append(f"自動再起動 {n_restarts} 回 (1時間あたり最大 {peak} 回)")
+            if n_failed:
+                parts.append(f"failed {n_failed} 回")
+            reason = f" — 原因: {', '.join(results)}" if results else ""
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=Severity.CRITICAL if looping else Severity.WARNING,
+                    subject=unit,
+                    summary=f"{unit}: {'、'.join(parts)}{reason}",
+                    evidence={
+                        "unit": unit,
+                        "restarts": n_restarts,
+                        "max_restarts_per_hour": peak,
+                        "failed_count": n_failed,
+                        "results": results,
+                        "crash_loop": looping,
+                        "first_ts": events[0]["ts"],
+                        "last_ts": events[-1]["ts"],
+                    },
+                    detected_at=(events[0]["ts"], events[-1]["ts"]),
+                    confidence=Confidence.HIGH,
+                )
+            )
+        return findings
+
+
+def _max_in_hour(restarts: list[tuple[float, int]]) -> int:
+    """Largest number of restarts falling inside any 1-hour span."""
+    best = 0
+    for i, (start, _) in enumerate(restarts):
+        best = max(best, sum(n for ts, n in restarts[i:] if ts - start <= 3600.0))
+    return best
+
+
+# ---------------------------------------------------------------------------
+# KERNEL-ERROR-01
+# ---------------------------------------------------------------------------
+
+# Severity per kernel-log anomaly kind (``oom`` is OOM-KILL-01's business).
+# ``procdiag snapshot`` grades its 24-hour kernel-log check with the same map.
+KERNEL_SEVERITY = {
+    "fs_error": Severity.CRITICAL,
+    "io_error": Severity.CRITICAL,
+    "mce": Severity.CRITICAL,
+    "hung_task": Severity.WARNING,
+    "segfault": Severity.WARNING,
+    "usb_disconnect": Severity.WARNING,
+    "thermal": Severity.INFO,
+}
+
+
+@register
+class KernelErrorRule(Rule):
+    """Report disk, filesystem, hardware and stability errors from the kernel log.
+
+    Reads ``kernel_events`` recorded by the kernel-log sampler and emits one
+    finding per anomaly kind, with the count, the time span and a few sample
+    messages.  OOM lines are left to OOM-KILL-01.
+    """
+
+    rule_id = "KERNEL-ERROR-01"
+    category = "crash"
+    title = "カーネルが記録した異常"
+    default_severity = Severity.WARNING
+    min_observation_hours = 0.0
+    what = (
+        "kernel_events (カーネルログから抽出した I/O エラー・FS エラー・ハングタスク・"
+        "ハードウェアエラー・segfault・USB 切断) を種類別に集計する"
+    )
+    why = (
+        "ディスク故障・ハードウェア異常・ドライバ不具合は、性能指標には現れず"
+        "カーネルログにだけ記録されることが多い"
+    )
+    manual_commands = [
+        "journalctl -k -p warning --since '2 days ago'",
+        "dmesg -T | grep -iE 'error|fail|blocked|segfault|disconnect'",
+    ]
+
+    max_samples: int = 3
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        """Run KERNEL-ERROR-01 against the observation window."""
+        if not store.has_table("kernel_events"):
+            return []
+        rows = store.rows("kernel_events", since=window.start_ts, until=window.end_ts)
+
+        by_kind: dict[str, list] = {}
+        for row in rows:
+            if row["kind"] in KERNEL_SEVERITY:
+                by_kind.setdefault(row["kind"], []).append(row)
+
+        findings: list[Finding] = []
+        for kind, events in by_kind.items():
+            label = kernlog.LABELS.get(kind, kind)
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=KERNEL_SEVERITY[kind],
+                    subject=label,
+                    summary=f"カーネルログに{label}を {len(events)} 件記録",
+                    evidence={
+                        "kind": kind,
+                        "label": label,
+                        "count": len(events),
+                        "first_ts": events[0]["ts"],
+                        "last_ts": events[-1]["ts"],
+                        "samples": [e["message"] for e in events[: self.max_samples]],
+                    },
+                    detected_at=(events[0]["ts"], events[-1]["ts"]),
+                    confidence=Confidence.HIGH,
+                )
+            )
+        return findings

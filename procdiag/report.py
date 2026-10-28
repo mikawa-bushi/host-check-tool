@@ -24,13 +24,23 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import procdiag
-from procdiag.core import Confidence, Diagnosis, ObservationQuality, Severity
+from procdiag.core import (
+    Confidence,
+    Diagnosis,
+    ObservationQuality,
+    Severity,
+    SkippedRule,
+    configure_rule,
+)
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
+
+if TYPE_CHECKING:
+    from procdiag.config import ProcdiagConfig
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +100,9 @@ class ChartData:
     psi: List[Tuple[float, float, float, float]] = field(default_factory=list)
     mounts: dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
     spikes: List[dict] = field(default_factory=list)
+    # Decision boundaries drawn as guide lines (the rules' effective values).
+    core_pct_threshold: float = CpuSinglecoreRule.core_pct_threshold
+    psi_cpu_threshold: float = CpuSaturationRule.psi_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +160,12 @@ _SYS_CHART_COLUMNS = {
 }
 
 
-def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
+def build_charts(
+    store: Storage,
+    *,
+    since: float | None = None,
+    config: "ProcdiagConfig | None" = None,
+) -> ChartData:
     """Build a ChartData from a Storage instance.
 
     Reads sys_rollup_1m first (preferred because it is already aggregated);
@@ -156,8 +174,14 @@ def build_charts(store: Storage, *, since: float | None = None) -> ChartData:
     Reads spike_events for the spikes list.
 
     Returns an empty ChartData (no exception) when the DB contains no data.
+    With *config*, the threshold guide lines follow ``rules.overrides``.
     """
     charts = ChartData()
+    if config is not None:
+        core_rule, _ = configure_rule(CpuSinglecoreRule, config)
+        psi_rule, _ = configure_rule(CpuSaturationRule, config)
+        charts.core_pct_threshold = core_rule.core_pct_threshold
+        charts.psi_cpu_threshold = psi_rule.psi_threshold
 
     try:
         _fill_system_series(charts, store, since)
@@ -225,6 +249,50 @@ def _mount_series(disk_rows: List[sqlite3.Row]) -> dict[str, List[Tuple[float, f
 
 
 # ---------------------------------------------------------------------------
+# rule-coverage helpers (shared by terminal / HTML)
+# ---------------------------------------------------------------------------
+
+
+def _coverage_summary(diag: Diagnosis) -> str | None:
+    """One-line rule coverage, or None when nothing ran / no data at all.
+
+    A healthy verdict only speaks for the rules that actually ran, so the
+    report always says how many did — a short recording must not read as
+    "all clear" (most regression rules need 6–24 h of data).
+    """
+    n_eval = len(diag.evaluated_rules)
+    n_skip = len(diag.skipped_rules)
+    n_err = len(diag.errored_rules)
+    total = n_eval + n_skip + n_err
+    if total == 0 or diag.no_data:
+        return None
+    if diag.fully_evaluated:
+        return f"評価範囲: {total} ルールすべてを評価"
+    parts = [f"評価範囲: {total} ルール中 {n_eval} 件のみ評価"]
+    if n_skip:
+        longest = max(r.remaining_hours for r in diag.skipped_rules)
+        parts.append(
+            f"観測時間不足で未評価 {n_skip} 件"
+            f" (あと最長 {longest:.1f} 時間の記録で全ルールを評価できます)"
+        )
+    if n_err:
+        parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
+    return " / ".join(parts)
+
+
+def _skipped_by_wait(diag: Diagnosis) -> List[SkippedRule]:
+    """Unevaluated rules, the one needing the longest further recording first."""
+    return sorted(diag.skipped_rules, key=lambda r: -r.remaining_hours)
+
+
+def _skipped_list(diag: Diagnosis) -> str:
+    """``"MEM-PRESSURE-01 (あと 23.9h), MEM-LEAK-01 (あと 5.9h)"``."""
+    return ", ".join(
+        f"{r.rule_id} (あと {r.remaining_hours:.1f}h)" for r in _skipped_by_wait(diag)
+    )
+
+
+# ---------------------------------------------------------------------------
 # render_terminal
 # ---------------------------------------------------------------------------
 
@@ -261,9 +329,10 @@ def render_terminal(
             f"再度 check してください。{_c(_RESET, color)}"
         )
     elif diag.healthy:
+        scope = "" if diag.fully_evaluated else "評価できた範囲では"
         lines.append(
             f"{_c(_BOLD, color)}{_c(_GREEN, color)}"
-            f"診断: 問題は見つかりませんでした。{_c(_RESET, color)}"
+            f"診断: {scope}問題は見つかりませんでした。{_c(_RESET, color)}"
         )
     else:
         lines.append(f"{_c(_BOLD, color)}━━━ 診断 (Diagnosis) ━━━{_c(_RESET, color)}")
@@ -281,6 +350,17 @@ def render_terminal(
                     f"     関連する検出 (同一原因とみられるもの): "
                     f"{', '.join(f.related)}"
                 )
+
+    # --- Rule coverage ---
+    coverage = _coverage_summary(diag)
+    if coverage is not None:
+        if diag.fully_evaluated:
+            lines.append(coverage)
+        else:
+            warn = _c(_ANSI.get(Severity.WARNING, ""), color)
+            lines.append(f"{warn}⚠ {coverage}{_c(_RESET, color)}")
+            if diag.skipped_rules:
+                lines.append(f"  未評価: {_skipped_list(diag)}")
 
     # --- Observation quality block ---
     q = diag.quality
@@ -322,6 +402,9 @@ def render_json(diag: Diagnosis) -> str:
             "healthy": diag.healthy,
             "no_data": diag.no_data,
             "findings": [f.to_dict() for f in diag.findings],
+            "evaluated_rules": list(diag.evaluated_rules),
+            "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
+            "errored_rules": list(diag.errored_rules),
             "quality": diag.quality.to_dict(),
             "reasoning": list(diag.reasoning),
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -685,9 +768,12 @@ def _summary_section(diag: Diagnosis) -> str:
     if diag.no_data and not diag.findings:
         badge = '<span class="badge-warn">観測データなし</span>'
         verdict = "観測データがありません。procdiag record でデータを記録してください"
-    elif diag.healthy:
+    elif diag.healthy and diag.fully_evaluated:
         badge = '<span class="badge-ok">正常</span>'
         verdict = "問題は見つかりませんでした"
+    elif diag.healthy:
+        badge = '<span class="badge-warn">問題なし (一部未評価)</span>'
+        verdict = "評価できた範囲では問題は見つかりませんでした"
     else:
         n_crit = sum(1 for f in diag.findings if f.severity == Severity.CRITICAL)
         n_warn = sum(1 for f in diag.findings if f.severity == Severity.WARNING)
@@ -711,11 +797,31 @@ def _summary_section(diag: Diagnosis) -> str:
     return f"""
 <h2>① サマリ</h2>
 <p>{badge} &nbsp; {_esc(verdict)}</p>
-<table>
+{_coverage_html(diag)}<table>
   <thead><tr><th></th><th>ルールID</th><th>対象</th><th>サマリ</th><th>確信度</th></tr></thead>
   <tbody>{finding_rows}</tbody>
 </table>
 """
+
+
+def _coverage_html(diag: Diagnosis) -> str:
+    """Coverage line plus, when incomplete, the table of unevaluated rules."""
+    coverage = _coverage_summary(diag)
+    if coverage is None:
+        return ""
+    html = f"<p>{_esc(coverage)}</p>\n"
+    if diag.skipped_rules:
+        rows = "".join(
+            f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(r.title)}</td>"
+            f"<td>{r.required_hours:.1f} 時間</td><td>あと {r.remaining_hours:.1f} 時間</td></tr>"
+            for r in _skipped_by_wait(diag)
+        )
+        html += (
+            "<table>\n  <thead><tr><th>未評価ルール</th><th>内容</th>"
+            "<th>必要な観測時間</th><th>残り</th></tr></thead>\n"
+            f"  <tbody>{rows}</tbody>\n</table>\n"
+        )
+    return html
 
 
 def _proposal_section(diag: Diagnosis) -> str:
@@ -759,8 +865,8 @@ def _charts_section(charts: "ChartData | None") -> str:
     if charts is None:
         return html + "<p>チャートデータなし。</p>"
 
-    core_pct = CpuSinglecoreRule.core_pct_threshold
-    psi_pct = CpuSaturationRule.psi_threshold
+    core_pct = charts.core_pct_threshold
+    psi_pct = charts.psi_cpu_threshold
     mem_y_max = max(v for _, v in charts.mem_used) * 1.1 if charts.mem_used else None
     svgs = [
         _polyline_svg(

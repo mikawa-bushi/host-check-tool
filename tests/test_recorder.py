@@ -346,7 +346,7 @@ class FakeDiskSampler(Sampler):
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
         self.run_count += 1
         ts = 4000.0 + self.run_count
-        row = (ts, "/", 100 * 1024**3, 50 * 1024**3)
+        row = (ts, "/", 100 * 1024**3, 50 * 1024**3, None, None, 0)
         return [SampleBatch(table="disk_samples", rows=[row])]
 
     def collect_dirs(self, ctx: RunContext) -> list[SampleBatch]:

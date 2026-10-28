@@ -808,3 +808,56 @@ class TestNoData:
         assert diag.no_data is False
         assert diag.healthy is True
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Rule coverage — a short recording must not read as "all clear"
+# ---------------------------------------------------------------------------
+
+
+class TestRuleCoverage:
+    def _short_diag(self, tmp_path):
+        store = make_db(tmp_path, hours=1.0)
+        add_sys_baseline(store, hours=1.0)
+        diag = Engine(_cfg(min_obs_hours=6.0)).run(store)
+        store.close()
+        return diag
+
+    def test_short_recording_lists_skipped_rules(self, tmp_path):
+        diag = self._short_diag(tmp_path)
+        skipped = {r.rule_id: r for r in diag.skipped_rules}
+        assert "MEM-LEAK-01" in skipped and "MEM-PRESSURE-01" in skipped
+        assert skipped["MEM-PRESSURE-01"].required_hours == 24.0
+        assert 22.0 < skipped["MEM-PRESSURE-01"].remaining_hours <= 24.0
+        # Instantaneous rules still ran.
+        assert "SWAP-THRASH-01" in diag.evaluated_rules
+        assert not diag.fully_evaluated
+        assert diag.healthy  # coverage is reported separately from health
+
+    def test_crashing_rule_is_counted_as_errored(self, tmp_path, monkeypatch):
+        from procdiag.diagnosis.memory import SwapThrashRule
+
+        def _boom(self, store, window):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(SwapThrashRule, "evaluate", _boom)
+        diag = self._short_diag(tmp_path)
+        assert diag.errored_rules == ["SWAP-THRASH-01"]
+        assert "SWAP-THRASH-01" not in diag.evaluated_rules
+
+    def test_outputs_state_the_partial_coverage(self, tmp_path):
+        import json
+
+        from procdiag.report import render_html, render_json, render_terminal
+
+        diag = self._short_diag(tmp_path)
+        text = render_terminal(diag, color=False)
+        assert "評価できた範囲では問題は見つかりませんでした" in text
+        assert "件のみ評価" in text and "未評価: MEM-PRESSURE-01" in text
+
+        data = json.loads(render_json(diag))
+        assert {r["rule_id"] for r in data["skipped_rules"]} >= {"MEM-LEAK-01"}
+        assert "SWAP-THRASH-01" in data["evaluated_rules"]
+
+        html = render_html(diag, None)
+        assert "問題なし (一部未評価)" in html and "未評価ルール" in html

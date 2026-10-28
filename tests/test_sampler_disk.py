@@ -23,6 +23,7 @@ import pytest
 from procdiag.config import ProcdiagConfig, SamplingConfig, WatchDir
 from procdiag.core.sampler import RunContext
 from procdiag.samplers.disk import DiskSampler, _scan_dir
+from procdiag.storage import TABLE_COLUMNS
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -53,10 +54,11 @@ class TestDiskCollect:
         sampler = DiskSampler()
         ctx = _make_ctx()
         batch = sampler.collect(ctx)[0]
-        # At minimum the root filesystem must be present and have 4 columns.
+        # At minimum the root filesystem must be present, with every column.
+        width = len(TABLE_COLUMNS["disk_samples"])
         assert len(batch.rows) >= 1, "少なくとも1パーティションが必要"
         for row in batch.rows:
-            assert len(row) == 4, f"列数が不正 (期待4, 実際{len(row)}): {row}"
+            assert len(row) == width, f"列数が不正 (期待{width}, 実際{len(row)}): {row}"
 
     def test_root_filesystem_present(self):
         sampler = DiskSampler()
@@ -77,10 +79,32 @@ class TestDiskCollect:
         ctx = _make_ctx()
         batch = sampler.collect(ctx)[0]
         for row in batch.rows:
-            ts, mp, total, used = row
+            ts, mp, total, used, inodes_total, inodes_used, read_only = row
             assert total > 0, f"{mp}: total={total}"
             assert used >= 0, f"{mp}: used={used}"
             assert used <= total, f"{mp}: used={used} > total={total}"
+            assert read_only in (0, 1)
+            if inodes_total is not None:
+                assert 0 <= inodes_used <= inodes_total
+
+
+class TestMountState:
+    def test_read_only_flag_parsed_from_options(self):
+        from procdiag.samplers.disk import is_read_only
+
+        assert is_read_only("ro,relatime")
+        assert not is_read_only("rw,relatime,errors=remount-ro")
+        assert not is_read_only("")
+
+    def test_inode_usage_not_applicable_when_fs_reports_zero(self, monkeypatch):
+        import procdiag.samplers.disk as disk_mod
+
+        class _St:
+            f_files = 0
+            f_ffree = 0
+
+        monkeypatch.setattr(disk_mod.os, "statvfs", lambda p: _St())
+        assert disk_mod._inode_usage("/") == (None, None)
 
 
 # ---------------------------------------------------------------------------

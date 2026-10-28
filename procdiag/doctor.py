@@ -26,7 +26,7 @@ from __future__ import annotations
 import functools
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -53,6 +53,10 @@ class DoctorCheck:
     label: str  # 日本語表示名
     status: str  # "ok" | "degraded" | "info"
     detail: str  # 日本語。降格時は §2.1 の「降格時の挙動」に相当する影響説明
+
+    def to_dict(self) -> dict[str, str]:
+        """The ``doctor --format json`` entry (also written by ``bundle``)."""
+        return asdict(self)
 
 
 # (status, detail) as returned by a check body.

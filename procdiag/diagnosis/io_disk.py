@@ -590,8 +590,12 @@ class DiskJournalRule(Rule):
     journal_path_prefix: str = "/var/log/journal"
 
     def configure(self, config: "ProcdiagConfig") -> None:
-        """Take the warning threshold from ``config.rules.journal_size_warn_gb``."""
+        """Take the warning threshold from ``config.rules.journal_size_warn_gb``.
+
+        An explicit ``rules.overrides["DISK-JOURNAL-01"]`` entry still wins.
+        """
         self.journal_size_warn_gb = config.rules.journal_size_warn_gb
+        super().configure(config)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-JOURNAL-01 against the observation window."""
@@ -651,4 +655,180 @@ class DiskJournalRule(Rule):
                 )
             )
 
+        return findings
+
+
+# ---------------------------------------------------------------------------
+# DISK-INODE-01
+# ---------------------------------------------------------------------------
+
+
+@register
+class DiskInodeRule(Rule):
+    """Detect inode exhaustion — "No space left on device" with free bytes.
+
+    Millions of small files (spool, cache, session files) can use up a
+    filesystem's inode table long before its bytes run out.  Byte-based
+    DISK-FULL-01 cannot see that, so this rule checks the latest inode usage
+    per mount-point and extrapolates its growth like DISK-FULL-01 does.
+    Filesystems without a fixed inode table (btrfs) record NULL and are skipped.
+    """
+
+    rule_id = "DISK-INODE-01"
+    category = "io_disk"
+    title = "inode 枯渇"
+    default_severity = Severity.WARNING
+    min_observation_hours = 0.0  # the current usage alone is decisive
+    what = "disk_samples の inodes_used / inodes_total の最新値と増加傾向を確認する"
+    why = (
+        "小さなファイルが大量にあると、容量に空きがあっても inode が尽きて"
+        "書き込みが失敗する。容量ベースの DISK-FULL-01 では検出できない"
+    )
+    manual_commands = [
+        "df -i",
+        "sudo du --inodes -x / 2>/dev/null | sort -n | tail -20",
+    ]
+
+    warning_pct: float = 90.0
+    critical_pct: float = 95.0
+    warning_days: float = _DISK_FULL_WARNING_DAYS
+    critical_days: float = _DISK_FULL_CRITICAL_DAYS
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        """Run DISK-INODE-01 against the observation window."""
+        if not store.has_column("disk_samples", "inodes_total"):
+            return []  # DB recorded before schema v4
+        rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
+
+        by_mount: dict[str, list] = {}
+        for row in rows:
+            if row["inodes_total"] and row["inodes_used"] is not None:
+                by_mount.setdefault(row["mountpoint"], []).append(row)
+
+        findings: list[Finding] = []
+        for mountpoint, mrows in by_mount.items():
+            last = mrows[-1]
+            total, used = last["inodes_total"], last["inodes_used"]
+            used_pct = used / total * 100.0
+            days_left = extrapolate_full(
+                [(r["ts"], float(r["inodes_used"])) for r in mrows],
+                float(total),
+                min_points=3,
+            )
+            by_level = used_pct >= self.warning_pct
+            by_trend = days_left is not None and days_left <= self.warning_days
+            if not (by_level or by_trend):
+                continue
+
+            critical = used_pct >= self.critical_pct or (
+                days_left is not None and days_left <= self.critical_days
+            )
+            bytes_pct = last["used"] / last["total"] * 100.0 if last["total"] else None
+            evidence = {
+                "mountpoint": mountpoint,
+                "inodes_used": used,
+                "inodes_total": total,
+                "used_pct": round(used_pct, 1),
+                "bytes_used_pct": (
+                    round(bytes_pct, 1) if bytes_pct is not None else None
+                ),
+                "days_left": days_left,
+                "warning_pct": self.warning_pct,
+            }
+            summary = f"{mountpoint}: inode 使用率 {used_pct:.1f}%" + (
+                f" (約 {days_left:.1f}日で枯渇)" if days_left is not None else ""
+            )
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=Severity.CRITICAL if critical else Severity.WARNING,
+                    subject=mountpoint,
+                    summary=summary,
+                    evidence=evidence,
+                    detected_at=(window.start_ts, window.end_ts),
+                    # A measured level is certain; a trend-only hit is a forecast.
+                    confidence=Confidence.HIGH if by_level else Confidence.MEDIUM,
+                )
+            )
+        return findings
+
+
+# ---------------------------------------------------------------------------
+# FS-READONLY-01
+# ---------------------------------------------------------------------------
+
+
+@register
+class FsReadOnlyRule(Rule):
+    """Detect a filesystem that switched to read-only while recording.
+
+    ext4/xfs remount themselves read-only (``errors=remount-ro``) when they
+    hit an I/O or metadata error — every later write then fails although the
+    disk is not full.  A rw→ro transition is reported as CRITICAL; a root
+    filesystem that is read-only for the whole window as WARNING (other
+    always-read-only mounts are assumed intentional).
+    """
+
+    rule_id = "FS-READONLY-01"
+    category = "io_disk"
+    title = "ファイルシステムの読み取り専用化"
+    default_severity = Severity.CRITICAL
+    min_observation_hours = 0.0
+    what = "disk_samples の read_only フラグが記録中に 0→1 へ変わったマウントを検出する"
+    why = (
+        "ファイルシステムはエラーを検出すると自動的に読み取り専用で再マウントされる。"
+        "容量に空きがあっても以後の書き込みがすべて失敗する"
+    )
+    manual_commands = [
+        "grep ' ro,' /proc/mounts",
+        "journalctl -k | grep -iE 'remount|EXT4-fs error|I/O error'",
+    ]
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        """Run FS-READONLY-01 against the observation window."""
+        if not store.has_column("disk_samples", "read_only"):
+            return []  # DB recorded before schema v4
+        rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
+
+        flags: dict[str, list[tuple[float, int]]] = {}
+        for row in rows:
+            if row["read_only"] is not None:
+                flags.setdefault(row["mountpoint"], []).append(
+                    (row["ts"], row["read_only"])
+                )
+
+        findings: list[Finding] = []
+        for mountpoint, series in flags.items():
+            switched_at = next(
+                (
+                    ts
+                    for (_, prev), (ts, cur) in zip(series, series[1:])
+                    if not prev and cur
+                ),
+                None,
+            )
+            still_ro = bool(series[-1][1])
+            if switched_at is not None:
+                severity, confidence = Severity.CRITICAL, Confidence.HIGH
+                summary = f"{mountpoint}: 記録中に読み取り専用へ切り替わりました"
+            elif still_ro and all(flag for _, flag in series) and mountpoint == "/":
+                severity, confidence = Severity.WARNING, Confidence.MEDIUM
+                summary = "/: ルートファイルシステムが読み取り専用で稼働しています"
+            else:
+                continue
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=severity,
+                    subject=mountpoint,
+                    summary=summary,
+                    evidence={
+                        "mountpoint": mountpoint,
+                        "switched_at": switched_at,
+                        "still_read_only": still_ro,
+                    },
+                    detected_at=(switched_at or window.start_ts, window.end_ts),
+                    confidence=confidence,
+                )
+            )
         return findings

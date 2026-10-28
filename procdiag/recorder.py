@@ -133,6 +133,9 @@ class Recorder:
         self._start_mono: float = 0.0
         self._last_retention_mono: float = 0.0
         self._last_gap_mono: float = float("-inf")
+        self._boot_time: float = 0.0
+        # sessions row of this run (None when it could not be opened).
+        self._session_id: Optional[int] = None
         self._flush_interval = 60.0
         self._retention_interval = 3600.0
 
@@ -149,16 +152,23 @@ class Recorder:
         """
         from .samplers.cgroup import CgroupSampler  # type: ignore[import]
         from .samplers.disk import DiskSampler  # type: ignore[import]
+        from .samplers.kernel_log import KernelLogSampler  # type: ignore[import]
         from .samplers.process import ProcessSampler  # type: ignore[import]
+        from .samplers.service import ServiceSampler  # type: ignore[import]
         from .samplers.system import SystemSampler  # type: ignore[import]
         from .samplers.thermal import ThermalSampler  # type: ignore[import]
 
         return {
             "system": SystemSampler(),
             "cgroup": CgroupSampler(resolve_cg=self._storage.cg_id_for),
-            "process": ProcessSampler(resolve_proc=self._storage.proc_id_for),
+            "process": ProcessSampler(
+                resolve_proc=self._storage.proc_id_for,
+                record_fd_limits=self._storage.set_proc_fd_limits,
+            ),
             "disk": DiskSampler(),
             "thermal": ThermalSampler(),
+            "service": ServiceSampler(),
+            "kernel_log": KernelLogSampler(),
         }
 
     def _build_trigger(self) -> Any:
@@ -204,6 +214,7 @@ class Recorder:
             boot_time = psutil.boot_time()
         except Exception:
             boot_time = 0.0
+        self._boot_time = boot_time
 
         self._storage.write_meta(
             {
@@ -309,6 +320,12 @@ class Recorder:
         """Flush buffer, run incremental rollup, and (hourly) retention."""
         self._storage.flush(reason="interval")
         self._storage.rollup_incremental()
+        if self._session_id is not None:
+            # Heartbeat: after a power cut this is when the host went down.
+            try:
+                self._storage.touch_session(self._session_id)
+            except Exception:
+                logger.exception("セッション生存記録の例外")
 
         now_mono = self._clock()
         if now_mono - self._last_retention_mono >= self._retention_interval:
@@ -417,6 +434,16 @@ class Recorder:
         except Exception:
             logger.exception("メタデータ書き込み例外")
 
+        # Open this run's session row (UNCLEAN-SHUTDOWN-01 compares sessions).
+        try:
+            self._session_id = self._storage.start_session(
+                boot_time=self._boot_time,
+                hostname=socket.gethostname(),
+                procdiag_version=_VERSION,
+            )
+        except Exception:
+            logger.exception("セッション開始記録の例外")
+
         # Setup all samplers.
         for name, sampler in self._samplers.items():
             try:
@@ -458,6 +485,14 @@ class Recorder:
         sched.add("t3_disk", sc.disk_interval, partial(self._run_sampler, "disk"))
         sched.add(
             "t3_thermal", sc.thermal_interval, partial(self._run_sampler, "thermal")
+        )
+        sched.add(
+            "t3_service", sc.service_interval, partial(self._run_sampler, "service")
+        )
+        sched.add(
+            "t3_kernel_log",
+            sc.kernel_log_interval,
+            partial(self._run_sampler, "kernel_log"),
         )
         sched.add("t3_dir", sc.dir_scan_interval, self._job_dir_scan)
         sched.add("flush", self._flush_interval, self._job_flush)
@@ -502,6 +537,8 @@ class Recorder:
             # idempotent, so it is safe on the stop path.
             self._storage.rollup_incremental()
             self._storage.record_event("stopped", "正常終了")
+            if self._session_id is not None:
+                self._storage.end_session(self._session_id)
         except Exception:
             logger.exception("シャットダウン例外")
 
@@ -518,7 +555,12 @@ class Recorder:
     # ------------------------------------------------------------------
 
     def _register_signals(self) -> None:
-        """Register SIGTERM/SIGINT handlers if we are in the main thread."""
+        """Register SIGTERM/SIGINT/SIGHUP handlers if we are in the main thread.
+
+        SIGHUP (the terminal running a foreground ``record`` was closed) is a
+        deliberate stop too; without a handler the process would die without
+        closing its session, which would read as an unclean shutdown.
+        """
         if threading.current_thread() is not threading.main_thread():
             return
 
@@ -529,6 +571,7 @@ class Recorder:
         try:
             signal.signal(signal.SIGTERM, _handler)
             signal.signal(signal.SIGINT, _handler)
+            signal.signal(signal.SIGHUP, _handler)
         except (OSError, ValueError):
             # Can happen in non-main threads or restricted environments.
             pass

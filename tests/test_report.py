@@ -429,7 +429,8 @@ class TestBuildCharts:
             rows = []
             for i in range(5):
                 ts = base_ts + i * 60
-                rows.append((ts, "/", 100_000_000_000, 50_000_000_000 + i * 1_000_000))
+                used = 50_000_000_000 + i * 1_000_000
+                rows.append((ts, "/", 100_000_000_000, used, None, None, 0))
             store.buffer("disk_samples", rows)
             store.flush()
 

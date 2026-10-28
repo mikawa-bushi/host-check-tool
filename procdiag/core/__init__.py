@@ -6,8 +6,24 @@ that holds each name — mirrors netdiag's ``core/__init__.py``.
 
 from __future__ import annotations
 
-from .result import Confidence, Diagnosis, Finding, ObservationQuality, Severity, Window
-from .rule import Rule, all_rules, get_rule, register, registry_names
+from .result import (
+    Confidence,
+    Diagnosis,
+    Finding,
+    ObservationQuality,
+    Severity,
+    SkippedRule,
+    Window,
+)
+from .rule import (
+    Rule,
+    all_rules,
+    configure_rule,
+    get_rule,
+    register,
+    registry_names,
+    validate_rule_overrides,
+)
 from .sampler import (
     RunContext,
     SampleBatch,
@@ -37,12 +53,15 @@ __all__ = [
     "Finding",
     "ObservationQuality",
     "Diagnosis",
+    "SkippedRule",
     # rule
     "Rule",
     "register",
     "get_rule",
     "all_rules",
     "registry_names",
+    "configure_rule",
+    "validate_rule_overrides",
     # sampler
     "SampleBatch",
     "SystemSnapshot",

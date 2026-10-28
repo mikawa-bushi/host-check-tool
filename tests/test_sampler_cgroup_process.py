@@ -318,9 +318,44 @@ class TestProcessSampler:
         ctx = _make_ctx()
         sampler.setup(ctx)
         batches = sampler.collect(ctx)
-        assert len(batches) == 1
-        assert batches[0].table == "proc_samples"
+        assert [b.table for b in batches] == ["proc_samples", "proc_counts"]
         assert len(batches[0].rows) > 0
+        ((_ts, total, zombies),) = batches[1].rows
+        assert total == len(batches[0].rows) and 0 <= zombies <= total
+
+    def test_zombies_counted_and_fd_limits_recorded(self):
+        """Zombie state comes from oneshot's status(); limits once per identity."""
+        recorded: list[tuple[int, int, int]] = []
+        stub = _ProcStub()
+        sampler = ProcessSampler(
+            resolve_proc=stub, record_fd_limits=lambda *a: recorded.append(a)
+        )
+        ctx = _make_ctx()
+
+        def _proc(pid: int, status: str) -> MagicMock:
+            m = MagicMock(spec=psutil.Process)
+            m.pid = pid
+            m.name.return_value = "worker"
+            m.cmdline.return_value = ["worker"]
+            m.status.return_value = status
+            m.cpu_percent.return_value = 0.0
+            m.memory_info.return_value = MagicMock(rss=0)
+            m.num_threads.return_value = 1
+            m.num_fds.return_value = 3
+            m.io_counters.return_value = MagicMock(read_bytes=0, write_bytes=0)
+            m.rlimit.return_value = (1024, 524288)
+            return m
+
+        procs = {10: _proc(10, psutil.STATUS_ZOMBIE), 11: _proc(11, "sleeping")}
+        with (
+            patch("psutil.pids", return_value=list(procs)),
+            patch("psutil.Process", side_effect=lambda pid: procs[pid]),
+        ):
+            batches = sampler.collect(ctx)
+
+        assert batches[1].rows[0][1:] == (2, 1)  # total, zombies
+        # Both PIDs share one identity ("worker"), so the limit is recorded once.
+        assert len(recorded) == 1 and recorded[0][1:] == (1024, 524288)
 
     def test_row_column_count(self):
         sampler, _ = self._sampler()

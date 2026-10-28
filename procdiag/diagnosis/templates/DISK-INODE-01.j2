@@ -1,0 +1,5 @@
+[検出] マウントポイント「{{ evidence.mountpoint }}」の inode 使用率が {{ evidence.used_pct }}% ({{ evidence.inodes_used }} / {{ evidence.inodes_total }}){% if evidence.days_left is not none %}、現在の増加率では約 {{ "%.1f"|format(evidence.days_left) }}日で枯渇する見込み{% endif %}{% if evidence.bytes_used_pct is not none %} (容量の使用率は {{ evidence.bytes_used_pct }}%){% endif %}
+[根拠] disk_samples の inodes_used / inodes_total (statvfs) の最新値{% if evidence.days_left is not none %}と線形外挿{% endif %}。警告しきい値は {{ evidence.warning_pct }}%。inode が尽きると容量に空きがあっても「No space left on device」で新規ファイルを作れません。
+[暫定対処] `df -i {{ evidence.mountpoint }}` で状況を確認し、`sudo du --inodes -x {{ evidence.mountpoint }} | sort -n | tail -20` でファイル数の多いディレクトリを特定して、不要な小ファイル (一時ファイル・キャッシュ・セッションファイル等) を削除してください。
+[恒久対処] 小ファイルを大量に生成しているアプリケーションの保存方式 (定期削除・アーカイブ化・ローテーション) を見直してください。ファイル数が本質的に多い用途では、inode 数を増やしてファイルシステムを作り直す (`mkfs.ext4 -N` / `-i`) か、inode 上限のない XFS / btrfs への移行を検討してください。
+[影響予測] inode が枯渇すると、ログ出力・一時ファイル作成・DB の WAL 作成などあらゆる新規ファイル作成が失敗し、サービス停止やデータ欠落につながります。{% if evidence.days_left is not none and evidence.days_left < 7 %} 緊急対応が必要です。{% endif %}

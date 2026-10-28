@@ -23,9 +23,11 @@ htmlcov/
 *.db-wal
 *.db-shm
 
-# reports
+# reports / bundles / offline wheelhouses
 report.html
 report.json
+procdiag-bundle-*.tar.gz
+procdiag-wheelhouse-*
 
 # OS
 .DS_Store

@@ -119,6 +119,25 @@ class ObservationQuality:
 
 
 @dataclass
+class SkippedRule:
+    """A selected rule that could not run because the recording is too short."""
+
+    rule_id: str
+    title: str
+    required_hours: float  # minimum observation the rule needs
+    remaining_hours: float  # how much longer to record before it can run
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain-dict representation."""
+        return {
+            "rule_id": self.rule_id,
+            "title": self.title,
+            "required_hours": self.required_hours,
+            "remaining_hours": self.remaining_hours,
+        }
+
+
+@dataclass
 class Diagnosis:
     """Aggregated result of running all rules against the stored data.
 
@@ -131,6 +150,15 @@ class Diagnosis:
     reasoning: list[str] = field(default_factory=list)  # verbose trace
     quality: ObservationQuality = field(default_factory=ObservationQuality)
     no_data: bool = False  # True when the DB held no samples at all (see engine)
+    # Rule coverage: a "healthy" verdict only speaks for the rules that ran.
+    evaluated_rules: list[str] = field(default_factory=list)
+    skipped_rules: list[SkippedRule] = field(default_factory=list)
+    errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
+
+    @property
+    def fully_evaluated(self) -> bool:
+        """True when every selected rule ran to completion."""
+        return not self.skipped_rules and not self.errored_rules
 
     @property
     def primary(self) -> Finding | None:
