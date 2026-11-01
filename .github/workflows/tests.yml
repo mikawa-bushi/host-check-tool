@@ -1,21 +1,36 @@
-name: Tests
+name: CI
 
-# Lint (ruff) and the full pytest suite on every push and PR.  The Black
-# workflow only checks formatting; this one guards behaviour.
+# Formatting (black), lint (ruff) and the full pytest suite in one workflow.
+# It is kept to two short jobs per push so the organisation stays inside the
+# free Actions minutes (private repos: 2,000 Linux minutes / month, every job
+# rounded up to a whole minute).
 on:
   push:
     branches:
       - '**'  # '*' would not match branch names containing '/'
-  pull_request:
-    branches:
-      - '**'
+    paths-ignore:  # documentation-only pushes cannot change test results
+      - '**.md'
+      - 'docs/**'
+      - 'plans/**'
+      - 'tasks/**'
+      - 'LICENSE'
+  # No pull_request trigger: PR branches live in this repo, so their pushes
+  # already run above and a second trigger would double the minutes.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same branch makes the running check obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung test would otherwise bill up to the 6 h job limit.
+    timeout-minutes: 10
     name: pytest (Python ${{ matrix.python-version }})
     strategy:
       fail-fast: false
@@ -49,6 +64,12 @@ jobs:
     # ``procdiag`` console script used by the E2E tests is on the venv PATH.
     - name: Install dependencies
       run: poetry install
+
+    # Formatting does not depend on the Python version; check it once.
+    # Fix locally with ``black .`` (or the pre-commit hook).
+    - name: Check formatting (black)
+      if: matrix.python-version == '3.12'
+      run: poetry run black --check --diff .
 
     - name: Lint (ruff)
       run: poetry run ruff check .

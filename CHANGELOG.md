@@ -39,6 +39,7 @@
 - スキーマ版 4: `disk_samples` に inode 数・読み取り専用フラグ、`proc_registry` に FD 上限の列を追加し、`proc_counts` / `service_events` / `kernel_events` / `sessions` テーブルを新設。既存 DB は書き込み時に自動移行 (列追加は再実行しても安全)、読み取り専用で開いた旧 DB では新ルールが黙ってスキップされる。
 - `procdiag record` が SIGHUP (端末を閉じた) でも正常停止するようになった。
 - `status` / `export` / `prune` が `--config` を受け付け、DB の場所や保持期間を設定ファイルから解決するようになった (`--db` 指定が優先)。
+- CI を GitHub Actions の無料枠に収まるよう整理: Black のワークフローを `tests.yml` (CI) に統合して `black --check` を 1 回だけ実行し、失敗時に Black で整形して自動コミットするジョブは廃止 (整形は手元の `black .` / pre-commit で行う)。PR との二重実行・ドキュメントのみの push での実行をやめ、同じブランチの古い実行は中断、ジョブは 10 分で打ち切る。手動実行 (`workflow_dispatch`) に対応。
 - `procdiag status` が sys_samples 全行を読み込まず SQL 集計 (期間・自己負荷・直近イベント) で表示するようになった。長期記録の DB でも即座に応答する。
 - `procdiag --version` が `procdiag.__version__` を表示するようになった (レポート/JSON の版数表記と一致)。
 
