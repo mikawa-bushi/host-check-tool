@@ -120,6 +120,19 @@ class TestCgroupSamplerV2:
         assert batch.table == "cg_samples"
         assert len(batch.rows) > 0
 
+    def test_first_collect_soon_after_boot(self):
+        """Units are enumerated on the first collect even right after boot.
+
+        time.monotonic() counts from boot on Linux, so a recorder started by
+        systemd at boot sees values below the 5-minute enumeration TTL.
+        """
+        sampler, _ = self._sampler()
+        ctx = _make_ctx(cgroup_root=CGROUP_TREE)
+        sampler.setup(ctx)
+        with patch("procdiag.samplers.cgroup.time.monotonic", return_value=10.0):
+            batches = sampler.collect(ctx)
+        assert len(batches[0].rows) == 3  # cron, mysql, nginx
+
     def test_row_column_count(self):
         sampler, _ = self._sampler()
         ctx = _make_ctx(cgroup_root=CGROUP_TREE)

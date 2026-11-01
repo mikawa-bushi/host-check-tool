@@ -120,8 +120,11 @@ class CgroupSampler(Sampler):
         # Cumulative cpu_usec / io bytes per (unit_path, counter) -> deltas.
         self._deltas = CounterDelta()
         # Cached list of unit paths and the time it was last refreshed.
+        # -inf, not 0.0: time.monotonic() counts from boot on Linux, so a
+        # recorder started at boot would otherwise skip enumeration (and record
+        # no cgroups) until the host had been up for _ENUM_CACHE_TTL.
         self._units: list[str] = []
-        self._units_refreshed: float = 0.0
+        self._units_refreshed: float = float("-inf")
         self._enabled: bool = False  # set by setup()
 
     def setup(self, ctx: RunContext) -> None:
