@@ -52,6 +52,6 @@ config = ProcdiagConfig(
     ),
     report=ReportConfig(
         lang="ja",
-        hostname_label=None,  # レポート表題用ラベル 例: "L3ライン制御PC"
+        hostname_label=None,  # レポート表題用ラベル 例: "ライン制御PC"
     ),
 )

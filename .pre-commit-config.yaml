@@ -39,7 +39,7 @@ repos:
       - id: ruff-check
         args: ["--fix"]
 
-  # --- author/committer メールの許可リスト（社用/別 identity の混入防止） ---
+  # --- author/committer メールの許可リスト（別 identity の混入防止） ---
   - repo: local
     hooks:
       - id: check-commit-identity

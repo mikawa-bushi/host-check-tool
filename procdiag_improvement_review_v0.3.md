@@ -117,7 +117,7 @@
 
 - **場所**: `cli.py:245`（`color = sys.stdout.isatty() and not no_color`）/ `report.py:49-52`
 - **現状**: 色制御は `--no-color` フラグと `isatty` のみで、`NO_COLOR`（[no-color.org](https://no-color.org) 慣習）を一切参照しない。
-- **問題**: TTY だが色を嫌う環境（screen/tmux キャプチャ、色非対応ページャ、社内標準で `NO_COLOR` 設定）で毎回 `--no-color` を付け忘れると ANSI エスケープが記録/貼り付けに混入する。出力を手順書やチケットへ転記する現場で実害。
+- **問題**: TTY だが色を嫌う環境（screen/tmux キャプチャ、色非対応ページャ、組織の標準で `NO_COLOR` 設定）で毎回 `--no-color` を付け忘れると ANSI エスケープが記録/貼り付けに混入する。出力を手順書やチケットへ転記する現場で実害。
 - **改善案**: 色判定を `core/util.py` に集約（`should_use_color(no_color_flag)`）し、`os.environ.get("NO_COLOR")` を条件に追加。check/doctor 双方が使う。
 - **影響: 中 / 工数: 極小 / 種別: improvement**
 
@@ -268,7 +268,7 @@
 #### 3-8. ホスト固有ベースライン（EXT-04）
 
 - **場所/現状**: `trend.py` に `fit_linear`/`extrapolate_full` はあるが、曜日×時間帯別の median/MAD 学習は無い。`config.py` にベースライン用パラメータも無い。
-- **問題**: 「CPU 平均 45% は異常か通常か」を絶対閾値だけで判断するのは脆い。製造現場は「平日 8:00–17:00 稼働」など強い周期性があり、「普段のこの時間帯比」での相対判定が誤検知を減らす。
+- **問題**: 「CPU 平均 45% は異常か通常か」を絶対閾値だけで判断するのは脆い。現場によっては「平日の日中だけ稼働」など強い周期性があり、「普段のこの時間帯比」での相対判定が誤検知を減らす。
 - **改善案**: 90 日 rollup から曜日×時間帯ビンの median/MAD（stdlib `statistics`）を学習し、Finding の evidence に「普段比 +150% / +3σ」を**併記**（絶対閾値による昇格/降格はせず併記から始める＝誤検知抑制方針を崩さない）。**record 外・決定論・非 root**。
 - **影響: 中 / 工数: 中 / 種別: feature**
 

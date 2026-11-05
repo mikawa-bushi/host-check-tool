@@ -389,7 +389,7 @@ config = ProcdiagConfig(
         dir_scan_interval=3600.0,
         watch_dirs=[
             WatchDir(path="/var/log", time_budget_sec=10),
-            WatchDir(path="/opt/lineapp/data"),
+            WatchDir(path="/opt/myapp/data"),
         ],
         cmdline_normalize=True,
     ),
@@ -416,7 +416,7 @@ config = ProcdiagConfig(
     ),
     report=ReportConfig(
         lang="ja",
-        hostname_label=None,        # レポート表題用(例: "L3ライン制御PC")
+        hostname_label=None,        # レポート表題用(例: "ライン制御PC")
     ),
 )
 ```

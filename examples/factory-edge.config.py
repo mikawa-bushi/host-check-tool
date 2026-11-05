@@ -27,7 +27,7 @@ config = ProcdiagConfig(
         watch_dirs=[
             WatchDir(path="/var/log", time_budget_sec=10),
             WatchDir(path="/var/log/journal"),  # DISK-JOURNAL-01 用
-            WatchDir(path="/opt/lineapp/data"),  # ライン業務アプリのデータ置き場
+            WatchDir(path="/opt/myapp/data"),  # 業務アプリのデータ置き場
         ],
         cmdline_normalize=True,  # 数字引数をプレースホルダに置換してプロセス台帳爆発を防ぐ
     ),
@@ -56,6 +56,6 @@ config = ProcdiagConfig(
     ),
     report=ReportConfig(
         lang="ja",
-        hostname_label="L3ライン制御PC",  # レポート表題用ラベル
+        hostname_label="ライン制御PC",  # レポート表題用ラベル
     ),
 )

@@ -334,8 +334,8 @@ class TestRenderHtml:
         assert "テスト備考" in out
 
     def test_hostname_label_in_title(self) -> None:
-        out = render_html(_healthy_diag(), hostname_label="L3ライン制御PC")
-        assert "L3ライン制御PC" in out
+        out = render_html(_healthy_diag(), hostname_label="ライン制御PC")
+        assert "ライン制御PC" in out
 
     def test_summary_section_present(self) -> None:
         out = render_html(_finding_diag(), _charts_empty())
@@ -586,10 +586,10 @@ class TestRenderHtmlHostname:
     def test_hostname_label_takes_priority(self) -> None:
         html = render_html(
             _healthy_diag(),
-            hostname_label="L3ライン制御PC",
+            hostname_label="ライン制御PC",
             meta_hostname="factory-pc-01",
         )
-        assert "L3ライン制御PC" in html
+        assert "ライン制御PC" in html
 
     def test_default_title_when_neither(self) -> None:
         html = render_html(_healthy_diag())

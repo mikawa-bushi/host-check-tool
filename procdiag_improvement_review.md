@@ -185,7 +185,7 @@
   ```
 - **問題**: recorder は `meta` テーブルに `hostname` を保存している（`recorder.py:204`）のに、`render_html` は store を受け取らず meta を読まない。`config.report.hostname_label` を設定しない限りタイトルは常に「procdiag レポート」。
 - **改善案**: `render_html` か呼び出し側で `store.meta().get("hostname")` を渡し、`hostname_label or meta_hostname or 既定` の順で解決。複数ホストのレポートを並べたとき区別できる。
-- **理由**: 工場で複数 PC を診断する用途（`hostname_label` 例「L3ライン制御PC」が示す通り）では、どのホストのレポートか一目で分かることが重要。
+- **理由**: 工場で複数 PC を診断する用途（`hostname_label` 例「ライン制御PC」が示す通り）では、どのホストのレポートか一目で分かることが重要。
 
 ### 5-2. `is_python` 判定が広すぎる
 

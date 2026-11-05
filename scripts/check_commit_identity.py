@@ -4,7 +4,7 @@
 origin のどのブランチにも未到達のコミット（＝これから push されるコミット）を
 走査し、author か committer の名前・メールが許可リスト外なら push を中止する。
 秘密情報スキャナはファイル内容しか見ず、コミットの著者メタデータは検査しない
-ため、社用/別 identity の混入（例: ``@example.com``）や、メールは noreply でも
+ため、別 identity の混入（例: ``@example.com``）や、メールは noreply でも
 名前に本名が入ったコミットはこのガードで防ぐ。
 
 許可リストは ``MONITOR_ALLOWED_EMAILS`` / ``MONITOR_ALLOWED_NAMES``
