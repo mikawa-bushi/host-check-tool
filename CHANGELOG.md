@@ -5,7 +5,14 @@
 ## [Unreleased]
 
 ### Added
-- タグ `vX.Y.Z` の push で PyPI へ公開する GitHub Actions ワークフロー (`.github/workflows/publish.yml`)。trusted publishing (OIDC) を使うため PyPI のトークンをどこにも保存しない。タグと `pyproject.toml` の版が一致し、タグのコミットが `main` 上にあることを確かめてからビルド・公開する。
+- タグ `vX.Y.Z` の push で PyPI へ公開する GitHub Actions ワークフロー (`.github/workflows/publish.yml`)。trusted publishing (OIDC) を使うため PyPI のトークンをどこにも保存しない。タグと `pyproject.toml` の版が一致し、タグのコミットが `main` 上にあって CI に通っていることを確かめてからビルド・公開する。
+
+### Changed
+- CI で試す Python を 3.10 / 3.12 から、対応範囲の最古と最新の 3.10 / 3.14 に変更。
+
+### Fixed
+- `docs/procdiag.md` の終了コード表に 3 (観測データなし) と 4 (前提条件エラー) が載っていなかった。
+- README の詳細ドキュメントへのリンクが相対パスで、PyPI のページからたどれなかった。
 
 ## [0.4.0] - 2026-11-05
 
