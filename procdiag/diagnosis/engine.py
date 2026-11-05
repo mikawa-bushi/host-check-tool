@@ -311,6 +311,8 @@ class Engine:
 
         # --- Step 4: fold ---
         findings = fold(raw_findings)
+        kept = {id(f) for f in findings}
+        folded = [f for f in raw_findings if id(f) not in kept]
 
         # --- Step 5: sort ---
         findings.sort(
@@ -340,6 +342,7 @@ class Engine:
             errored_rules=errored,
             uncovered_rules=uncovered,
             measurements=measurements,
+            folded=folded,
         )
 
     # ------------------------------------------------------------------

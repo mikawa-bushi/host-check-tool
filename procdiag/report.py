@@ -29,12 +29,10 @@ from typing import TYPE_CHECKING, List, Tuple
 import procdiag
 from procdiag.core import (
     Confidence,
-    CoverageGap,
     Diagnosis,
     ObservationQuality,
     Severity,
     SkippedRule,
-    UncoveredRule,
     configure_rule,
 )
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
@@ -285,19 +283,9 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
     return " / ".join(parts)
 
 
-def _uncovered_reason_ja(rule: UncoveredRule) -> str:
-    """``"期間内に sys_samples の記録がありません"`` / the old-DB wording."""
-    names = ", ".join(rule.missing)
-    if rule.reason is CoverageGap.SCHEMA_MISSING:
-        return f"DB の版が古く {names} がありません"
-    return f"期間内に {names} の記録がありません"
-
-
 def _uncovered_list(diag: Diagnosis) -> str:
     """``"CPU-SATURATION-01 (期間内に sys_samples の記録がありません), ..."``."""
-    return ", ".join(
-        f"{r.rule_id} ({_uncovered_reason_ja(r)})" for r in diag.uncovered_rules
-    )
+    return ", ".join(f"{r.rule_id} ({r.detail})" for r in diag.uncovered_rules)
 
 
 def _skipped_by_wait(diag: Diagnosis) -> List[SkippedRule]:
@@ -847,7 +835,7 @@ def _coverage_html(diag: Diagnosis) -> str:
     if diag.uncovered_rules:
         rows = "".join(
             f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(r.title)}</td>"
-            f"<td>{_esc(_uncovered_reason_ja(r))}</td></tr>"
+            f"<td>{_esc(r.detail)}</td></tr>"
             for r in diag.uncovered_rules
         )
         html += (

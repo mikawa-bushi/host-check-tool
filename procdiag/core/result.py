@@ -197,6 +197,14 @@ class UncoveredRule:
     reason: CoverageGap
     missing: tuple[str, ...]
 
+    @property
+    def detail(self) -> str:
+        """Japanese reason, e.g. ``"期間内に sys_samples の記録がありません"``."""
+        names = ", ".join(self.missing)
+        if self.reason is CoverageGap.SCHEMA_MISSING:
+            return f"DB の版が古く {names} がありません"
+        return f"期間内に {names} の記録がありません"
+
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict representation."""
         return {
@@ -228,6 +236,8 @@ class Diagnosis:
     # In memory only (never serialised by check): every measurement of every
     # evaluated measured rule; a key's presence means the rule ran.
     measurements: dict[str, list[Measurement]] = field(default_factory=dict)
+    # In memory only: findings fold() absorbed into a parent's ``related``.
+    folded: list[Finding] = field(default_factory=list)
 
     @property
     def fully_evaluated(self) -> bool:

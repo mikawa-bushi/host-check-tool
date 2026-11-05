@@ -358,7 +358,7 @@ def make_row(table: str, **values: Any) -> tuple:
 # ---------------------------------------------------------------------------
 
 # Raw high-frequency samples: kept for ``retention.raw`` (e.g. 48h).
-_RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
+RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
 # 1-minute rollups: keyed by ``ts_min`` and kept for ``retention.rollup``.
 _ROLLUP_TABLES = ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m")
 # Low-frequency raw samples that are cheap enough to keep as long as rollups.
@@ -379,7 +379,7 @@ _NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry", "sessions")
 # Every table, in the order ``counts()`` reports them.
 _ALL_TABLES = (
     *_NO_TS_TABLES,
-    *_RAW_TABLES,
+    *RAW_TABLES,
     *_LONG_LIVED_TABLES,
     "spike_events",
     "ops_events",
@@ -714,7 +714,7 @@ class Storage:
         rollup_cutoff = now - parse_duration(rollup)
 
         with self.conn:
-            raw_deleted = self._delete_before(_RAW_TABLES, raw_cutoff)
+            raw_deleted = self._delete_before(RAW_TABLES, raw_cutoff)
         with self.conn:
             rollup_deleted = self._delete_before(
                 _ROLLUP_TABLES + _LONG_LIVED_TABLES, rollup_cutoff
