@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- タグ `vX.Y.Z` の push で PyPI へ公開する GitHub Actions ワークフロー (`.github/workflows/publish.yml`)。trusted publishing (OIDC) を使うため PyPI のトークンをどこにも保存しない。タグと `pyproject.toml` の版が一致し、タグのコミットが `main` 上にあることを確かめてからビルド・公開する。
+
 ## [0.4.0] - 2026-11-05
 
 ### Added
