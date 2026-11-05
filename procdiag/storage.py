@@ -1149,6 +1149,18 @@ class Storage:
         ).fetchone()
         return row["name"] if row else f"proc_{proc_id}"
 
+    def proc_identities(self) -> Dict[int, Tuple[str, str]]:
+        """``{proc_id: (name, cmdline_hash)}`` for every registered process.
+
+        One (cached, on a read-only Storage) query, so rules that label every
+        process they measure do not issue a lookup per process.  The pair is
+        ``proc_registry``'s UNIQUE key and is stable across DBs.
+        """
+        return {
+            r["proc_id"]: (r["name"], r["cmdline_hash"])
+            for r in self.rows("proc_registry")
+        }
+
     def proc_first_seen(self, proc_id: int) -> Optional[float]:
         """Return the ``first_seen`` timestamp for *proc_id*, or None.
 

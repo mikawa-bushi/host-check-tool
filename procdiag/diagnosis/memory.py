@@ -23,12 +23,15 @@ Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 from ..core import (
     Confidence,
     Finding,
+    Headline,
+    MeasuredRule,
     MiB,
+    Observation,
     Rule,
     Severity,
     Window,
@@ -43,6 +46,8 @@ from .trend import (
     fit_linear,
     group_series,
     learn_baseline,
+    observed_fit,
+    proc_trend_observations,
 )
 
 if TYPE_CHECKING:
@@ -116,7 +121,7 @@ def _is_python_process(name: str) -> bool:
 
 
 @register
-class MemLeakRule(Rule):
+class MemLeakRule(MeasuredRule):
     """Detect per-process memory leaks via linear regression on RSS rollups.
 
     Queries ``proc_rollup_1m`` for each registered process, fits a line to
@@ -130,6 +135,7 @@ class MemLeakRule(Rule):
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
     requires_rows = ("proc_rollup_1m",)
+    headline = Headline("RSS 増加率", "MB/h", threshold="slope_warning_mb_h")
     what = "proc_rollup_1m の rss_avg に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "リークは『右肩上がりが続く』こと自体が証拠。"
@@ -145,22 +151,39 @@ class MemLeakRule(Rule):
     slope_critical_mb_h: float = _MEM_LEAK_SLOPE_CRITICAL_MB_H
     min_r2: float = _MEM_LEAK_MIN_R2
 
-    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
-        """Run MEM-LEAK-01 against the observation window."""
-        findings: list[Finding] = []
-
-        rss_by_proc = group_series(
+    def observe(self, store: "Storage", window: Window) -> list[Observation]:
+        """The RSS slope (MB/h) of every process with enough rollup points."""
+        return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
-            key="proc_id",
-            value="rss_avg",
+            store.proc_identities(),
+            "rss_avg",
+            min_span_hours=self.min_observation_hours,
+            unit=MiB,
         )
 
-        # Read the host's current boot time once (reboot-crossing escalation,
-        # EXT-03).  Absent / unparseable boot_time simply disables the check.
-        try:
-            boot_time: float | None = float(store.meta().get("boot_time", "")) or None
-        except (TypeError, ValueError):
-            boot_time = None
+    def judge(
+        self, store: "Storage", window: Window, obs: Observation
+    ) -> Optional[Finding]:
+        """A sustained (R²) slope at or above the warning threshold."""
+        fit = observed_fit(obs, MiB)
+        slope_mb_h = obs.value
+        if fit.r2 < self.min_r2 or slope_mb_h < self.slope_warning_mb_h:
+            return None
+
+        proc_id = obs.evidence["proc_id"]
+        process_name = obs.subject
+
+        # Severity escalation.
+        severity = (
+            Severity.CRITICAL
+            if slope_mb_h >= self.slope_critical_mb_h
+            else Severity.WARNING
+        )
+
+        # Confidence from R² × observation time (baseline).
+        confidence = confidence_from_fit(
+            fit, min_observation_hours=self.min_observation_hours
+        )
 
         # Total memory for the (very rough) days-to-OOM extrapolation, from the
         # last sys_sample of the window.
@@ -168,81 +191,57 @@ class MemLeakRule(Rule):
         sys_rows = store.rows("sys_samples", since=window.start_ts, until=window.end_ts)
         if sys_rows and sys_rows[-1]["mem_available"] is not None:
             total_mem = sys_rows[-1]["mem_used"] + sys_rows[-1]["mem_available"]
+        days_to_oom = (
+            days_until(obs.evidence["last_value"], total_mem, MiB * slope_mb_h)
+            if total_mem
+            else None
+        )
 
-        for proc_id, series, fit in fit_each(
-            rss_by_proc,
-            min_points=12,
-            min_span_hours=self.min_observation_hours,
-            min_r2=self.min_r2,
-        ):
-            slope_mb_h = fit.slope_per_hour / MiB
-            if slope_mb_h < self.slope_warning_mb_h:
-                continue
+        evidence = {
+            "proc_id": proc_id,
+            "process_name": process_name,
+            "slope_mb_per_h": slope_mb_h,
+            "r2": fit.r2,
+            "n": fit.n,
+            "span_hours": fit.span_hours,
+            "is_python": _is_python_process(process_name),
+            "days_to_oom": days_to_oom,
+        }
 
-            process_name = store.proc_name(proc_id)
+        confidence = self._apply_pss_evidence(
+            store, window, proc_id, confidence, evidence
+        )
 
-            # Severity escalation.
-            severity = (
-                Severity.CRITICAL
-                if slope_mb_h >= self.slope_critical_mb_h
-                else Severity.WARNING
-            )
+        # Reboot-crossing escalation (EXT-03): a leaking identity whose
+        # first_seen predates the current boot has recurred across at least
+        # one reboot, pointing at a systemic (driver/config) cause.  Promote
+        # MEDIUM -> HIGH and record it.  Existing data only; offline/non-root.
+        # Absent / unparseable boot_time simply disables the check.
+        try:
+            boot_time: float | None = float(store.meta().get("boot_time", "")) or None
+        except (TypeError, ValueError):
+            boot_time = None
+        if boot_time is not None:
+            first_seen = store.proc_first_seen(proc_id)
+            if first_seen is not None and first_seen < boot_time:
+                evidence["predates_current_boot"] = True
+                if confidence == Confidence.MEDIUM:
+                    confidence = Confidence.HIGH
 
-            # Confidence from R² × observation time (baseline).
-            confidence = confidence_from_fit(
-                fit, min_observation_hours=self.min_observation_hours
-            )
+        summary = (
+            f"{process_name}: RSS +{slope_mb_h:.1f} MB/h で単調増加"
+            f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
+        )
 
-            days_to_oom = (
-                days_until(series[-1][1], total_mem, MiB * slope_mb_h)
-                if total_mem
-                else None
-            )
-
-            evidence = {
-                "proc_id": proc_id,
-                "process_name": process_name,
-                "slope_mb_per_h": slope_mb_h,
-                "r2": fit.r2,
-                "n": fit.n,
-                "span_hours": fit.span_hours,
-                "is_python": _is_python_process(process_name),
-                "days_to_oom": days_to_oom,
-            }
-
-            confidence = self._apply_pss_evidence(
-                store, window, proc_id, confidence, evidence
-            )
-
-            # Reboot-crossing escalation (EXT-03): a leaking identity whose
-            # first_seen predates the current boot has recurred across at least
-            # one reboot, pointing at a systemic (driver/config) cause.  Promote
-            # MEDIUM -> HIGH and record it.  Existing data only; offline/non-root.
-            if boot_time is not None:
-                first_seen = store.proc_first_seen(proc_id)
-                if first_seen is not None and first_seen < boot_time:
-                    evidence["predates_current_boot"] = True
-                    if confidence == Confidence.MEDIUM:
-                        confidence = Confidence.HIGH
-
-            summary = (
-                f"{process_name}: RSS +{slope_mb_h:.1f} MB/h で単調増加"
-                f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
-            )
-
-            findings.append(
-                Finding(
-                    rule_id=self.rule_id,
-                    severity=severity,
-                    subject=process_name,
-                    summary=summary,
-                    evidence=evidence,
-                    detected_at=(window.start_ts, window.end_ts),
-                    confidence=confidence,
-                )
-            )
-
-        return findings
+        return Finding(
+            rule_id=self.rule_id,
+            severity=severity,
+            subject=process_name,
+            summary=summary,
+            evidence=evidence,
+            detected_at=(window.start_ts, window.end_ts),
+            confidence=confidence,
+        )
 
     @staticmethod
     def _apply_pss_evidence(

@@ -34,6 +34,8 @@ from ..core import (
     CoverageGap,
     Diagnosis,
     Finding,
+    MeasuredRule,
+    Measurement,
     ObservationQuality,
     Rule,
     Severity,
@@ -243,6 +245,7 @@ class Engine:
         skipped: list[SkippedRule] = []
         errored: list[str] = []
         uncovered: list[UncoveredRule] = []
+        measurements: dict[str, list[Measurement]] = {}
         coverage_cache: dict[tuple[str, str], bool] = {}
 
         for rule_cls in rule_classes:
@@ -275,7 +278,11 @@ class Engine:
                 uncovered.append(gap)
                 continue
             try:
-                found = rule.evaluate(store, window)
+                if isinstance(rule, MeasuredRule):
+                    measured = rule.assess(store, window)
+                    found = [m.finding for m in measured if m.finding]
+                else:
+                    found = rule.evaluate(store, window)
             except Exception as exc:
                 msg = (
                     f"ルール {rule.rule_id} で例外が発生しました: "
@@ -287,6 +294,8 @@ class Engine:
                 errored.append(rule.rule_id)
                 continue
             evaluated.append(rule.rule_id)
+            if isinstance(rule, MeasuredRule):
+                measurements[rule.rule_id] = measured
 
             if self.verbose and found:
                 for f in found:
@@ -330,6 +339,7 @@ class Engine:
             skipped_rules=skipped,
             errored_rules=errored,
             uncovered_rules=uncovered,
+            measurements=measurements,
         )
 
     # ------------------------------------------------------------------

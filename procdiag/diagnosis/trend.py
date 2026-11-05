@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Hashable, Iterable, Iterator, Mapping, Optional
 
-from ..core import Confidence
+from ..core import Confidence, Observation
 
 # ---------------------------------------------------------------------------
 # TrendFit — result of linear regression
@@ -139,6 +139,23 @@ def group_series(
     return out
 
 
+def fit_all(
+    series_by_key: Mapping[Hashable, list[tuple[float, float]]],
+    *,
+    min_points: int,
+    min_span_hours: float,
+) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
+    """Yield ``(key, series, fit)`` for every series :func:`fit_linear` accepts.
+
+    No R² gate: a flat, noisy series (R² near 0) is the evidence that a leak
+    is gone, so the measuring side of a rule needs its slope too.
+    """
+    for key, series in series_by_key.items():
+        fit = fit_linear(series, min_points=min_points, min_span_hours=min_span_hours)
+        if fit is not None:
+            yield key, series, fit
+
+
 def fit_each(
     series_by_key: Mapping[Hashable, list[tuple[float, float]]],
     *,
@@ -146,18 +163,60 @@ def fit_each(
     min_span_hours: float,
     min_r2: float,
 ) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
-    """Yield ``(key, series, fit)`` for every series whose line fit is reliable.
+    """:func:`fit_all` restricted to fits with ``r2 >= min_r2`` (a sustained trend).
 
-    A series is skipped when :func:`fit_linear` declines it (too few points or
-    too short a span) or when its R² is below *min_r2* — i.e. the growth is
-    not a sustained trend.  The slope threshold stays with the caller because
-    each rule states it in its own unit (MB/h, FDs/h, threads/h).
+    The slope threshold stays with the caller because each rule states it in
+    its own unit (MB/h, FDs/h, threads/h).
     """
-    for key, series in series_by_key.items():
-        fit = fit_linear(series, min_points=min_points, min_span_hours=min_span_hours)
-        if fit is None or fit.r2 < min_r2:
-            continue
-        yield key, series, fit
+    for key, series, fit in fit_all(
+        series_by_key, min_points=min_points, min_span_hours=min_span_hours
+    ):
+        if fit.r2 >= min_r2:
+            yield key, series, fit
+
+
+def proc_trend_observations(
+    rows: Iterable[Mapping[str, Any]],
+    identities: Mapping[int, tuple[str, str]],
+    column: str,
+    *,
+    min_span_hours: float,
+    unit: float = 1.0,
+) -> list[Observation]:
+    """One Observation per process whose *column* series can be fitted.
+
+    *rows* are ``proc_rollup_1m`` rows, *identities* is
+    ``Storage.proc_identities()``; the value is the slope per hour in
+    multiples of *unit*.
+    """
+    observations = []
+    for proc_id, series, fit in fit_all(
+        group_series(rows, key="proc_id", value=column),
+        min_points=12,
+        min_span_hours=min_span_hours,
+    ):
+        name, cmdline_hash = identities.get(proc_id, (f"proc_{proc_id}", None))
+        observations.append(
+            Observation(
+                subject=name,
+                identity=cmdline_hash,
+                value=fit.slope_per_hour / unit,
+                evidence={
+                    "proc_id": proc_id,
+                    "r2": fit.r2,
+                    "n": fit.n,
+                    "span_hours": fit.span_hours,
+                    "last_value": series[-1][1],
+                },
+            )
+        )
+    return observations
+
+
+def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:
+    """The :class:`TrendFit` behind a trend observation."""
+    ev = obs.evidence
+    return TrendFit(obs.value * unit, ev["r2"], ev["n"], ev["span_hours"])
 
 
 def days_until(current: float, limit: float, slope_per_hour: float) -> Optional[float]:

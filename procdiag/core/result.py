@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 
 class Severity(str, Enum):
@@ -137,6 +137,44 @@ class SkippedRule:
         }
 
 
+@dataclass(frozen=True)
+class Headline:
+    """What a measured rule's ``Observation.value`` means, for people.
+
+    Lower values are better for every measured rule.  ``threshold`` names the
+    tunable that ``judge`` compares the value against, so a reader of the
+    value (``compare``) takes the configured threshold from the rule itself.
+    """
+
+    label: str  # "RSS 増加率"
+    unit: str  # "MB/h"
+    threshold: str  # e.g. "slope_warning_mb_h"
+    digits: int = 1
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One subject's measured value over a window, before any threshold.
+
+    ``identity`` tells two subjects with the same name apart across DBs
+    (the process's cmdline hash); None for host-wide subjects.  ``evidence``
+    is JSON-serialisable and carries what ``judge`` needs (r2, n, ...).
+    """
+
+    subject: str
+    identity: Optional[str]
+    value: float
+    evidence: dict
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """An observation and the Finding ``judge`` made of it (None = declined)."""
+
+    observation: Observation
+    finding: Optional[Finding]
+
+
 class CoverageGap(str, Enum):
     """Why a selected rule's input data cannot speak for the window."""
 
@@ -187,6 +225,9 @@ class Diagnosis:
     skipped_rules: list[SkippedRule] = field(default_factory=list)
     errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
     uncovered_rules: list[UncoveredRule] = field(default_factory=list)
+    # In memory only (never serialised by check): every measurement of every
+    # evaluated measured rule; a key's presence means the rule ran.
+    measurements: dict[str, list[Measurement]] = field(default_factory=dict)
 
     @property
     def fully_evaluated(self) -> bool:

@@ -11,6 +11,9 @@ from .result import (
     CoverageGap,
     Diagnosis,
     Finding,
+    Headline,
+    Measurement,
+    Observation,
     ObservationQuality,
     Severity,
     SkippedRule,
@@ -18,6 +21,7 @@ from .result import (
     Window,
 )
 from .rule import (
+    MeasuredRule,
     Rule,
     all_rules,
     configure_rule,
@@ -58,8 +62,12 @@ __all__ = [
     "SkippedRule",
     "UncoveredRule",
     "CoverageGap",
+    "Headline",
+    "Observation",
+    "Measurement",
     # rule
     "Rule",
+    "MeasuredRule",
     "register",
     "get_rule",
     "all_rules",
