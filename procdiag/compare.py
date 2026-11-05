@@ -7,13 +7,14 @@ rules (:class:`~procdiag.core.MeasuredRule`) contribute a value on a side
 where nothing fired, so a fix reads "38.0 → 0.2 MB/h"; a side that cannot
 judge a subject says why instead of reading as fixed.
 
-Public surface: :func:`plan_request`, :func:`build_comparison`,
-:func:`exit_code`, :class:`CompareError` and the result types the
-renderers in ``report.py`` read.
+Public surface: :func:`plan_request`, :func:`run_compare`,
+:func:`build_comparison`, :func:`exit_code`, :class:`CompareError` and the
+result types the renderers in ``report.py`` read.
 """
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -32,7 +33,8 @@ from .core import (
     get_rule,
 )
 from .core.result import CoverageGap
-from .storage import RAW_TABLES
+from .diagnosis import Engine
+from .storage import RAW_TABLES, Storage, StorageVersionError
 
 if TYPE_CHECKING:
     from .config import ProcdiagConfig
@@ -672,3 +674,109 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
     if after_hits and not exit_zero_on_info:
         return 2
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Reading the DBs
+# ---------------------------------------------------------------------------
+
+
+def _resolve(store: Storage, period: Period) -> Optional[tuple[Window, float]]:
+    """Clip *period* to what was recorded: ``(window, raw_hours)`` or None.
+
+    The extent is the union of raw and rollup system rows, not
+    ``window_bounds()``, which prefers raw rows and would cut a week to the
+    last 48 hours.  ``until`` is exclusive, so a row stamped exactly at the
+    split belongs to the after side.
+    """
+    until = None if period.until is None else period.until - 1e-3
+    bounds = [
+        b
+        for t in ("sys_samples", "sys_rollup_1m")
+        if (b := store.time_bounds(t, period.since, until)) is not None
+    ]
+    if not bounds:
+        return None
+    window = Window(min(b[0] for b in bounds), max(b[1] for b in bounds))
+    raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
+    return window, (raw[1] - raw[0]) / 3600.0 if raw else 0.0
+
+
+def _evaluate_side(
+    name: SideName,
+    store: Storage,
+    period: Period,
+    engine: Engine,
+    only: Optional[list[str]],
+    skip: Optional[list[str]],
+) -> Side:
+    meta = store.meta()
+    resolved = _resolve(store, period)
+    result = None
+    if resolved is not None:
+        window, raw_hours = resolved
+        diag = engine.run(store, only=only, skip=skip, window=window)
+        result = Evaluated(window, raw_hours, diag)
+    return Side(
+        name=name,
+        db=store.path,
+        hostname=meta.get("hostname"),
+        schema_version=meta.get("schema_version"),
+        recording_config=meta.get("config"),
+        requested=period,
+        result=result,
+    )
+
+
+def _open(stack: ExitStack, db: Path) -> Storage:
+    try:
+        return stack.enter_context(Storage(db, read_only=True))
+    except StorageVersionError as exc:
+        raise CompareError(f"{db}: {exc}") from exc
+
+
+def run_compare(
+    config: "ProcdiagConfig",
+    request: CompareRequest,
+    *,
+    only: Optional[list[str]] = None,
+    skip: Optional[list[str]] = None,
+    verbose: bool = False,
+) -> Comparison:
+    """Diagnose both periods with the same rules and thresholds, then compare.
+
+    Raises :class:`CompareError` for overlapping periods in one DB and for a
+    DB written by a newer procdiag.  Read-only throughout.
+    """
+    engine = Engine(config, verbose=verbose)
+    if isinstance(request, SplitRequest):
+        before_db = after_db = request.db
+    else:
+        before_db, after_db = request.before_db, request.after_db
+    same_db = before_db.resolve() == after_db.resolve()
+    if same_db and isinstance(request, PeriodsRequest):
+        check_order(request.before, request.after)
+    with ExitStack() as stack:
+        after_store = _open(stack, after_db)
+        before_store = after_store if same_db else _open(stack, before_db)
+        if isinstance(request, SplitRequest):
+            after = _evaluate_side(
+                SideName.AFTER,
+                after_store,
+                Period(request.at, None),
+                engine,
+                only,
+                skip,
+            )
+            span = after.result.window.span_hours if after.result else 0.0
+            hours = max(span, engine.required_hours(only=only, skip=skip))
+            before_period = Period(request.at - hours * 3600.0, request.at)
+        else:
+            after = _evaluate_side(
+                SideName.AFTER, after_store, request.after, engine, only, skip
+            )
+            before_period = request.before
+        before = _evaluate_side(
+            SideName.BEFORE, before_store, before_period, engine, only, skip
+        )
+    return build_comparison(before, after, config)

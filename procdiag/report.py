@@ -11,6 +11,8 @@ Public API (called by cli.py):
     render_json(diag) -> str
     render_html(diag, charts=None, *, hostname_label=None, meta_hostname=None) -> str
     build_charts(store, *, since=None) -> ChartData
+    render_comparison_terminal(cmp, *, color=True, verbose=False) -> str
+    render_comparison_json(cmp) -> str
 
 ChartData is a dataclass whose fields hold (ts, value) series for the main
 system metrics, plus a ``spikes`` list for the spike-event section in HTML.
@@ -22,14 +24,29 @@ import html as _html_lib
 import json
 import logging
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Tuple
 
 import procdiag
+from procdiag.compare import (
+    COMPARE_FORMAT,
+    Clear,
+    Comparison,
+    ComparisonRow,
+    Detected,
+    Side,
+    SideName,
+    SideState,
+    Unknown,
+    Verdict,
+)
+from procdiag.compare import exit_code as compare_exit_code
 from procdiag.core import (
     Confidence,
     Diagnosis,
+    Headline,
     ObservationQuality,
     Severity,
     SkippedRule,
@@ -978,3 +995,252 @@ def _quality_section(q: ObservationQuality) -> str:
   {"".join(f"<p>備考: {_esc(n)}</p>" for n in q.notes)}
 </div>
 """
+
+
+# ---------------------------------------------------------------------------
+# procdiag compare (EXT-06)
+# ---------------------------------------------------------------------------
+
+
+def _local(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts).astimezone()
+
+
+def _iso(ts: float | None) -> str | None:
+    return None if ts is None else _local(ts).isoformat(timespec="seconds")
+
+
+def _value_text(state: SideState, headline: Headline) -> str:
+    if isinstance(state, Unknown) or state.value is None:
+        return "?"
+    return f"{state.value:.{headline.digits}f}"
+
+
+def _state_text(state: SideState) -> str:
+    if isinstance(state, Detected):
+        count = f", {state.count}件" if state.count > 1 else ""
+        return f"検出 ({state.severity.value}{count})"
+    if isinstance(state, Clear):
+        return "検出なし"
+    return "判定不能"
+
+
+def _row_change(row: ComparisonRow) -> str:
+    """``"RSS 増加率 38.0 → 0.2 MB/h"`` or ``"検出 (warning) → 検出なし"``."""
+    if row.headline is None:
+        return f"{_state_text(row.before)} → {_state_text(row.after)}"
+    h = row.headline
+    text = (
+        f"{h.label} {_value_text(row.before, h)} → {_value_text(row.after, h)} {h.unit}"
+    )
+    if isinstance(row.after, Detected):
+        text += f"  (修正後も {row.after.severity.value})"
+    elif (
+        isinstance(row.after, Clear)
+        and row.verdict is not Verdict.RESOLVED
+        and "r2" in row.after.evidence
+    ):
+        text += f"  (修正後 R²={row.after.evidence['r2']:.2f})"
+    return text
+
+
+def _period_text(side: Side, *, show_db: bool) -> str:
+    db = f"  [{side.db}]" if show_db else ""
+    res = side.result
+    if res is None:
+        return f"{side.name.label}: 期間内に記録がありません{db}"
+    start = _local(res.window.start_ts).strftime("%Y-%m-%d %H:%M")
+    end = _local(res.window.end_ts).strftime("%Y-%m-%d %H:%M")
+    return (
+        f"{side.name.label}: {start} 〜 {end}  {res.window.span_hours:.1f} 時間"
+        f" (うち生データ {res.raw_hours:.1f} 時間){db}"
+    )
+
+
+def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
+    """``[(rule_id, reason), ...]`` for every rule *side* could not run."""
+    if side.result is None:
+        return []
+    diag = side.result.diagnosis
+    return (
+        [(r.rule_id, f"あと {r.remaining_hours:.1f}h") for r in diag.skipped_rules]
+        + [(r.rule_id, r.detail) for r in diag.uncovered_rules]
+        + [(rid, "実行エラー") for rid in diag.errored_rules]
+    )
+
+
+def _compare_conclusion(cmp: Comparison) -> str:
+    code = compare_exit_code(cmp)
+    if code == 1:
+        return "修正後もまだ問題があります。"
+    if cmp.before.result is None or cmp.after.result is None:
+        return "片方の期間に記録がないため比較できません。"
+    if code == 3:
+        return "判定できない検出があります。記録を続けてから比べ直してください。"
+    if not cmp.rows:
+        return "どちらの期間にも問題は検出されませんでした。"
+    if all(r.verdict is Verdict.RESOLVED for r in cmp.rows):
+        return "修正前に検出された問題はすべて解消しました。"
+    if code == 2:
+        return "修正後は info の検出のみです。"
+    return "修正後に warning / critical の検出はありません。"
+
+
+def _cols(text: str) -> int:
+    """Terminal columns of *text* (CJK counts as two)."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+_VERDICT_ANSI = {
+    Verdict.WORSE: _ANSI[Severity.CRITICAL],
+    Verdict.NEW: _ANSI[Severity.CRITICAL],
+    Verdict.UNCHANGED: _ANSI[Severity.WARNING],
+    Verdict.NOT_EVALUABLE: _ANSI[Severity.WARNING],
+    Verdict.IMPROVED: _GREEN,
+    Verdict.RESOLVED: _GREEN,
+}
+
+
+def render_comparison_terminal(
+    cmp: Comparison, *, color: bool = True, verbose: bool = False
+) -> str:
+    """Plain-text / ANSI comparison: periods, notes, one line per row, result."""
+    show_db = cmp.before.db != cmp.after.db
+    zone = datetime.now().astimezone().strftime("%Z %z")
+    reset = _c(_RESET, color)
+    warn = _c(_ANSI[Severity.WARNING], color)
+    lines = [
+        _period_text(cmp.before, show_db=show_db),
+        _period_text(cmp.after, show_db=show_db),
+        f"時刻はこのホストのローカルタイム ({zone})",
+    ]
+    lines += [f"{warn}注意: {n.message}{reset}" for n in cmp.notes]
+    lines.append("")
+
+    width = max((_cols(r.label) for r in cmp.rows), default=0)
+    for row in cmp.rows:
+        col = _c(_VERDICT_ANSI[row.verdict], color)
+        label = row.label + " " * (width - _cols(row.label))
+        rule = f"[{row.rule_id}]".ljust(18)
+        lines.append(
+            f"{col}{row.verdict.symbol} {label}{reset}"
+            f"  {rule} {row.subject.ljust(16)} {_row_change(row)}"
+        )
+        for name, state in ((SideName.BEFORE, row.before), (SideName.AFTER, row.after)):
+            if isinstance(state, Unknown):
+                lines.append(f"      {name.label}: {state.detail}")
+        if verbose and isinstance(row.after, Detected) and row.after.finding.proposal:
+            lines += [f"      {p}" for p in row.after.finding.proposal.splitlines()]
+    if cmp.rows:
+        lines.append("")
+
+    for side in (cmp.before, cmp.after):
+        by_reason: dict[str, list[str]] = {}
+        for rid, why in _unevaluated_items(side):
+            by_reason.setdefault(why, []).append(rid)
+        if by_reason:
+            lines.append(f"{side.name.label}の未評価:")
+            lines += [f"  {', '.join(r)}: {why}" for why, r in by_reason.items()]
+
+    counts = [f"{v.label} {n} 件" for v, n in cmp.verdict_counts().items() if n]
+    summary = " / ".join(counts) + "。" if counts else ""
+    lines.append(f"{_c(_BOLD, color)}結果: {summary}{_compare_conclusion(cmp)}{reset}")
+
+    if verbose:
+        for side in (cmp.before, cmp.after):
+            if side.result and side.result.diagnosis.reasoning:
+                lines.append("")
+                lines.append(f"{_c(_BOLD, color)}推論過程 ({side.name.label}):{reset}")
+                lines += [f"  {s}" for s in side.result.diagnosis.reasoning]
+    return "\n".join(lines)
+
+
+def _state_dict(state: SideState) -> dict:
+    if isinstance(state, Detected):
+        return {
+            "state": "detected",
+            "severity": state.severity.value,
+            "count": state.count,
+            "value": state.value,
+            "confidence": state.finding.confidence.value,
+            "summary": state.finding.summary,
+        }
+    if isinstance(state, Clear):
+        return {"state": "clear", "value": state.value, "evidence": state.evidence}
+    return {"state": "unknown", "why": state.why.value, "detail": state.detail}
+
+
+def _side_dict(side: Side) -> dict:
+    res = side.result
+    diag = res.diagnosis if res else Diagnosis(findings=[], healthy=True)
+    return {
+        "db": str(side.db),
+        "hostname": side.hostname,
+        "schema_version": side.schema_version,
+        "requested": {
+            "since": _iso(side.requested.since),
+            "until": _iso(side.requested.until),
+        },
+        "window": (
+            {"start": _iso(res.window.start_ts), "end": _iso(res.window.end_ts)}
+            if res
+            else None
+        ),
+        "span_hours": res.window.span_hours if res else 0.0,
+        "raw_hours": res.raw_hours if res else 0.0,
+        "no_data": res is None,
+        "evaluated_rules": list(diag.evaluated_rules),
+        "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
+        "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
+        "errored_rules": list(diag.errored_rules),
+        "quality": diag.quality.to_dict() if res else None,
+    }
+
+
+def _row_dict(row: ComparisonRow) -> dict:
+    headline = None
+    if row.headline is not None:
+        headline = {
+            "label": row.headline.label,
+            "unit": row.headline.unit,
+            "threshold": row.threshold,
+        }
+    return {
+        "rule_id": row.rule_id,
+        "title": row.title,
+        "subject": row.subject,
+        "identity": row.identity,
+        "verdict": row.verdict.value,
+        "why": row.why.value,
+        "label": row.label,
+        "headline": headline,
+        "before": _state_dict(row.before),
+        "after": _state_dict(row.after),
+    }
+
+
+def render_comparison_json(cmp: Comparison) -> str:
+    """Stable JSON (``"format": "procdiag-compare/1"``); key names are frozen."""
+    notes = [
+        {
+            "kind": n.kind.value,
+            "side": n.side.value if n.side else None,
+            "detail": dict(n.detail),
+            "message": n.message,
+        }
+        for n in cmp.notes
+    ]
+    return json.dumps(
+        {
+            "format": COMPARE_FORMAT,
+            "verdict_counts": {v.value: n for v, n in cmp.verdict_counts().items()},
+            "rows": [_row_dict(r) for r in cmp.rows],
+            "before": _side_dict(cmp.before),
+            "after": _side_dict(cmp.after),
+            "notes": notes,
+            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+            "procdiag_version": procdiag.__version__,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )

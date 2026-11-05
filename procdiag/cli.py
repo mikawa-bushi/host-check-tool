@@ -430,6 +430,123 @@ cli.commands["advise"].hidden = True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
+# compare
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("dbs", nargs=-1, type=click.Path(), metavar="[BEFORE_DB AFTER_DB]")
+@_db_option("1 つの DB の 2 期間を比べるときの DB (既定: config の db_path)。")
+@_config_option("設定ファイルのパス。しきい値は両方の期間に同じものを使う。")
+@click.option(
+    "--at",
+    default=None,
+    help="対策した時刻。この前後で比べる (例: '2026-10-28 09:00')。",
+)
+@click.option(
+    "--before",
+    "before_spec",
+    default=None,
+    help="修正前の期間 START..END (END は含まない。片側は省略可)。",
+)
+@click.option(
+    "--after",
+    "after_spec",
+    default=None,
+    help="修正後の期間 START..END (END は含まない。片側は省略可)。",
+)
+@click.option("--only", default=None, help="カンマ区切りのルール ID のみ実行。")
+@click.option("--skip", default=None, help="カンマ区切りのルール ID をスキップ。")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="出力フォーマット。",
+)
+@click.option(
+    "--output", type=click.Path(), default=None, help="結果をファイルに書き出す。"
+)
+@click.option("--verbose", is_flag=True, help="推論過程と修正後の提案を表示する。")
+@click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
+@click.option(
+    "--exit-zero-on-info",
+    is_flag=True,
+    help="修正後が info のみのとき終了コード 0 を返す (既定は 2)。",
+)
+@_quiet_option
+def compare(
+    dbs: tuple[str, ...],
+    db_path: Optional[str],
+    config_path: Optional[str],
+    at: Optional[str],
+    before_spec: Optional[str],
+    after_spec: Optional[str],
+    only: Optional[str],
+    skip: Optional[str],
+    fmt: str,
+    output: Optional[str],
+    verbose: bool,
+    no_color: bool,
+    exit_zero_on_info: bool,
+    quiet: bool,
+) -> None:
+    """修正前と修正後の 2 期間 (または 2 つの DB) を同じルール・しきい値で比べます。
+
+    時刻はオフセットなしならこのホストのローカルタイムです
+    (例: '2026-10-28 09:00'、'2026-10-28T00:00Z')。
+
+    終了コード: 0=修正後に critical・warning なし (修正前の検出はすべて判定できた) /
+    1=修正後に critical・warning あり / 2=修正後に info のみ /
+    3=判定できない検出がある・期間に記録がない / 4=前提条件エラー
+    """
+    from . import report as report_mod
+    from .compare import CompareError, PeriodsRequest, plan_request, run_compare
+    from .compare import exit_code as compare_exit_code
+    from .core.util import should_use_color
+
+    if dbs and db_path:
+        click.echo("エラー: --db と DB の位置引数は同時に指定できません", err=True)
+        sys.exit(_EXIT_USAGE)
+    cfg = _load_config(config_path, db_path)
+    try:
+        request = plan_request(
+            dbs=dbs, default_db=cfg.db_path, at=at, before=before_spec, after=after_spec
+        )
+        paths = (
+            (request.before_db, request.after_db)
+            if isinstance(request, PeriodsRequest)
+            else (request.db,)
+        )
+        for path in paths:
+            if not path.exists():
+                click.echo(_DB_MISSING_MSG.format(db=path), err=True)
+                sys.exit(_EXIT_USAGE)
+        result = run_compare(
+            cfg, request, only=_split_ids(only), skip=_split_ids(skip), verbose=verbose
+        )
+    except CompareError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
+
+    if fmt == "json":
+        text = report_mod.render_comparison_json(result)
+    else:
+        text = report_mod.render_comparison_terminal(
+            result, color=should_use_color(no_color), verbose=verbose
+        )
+
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+        if not _is_quiet(quiet):
+            click.echo(f"比較結果を書き出しました: {output}")
+    else:
+        click.echo(text)
+
+    sys.exit(compare_exit_code(result, exit_zero_on_info=exit_zero_on_info))
+
+
+# ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
 
