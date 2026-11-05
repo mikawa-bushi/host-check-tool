@@ -369,6 +369,10 @@ _LONG_LIVED_TABLES = (
     "service_events",
     "kernel_events",
 )
+# Samplers that legitimately never write on some hosts (no thermal sensor, no
+# watch_dirs configured).  A table here with no rows anywhere in the DB means
+# "not collected on this host", not "the window has no data".
+OPTIONAL_SAMPLER_TABLES = frozenset({"thermal_samples", "dir_samples"})
 # Tables without a ``ts`` column (lookups, and the tiny session history that is
 # kept for good so reboots can be compared across the whole recording).
 _NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry", "sessions")
@@ -982,16 +986,28 @@ class Storage:
             result["db_bytes"] = 0
         return result
 
-    def time_bounds(self, table: str) -> Optional[Tuple[float, float]]:
+    def time_bounds(
+        self,
+        table: str,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
         """Return ``(min_ts, max_ts)`` of *table*, or ``None`` when it is empty.
 
+        *since* / *until* restrict the rows like :meth:`rows` (inclusive).
         Aggregated in SQL so callers that only need the recorded span (status,
         window detection) never materialise a long recording into Python.
         """
         ts_col = _ts_column(table)
-        row = self.conn.execute(
-            f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table}"
-        ).fetchone()
+        q = f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table} WHERE 1=1"
+        params: List[Any] = []
+        if since is not None:
+            q += f" AND {ts_col} >= ?"
+            params.append(since)
+        if until is not None:
+            q += f" AND {ts_col} <= ?"
+            params.append(until)
+        row = self.conn.execute(q, params).fetchone()
         if row is None or row["lo"] is None:
             return None
         return float(row["lo"]), float(row["hi"])

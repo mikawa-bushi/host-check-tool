@@ -83,6 +83,7 @@ class FdLeakRule(Rule):
     title = "ファイルディスクリプタリーク疑い"
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
+    requires_rows = ("proc_rollup_1m",)
     what = "proc_rollup_1m の fds_max に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "FD リークは open() のクローズ忘れによる単調増加として現れる。"
@@ -185,6 +186,7 @@ class ThreadLeakRule(Rule):
     title = "スレッドリーク疑い"
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
+    requires_rows = ("proc_rollup_1m",)
     what = "proc_rollup_1m の threads_max に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "スレッドリークはスレッドの生成後に join/detach が漏れる典型的バグ。"
@@ -284,6 +286,7 @@ class ZombieRule(Rule):
     title = "ゾンビプロセス増加疑い"
     default_severity = Severity.INFO
     min_observation_hours = 6.0
+    requires_rows = ("proc_samples",)
     what = (
         "プロセス走査ごとのゾンビ数 (proc_counts) を時系列化し、"
         "増加傾向を線形回帰で検出する"

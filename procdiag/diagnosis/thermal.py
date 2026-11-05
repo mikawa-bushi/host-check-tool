@@ -30,6 +30,7 @@ class ThermalThrottleRule(Rule):
     default_severity = Severity.WARNING
     # Thermal events are fast; do not gate on a long observation window.
     min_observation_hours = 0.0
+    requires_rows = ("thermal_samples",)
     what = "高温下で CPU クロックが最大値より継続的に低い状態を検出する"
     why = "PSI(需要)では区別できない物理的な熱制限を、温度×クロック比で識別するため"
     manual_commands = [

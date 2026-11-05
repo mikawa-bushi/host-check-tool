@@ -31,17 +31,20 @@ from jinja2 import Environment, FileSystemLoader
 from ..config import ProcdiagConfig
 from ..core import (
     Confidence,
+    CoverageGap,
     Diagnosis,
     Finding,
     ObservationQuality,
     Rule,
     Severity,
     SkippedRule,
+    UncoveredRule,
     Window,
     all_rules,
     configure_rule,
 )
 from ..plugins import load_extra_rules
+from ..storage import OPTIONAL_SAMPLER_TABLES
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -159,13 +162,33 @@ class Engine:
 
         return candidates
 
+    def required_hours(
+        self,
+        only: Optional[list[str]] = None,
+        skip: Optional[list[str]] = None,
+    ) -> float:
+        """The longest observation any selected rule needs (configured values)."""
+        self._load_extra_rules([])
+        return max(
+            (
+                self._required_hours(configure_rule(cls, self.config)[0])
+                for cls in self.select(only=only, skip=skip)
+            ),
+            default=0.0,
+        )
+
     def run(
         self,
         store: "Storage",
         only: Optional[list[str]] = None,
         skip: Optional[list[str]] = None,
+        *,
+        window: Optional[Window] = None,
     ) -> Diagnosis:
         """Evaluate all selected rules and return a :class:`Diagnosis`.
+
+        *window* defaults to the DB's own bounds (``check``); a given window
+        is used verbatim and ``no_data`` then means no system sample inside it.
 
         Steps:
 
@@ -178,7 +201,9 @@ class Engine:
            keep the class default follow ``config.rules.min_observation_hours``
            (one knob for the regression rules, per design §6.3/§8), while rules
            that override it (e.g. 0.0 for instantaneous checks like
-           SWAP-THRASH-01) use their own value.
+           SWAP-THRASH-01) use their own value.  A rule whose declared inputs
+           (``requires_schema`` / ``requires_rows``) are missing for the
+           window is not run and is listed in ``uncovered_rules``.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
         5. Sort by severity → confidence.
@@ -191,7 +216,13 @@ class Engine:
         self._load_extra_rules(reasoning)
 
         # --- Step 1: determine window ---
-        window, has_data = self._determine_window(store, reasoning)
+        if window is None:
+            window, has_data = self._determine_window(store, reasoning)
+        else:
+            has_data = any(
+                store.time_bounds(t, window.start_ts, window.end_ts) is not None
+                for t in ("sys_samples", "sys_rollup_1m")
+            )
 
         if not has_data:
             reasoning.append(
@@ -206,12 +237,13 @@ class Engine:
             )
 
         # --- Step 2: run rules (per-rule observation guard) ---
-        base_min_hours = Rule.min_observation_hours
         rule_classes = self.select(only=only, skip=skip)
         raw_findings: list[Finding] = []
         evaluated: list[str] = []
         skipped: list[SkippedRule] = []
         errored: list[str] = []
+        uncovered: list[UncoveredRule] = []
+        coverage_cache: dict[tuple[str, str], bool] = {}
 
         for rule_cls in rule_classes:
             rule, config_error = configure_rule(rule_cls, self.config)
@@ -219,11 +251,7 @@ class Engine:
                 reasoning.append(
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
-            eff_min = (
-                self.config.rules.min_observation_hours
-                if rule.min_observation_hours == base_min_hours
-                else rule.min_observation_hours
-            )
+            eff_min = self._required_hours(rule)
             if window.span_hours < eff_min:
                 reasoning.append(
                     f"{rule.rule_id}: 観測時間不足のためスキップ "
@@ -237,6 +265,14 @@ class Engine:
                         remaining_hours=eff_min - window.span_hours,
                     )
                 )
+                continue
+            gap = self._coverage_gap(store, rule, window, coverage_cache)
+            if gap is not None:
+                reasoning.append(
+                    f"{rule.rule_id}: 入力データが無いため未評価 "
+                    f"({', '.join(gap.missing)})"
+                )
+                uncovered.append(gap)
                 continue
             try:
                 found = rule.evaluate(store, window)
@@ -276,7 +312,9 @@ class Engine:
         )
 
         # --- Step 6: build quality ---
-        quality = self._build_quality(store, window)
+        # With no samples the window is a placeholder, so the DB-wide event
+        # counts are the only statement about the recorder that can be made.
+        quality = self._build_quality(store, window, events_in_window=has_data)
 
         healthy = not any(
             f.severity in (Severity.WARNING, Severity.CRITICAL) for f in findings
@@ -291,11 +329,62 @@ class Engine:
             evaluated_rules=evaluated,
             skipped_rules=skipped,
             errored_rules=errored,
+            uncovered_rules=uncovered,
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _required_hours(self, rule: Rule) -> float:
+        """Rules on the class default follow ``config.rules.min_observation_hours``."""
+        if rule.min_observation_hours == Rule.min_observation_hours:
+            return self.config.rules.min_observation_hours
+        return rule.min_observation_hours
+
+    @staticmethod
+    def _coverage_gap(
+        store: "Storage",
+        rule: Rule,
+        window: Window,
+        cache: dict[tuple[str, str], bool],
+    ) -> Optional[UncoveredRule]:
+        """Why *rule*'s declared inputs cannot speak for *window*, or None."""
+
+        def exists(name: str) -> bool:
+            key = ("schema", name)
+            if key not in cache:
+                table, _, column = name.partition(".")
+                cache[key] = (
+                    store.has_column(table, column)
+                    if column
+                    else store.has_table(table)
+                )
+            return cache[key]
+
+        def has_rows(table: str) -> bool:
+            key = ("rows", table)
+            if key not in cache:
+                inside = store.time_bounds(table, window.start_ts, window.end_ts)
+                cache[key] = inside is not None or (
+                    table in OPTIONAL_SAMPLER_TABLES
+                    and store.time_bounds(table) is None
+                )
+            return cache[key]
+
+        missing = tuple(
+            n for n in (*rule.requires_schema, *rule.requires_rows) if not exists(n)
+        )
+        if missing:
+            return UncoveredRule(
+                rule.rule_id, rule.title, CoverageGap.SCHEMA_MISSING, missing
+            )
+        empty = tuple(t for t in rule.requires_rows if not has_rows(t))
+        if empty:
+            return UncoveredRule(
+                rule.rule_id, rule.title, CoverageGap.NOT_RECORDED, empty
+            )
+        return None
 
     def _load_extra_rules(self, reasoning: list[str]) -> None:
         """Import ``config.rules.extra_rules`` so their @register decorators fire.
@@ -350,15 +439,19 @@ class Engine:
             reasoning.append(msg)
             return f"[提案テンプレートの生成に失敗: {exc}]"
 
-    def _build_quality(self, store: "Storage", window: Window) -> ObservationQuality:
-        """Assemble ObservationQuality from DB statistics."""
+    def _build_quality(
+        self, store: "Storage", window: Window, *, events_in_window: bool
+    ) -> ObservationQuality:
+        """Assemble ObservationQuality from DB statistics over *window*."""
         span_hours = window.span_hours
+        since, until = (
+            (window.start_ts, window.end_ts) if events_in_window else (None, None)
+        )
 
         # Gap total from ops_events: sum the delay seconds recorded in each
         # gap event's detail ("<delay>s ジョブ<name>"), not the event count.
         gap_rows = store.rows(
-            "ops_events",
-            where="kind = 'gap'",
+            "ops_events", since=since, until=until, where="kind = 'gap'"
         )
         gap_seconds = sum(_parse_gap_delay_seconds(r["detail"]) for r in gap_rows)
 
@@ -368,7 +461,11 @@ class Engine:
             window.start_ts, window.end_ts
         )
 
-        throttle_events = len(store.rows("ops_events", where="kind = 'throttle_down'"))
+        throttle_events = len(
+            store.rows(
+                "ops_events", since=since, until=until, where="kind = 'throttle_down'"
+            )
+        )
         missing_io_pct = store.missing_io_ratio(window.start_ts, window.end_ts)
 
         notes: list[str] = []

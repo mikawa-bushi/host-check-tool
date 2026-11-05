@@ -129,6 +129,7 @@ class MemLeakRule(Rule):
     title = "メモリリーク疑い"
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
+    requires_rows = ("proc_rollup_1m",)
     what = "proc_rollup_1m の rss_avg に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "リークは『右肩上がりが続く』こと自体が証拠。"
@@ -309,6 +310,7 @@ class MemPressureRule(Rule):
     title = "慢性メモリ圧迫"
     default_severity = Severity.WARNING
     min_observation_hours = 24.0
+    requires_rows = ("sys_rollup_1m",)
     what = (
         "sys_rollup_1m の psi_mem_max が閾値超の時間帯が日次で反復するかを"
         "detect_recurrence で確認し、swap_out_sum > 0 も合わせて判定する"
@@ -453,6 +455,7 @@ class SwapThrashRule(Rule):
     title = "スワップスラッシング"
     default_severity = Severity.CRITICAL
     min_observation_hours = 0.0  # even a single event is worth reporting
+    requires_rows = ("sys_samples",)
     what = (
         "sys_samples で swap_in > 0 かつ swap_out > 0 かつ psi_mem_full10 > 0 が"
         "同一サンプルで同時発生したかを検出する"

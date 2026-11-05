@@ -29,10 +29,12 @@ from typing import TYPE_CHECKING, List, Tuple
 import procdiag
 from procdiag.core import (
     Confidence,
+    CoverageGap,
     Diagnosis,
     ObservationQuality,
     Severity,
     SkippedRule,
+    UncoveredRule,
     configure_rule,
 )
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
@@ -263,7 +265,8 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
     n_eval = len(diag.evaluated_rules)
     n_skip = len(diag.skipped_rules)
     n_err = len(diag.errored_rules)
-    total = n_eval + n_skip + n_err
+    n_unc = len(diag.uncovered_rules)
+    total = n_eval + n_skip + n_err + n_unc
     if total == 0 or diag.no_data:
         return None
     if diag.fully_evaluated:
@@ -275,9 +278,26 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
             f"観測時間不足で未評価 {n_skip} 件"
             f" (あと最長 {longest:.1f} 時間の記録で全ルールを評価できます)"
         )
+    if n_unc:
+        parts.append(f"記録データが無く未評価 {n_unc} 件")
     if n_err:
         parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
     return " / ".join(parts)
+
+
+def _uncovered_reason_ja(rule: UncoveredRule) -> str:
+    """``"期間内に sys_samples の記録がありません"`` / the old-DB wording."""
+    names = ", ".join(rule.missing)
+    if rule.reason is CoverageGap.SCHEMA_MISSING:
+        return f"DB の版が古く {names} がありません"
+    return f"期間内に {names} の記録がありません"
+
+
+def _uncovered_list(diag: Diagnosis) -> str:
+    """``"CPU-SATURATION-01 (期間内に sys_samples の記録がありません), ..."``."""
+    return ", ".join(
+        f"{r.rule_id} ({_uncovered_reason_ja(r)})" for r in diag.uncovered_rules
+    )
 
 
 def _skipped_by_wait(diag: Diagnosis) -> List[SkippedRule]:
@@ -361,6 +381,8 @@ def render_terminal(
             lines.append(f"{warn}⚠ {coverage}{_c(_RESET, color)}")
             if diag.skipped_rules:
                 lines.append(f"  未評価: {_skipped_list(diag)}")
+            if diag.uncovered_rules:
+                lines.append(f"  記録なしで未評価: {_uncovered_list(diag)}")
 
     # --- Observation quality block ---
     q = diag.quality
@@ -405,6 +427,7 @@ def render_json(diag: Diagnosis) -> str:
             "evaluated_rules": list(diag.evaluated_rules),
             "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
             "errored_rules": list(diag.errored_rules),
+            "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
             "quality": diag.quality.to_dict(),
             "reasoning": list(diag.reasoning),
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -819,6 +842,17 @@ def _coverage_html(diag: Diagnosis) -> str:
         html += (
             "<table>\n  <thead><tr><th>未評価ルール</th><th>内容</th>"
             "<th>必要な観測時間</th><th>残り</th></tr></thead>\n"
+            f"  <tbody>{rows}</tbody>\n</table>\n"
+        )
+    if diag.uncovered_rules:
+        rows = "".join(
+            f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(r.title)}</td>"
+            f"<td>{_esc(_uncovered_reason_ja(r))}</td></tr>"
+            for r in diag.uncovered_rules
+        )
+        html += (
+            "<table>\n  <thead><tr><th>記録なしで未評価</th><th>内容</th>"
+            "<th>理由</th></tr></thead>\n"
             f"  <tbody>{rows}</tbody>\n</table>\n"
         )
     return html

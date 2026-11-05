@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from .result import (
     Confidence,
+    CoverageGap,
     Diagnosis,
     Finding,
     ObservationQuality,
     Severity,
     SkippedRule,
+    UncoveredRule,
     Window,
 )
 from .rule import (
@@ -54,6 +56,8 @@ __all__ = [
     "ObservationQuality",
     "Diagnosis",
     "SkippedRule",
+    "UncoveredRule",
+    "CoverageGap",
     # rule
     "Rule",
     "register",

@@ -137,6 +137,38 @@ class SkippedRule:
         }
 
 
+class CoverageGap(str, Enum):
+    """Why a selected rule's input data cannot speak for the window."""
+
+    SCHEMA_MISSING = "schema_missing"  # DB recorded before the table / column existed
+    NOT_RECORDED = (
+        "not_recorded"  # no rows inside the window (raw retention, sampler off)
+    )
+
+
+@dataclass
+class UncoveredRule:
+    """A selected rule that was not run because its input data is missing.
+
+    ``missing`` names the tables (or ``table.column``) behind ``reason``.
+    Unlike :class:`SkippedRule`, recording longer does not help.
+    """
+
+    rule_id: str
+    title: str
+    reason: CoverageGap
+    missing: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain-dict representation."""
+        return {
+            "rule_id": self.rule_id,
+            "title": self.title,
+            "reason": self.reason.value,
+            "missing": list(self.missing),
+        }
+
+
 @dataclass
 class Diagnosis:
     """Aggregated result of running all rules against the stored data.
@@ -154,11 +186,16 @@ class Diagnosis:
     evaluated_rules: list[str] = field(default_factory=list)
     skipped_rules: list[SkippedRule] = field(default_factory=list)
     errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
+    uncovered_rules: list[UncoveredRule] = field(default_factory=list)
 
     @property
     def fully_evaluated(self) -> bool:
         """True when every selected rule ran to completion."""
-        return not self.skipped_rules and not self.errored_rules
+        return (
+            not self.skipped_rules
+            and not self.errored_rules
+            and not self.uncovered_rules
+        )
 
     @property
     def primary(self) -> Finding | None:

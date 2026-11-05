@@ -131,6 +131,7 @@ class OomKillRule(Rule):
     title = "OOM Killerによるプロセス強制終了"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0  # instantaneous — runs on any recording length
+    requires_rows = ("proc_samples", "sys_samples")
     what = (
         "プロセスの消滅タイミングと sys_samples のメモリ危機指標"
         "(psi_mem_full10 / swap_out / mem_available 急減)の相関で OOM kill を検出する"
@@ -414,6 +415,7 @@ class UncleanShutdownRule(Rule):
     title = "予期しない再起動・電源断"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
+    requires_schema = ("sessions",)
     what = (
         "記録セッションの履歴 (sessions) で、正常停止せずに次の起動 (boot) へ"
         "移ったセッションを検出する"
@@ -523,6 +525,7 @@ class ServiceRestartRule(Rule):
     title = "サービスの再起動ループ・failed"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
+    requires_schema = ("service_events",)
     what = "systemd の自動再起動回数 (NRestarts) の増加と failed 遷移をユニットごとに集計する"
     why = (
         "クラッシュ→自動再起動を繰り返すサービスは、その時点では active に見えるため"
@@ -539,8 +542,6 @@ class ServiceRestartRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run SERVICE-RESTART-01 against the observation window."""
-        if not store.has_table("service_events"):
-            return []
         rows = store.rows("service_events", since=window.start_ts, until=window.end_ts)
 
         by_unit: dict[str, list] = {}
@@ -630,6 +631,7 @@ class KernelErrorRule(Rule):
     title = "カーネルが記録した異常"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
+    requires_schema = ("kernel_events",)
     what = (
         "kernel_events (カーネルログから抽出した I/O エラー・FS エラー・ハングタスク・"
         "ハードウェアエラー・segfault・USB 切断) を種類別に集計する"
@@ -647,8 +649,6 @@ class KernelErrorRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run KERNEL-ERROR-01 against the observation window."""
-        if not store.has_table("kernel_events"):
-            return []
         rows = store.rows("kernel_events", since=window.start_ts, until=window.end_ts)
 
         by_kind: dict[str, list] = {}
