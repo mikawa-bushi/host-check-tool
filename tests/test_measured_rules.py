@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from synth import add_proc_series, add_sys_baseline, make_db
+from synth import add_proc_series, add_sys_baseline, add_zombie_series, make_db
 
 from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Headline, MeasuredRule
@@ -64,6 +64,47 @@ class TestMemLeakMeasurements:
         assert leaky.finding.evidence["slope_mb_per_h"] == leaky.observation.value
         assert steady.finding is None
         assert abs(steady.observation.value) < 1.0
+
+    @pytest.mark.parametrize(
+        "rule_id, kwargs, evidence_key",
+        [
+            ("FD-LEAK-01", {"fds_slope": 10}, "slope_fd_per_h"),
+            ("THREAD-LEAK-01", {"threads_slope": 10}, "slope_threads_per_h"),
+        ],
+    )
+    def test_fd_and_thread_leaks_measure_every_process(
+        self, tmp_path, rule_id, kwargs, evidence_key
+    ):
+        store = make_db(tmp_path, hours=12)
+        add_sys_baseline(store, hours=12)
+        add_proc_series(
+            store, "leaky", rss_start=50 * _MB, rss_slope_per_h=0, hours=12, **kwargs
+        )
+        add_proc_series(
+            store, "steady", rss_start=50 * _MB, rss_slope_per_h=0, hours=12
+        )
+        diag = _engine().run(store, only=[rule_id])
+        store.close()
+
+        by_name = {m.observation.subject: m for m in diag.measurements[rule_id]}
+        assert by_name["leaky"].observation.value == pytest.approx(10, rel=0.05)
+        assert by_name["leaky"].finding.evidence[evidence_key] == pytest.approx(
+            by_name["leaky"].observation.value
+        )
+        assert by_name["steady"].finding is None
+        assert by_name["steady"].observation.value == 0.0
+
+    def test_zombie_count_is_measured_when_flat(self, tmp_path):
+        store = make_db(tmp_path, hours=8)
+        add_sys_baseline(store, hours=8)
+        add_zombie_series(store, hours=8, base_zombie_count=3)
+        diag = _engine().run(store, only=["ZOMBIE-01"])
+        store.close()
+        (m,) = diag.measurements["ZOMBIE-01"]
+        assert m.observation.subject == "zombie_processes"
+        assert m.observation.value == 0.0
+        assert m.observation.evidence["method"] == "approx"
+        assert m.finding is None
 
     def test_skipped_rule_has_no_measurements(self, tmp_path):
         store = make_db(tmp_path, hours=2)
