@@ -3,7 +3,8 @@ name: Publish to PyPI
 # Pushing a tag vX.Y.Z publishes that commit to PyPI with trusted publishing
 # (OIDC), so no PyPI token is stored anywhere. Release steps:
 #   1. bump pyproject.toml version + procdiag.__version__, date the CHANGELOG
-#   2. commit and push to main, wait for CI to pass
+#   2. commit and push to main, wait for CI to pass (the build job refuses a
+#      commit without a successful CI run)
 #   3. git tag -a vX.Y.Z -m "host-check-tool X.Y.Z" && git push origin vX.Y.Z
 # PyPI must list this repository, publish.yml and the "pypi" environment as a
 # trusted publisher (project settings > Publishing). If the publish job fails,
@@ -20,6 +21,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read  # to look up the CI result for the tagged commit
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -40,6 +44,17 @@ jobs:
         fi
         if ! git merge-base --is-ancestor HEAD origin/main; then
           echo "::error::$GITHUB_REF_NAME is not on main"
+          exit 1
+        fi
+
+    - name: Check CI passed for the tagged commit
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        sha=$(git rev-parse HEAD)
+        passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml --commit "$sha" --status success --json databaseId --jq length)
+        if [ "$passed" -eq 0 ]; then
+          echo "::error::no successful CI run for $sha. Wait for CI to pass (or start it with: gh workflow run tests.yml --ref main), then re-run this workflow"
           exit 1
         fi
 
