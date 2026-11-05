@@ -1,5 +1,3 @@
-"""Measured rules report a value for every subject, firing or not."""
-
 from __future__ import annotations
 
 import pytest

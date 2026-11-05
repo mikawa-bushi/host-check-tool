@@ -169,7 +169,6 @@ class Engine:
         only: Optional[list[str]] = None,
         skip: Optional[list[str]] = None,
     ) -> float:
-        """The longest observation any selected rule needs (configured values)."""
         self._load_extra_rules([])
         return max(
             (
@@ -323,8 +322,6 @@ class Engine:
         )
 
         # --- Step 6: build quality ---
-        # With no samples the window is a placeholder, so the DB-wide event
-        # counts are the only statement about the recorder that can be made.
         quality = self._build_quality(store, window, events_in_window=has_data)
 
         healthy = not any(
@@ -350,7 +347,6 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _required_hours(self, rule: Rule) -> float:
-        """Rules on the class default follow ``config.rules.min_observation_hours``."""
         if rule.min_observation_hours == Rule.min_observation_hours:
             return self.config.rules.min_observation_hours
         return rule.min_observation_hours
@@ -362,8 +358,6 @@ class Engine:
         window: Window,
         cache: dict[tuple[str, str], bool],
     ) -> Optional[UncoveredRule]:
-        """Why *rule*'s declared inputs cannot speak for *window*, or None."""
-
         def exists(name: str) -> bool:
             key = ("schema", name)
             if key not in cache:

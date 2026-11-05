@@ -301,7 +301,6 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
 
 
 def _uncovered_list(diag: Diagnosis) -> str:
-    """``"CPU-SATURATION-01 (期間内に sys_samples の記録がありません), ..."``."""
     return ", ".join(f"{r.rule_id} ({r.detail})" for r in diag.uncovered_rules)
 
 
@@ -997,11 +996,6 @@ def _quality_section(q: ObservationQuality) -> str:
 """
 
 
-# ---------------------------------------------------------------------------
-# procdiag compare (EXT-06)
-# ---------------------------------------------------------------------------
-
-
 def _local(ts: float) -> datetime:
     return datetime.fromtimestamp(ts).astimezone()
 
@@ -1026,7 +1020,6 @@ def _state_text(state: SideState) -> str:
 
 
 def _row_change(row: ComparisonRow) -> str:
-    """``"RSS 増加率 38.0 → 0.2 MB/h"`` or ``"検出 (warning) → 検出なし"``."""
     if row.headline is None:
         return f"{_state_text(row.before)} → {_state_text(row.after)}"
     h = row.headline
@@ -1058,7 +1051,6 @@ def _period_text(side: Side, *, show_db: bool) -> str:
 
 
 def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
-    """``[(rule_id, reason), ...]`` for every rule *side* could not run."""
     if side.result is None:
         return []
     diag = side.result.diagnosis
@@ -1087,7 +1079,6 @@ def _compare_conclusion(cmp: Comparison) -> str:
 
 
 def _cols(text: str) -> int:
-    """Terminal columns of *text* (CJK counts as two)."""
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
 
 
@@ -1104,7 +1095,6 @@ _VERDICT_ANSI = {
 def render_comparison_terminal(
     cmp: Comparison, *, color: bool = True, verbose: bool = False
 ) -> str:
-    """Plain-text / ANSI comparison: periods, notes, one line per row, result."""
     show_db = cmp.before.db != cmp.after.db
     zone = datetime.now().astimezone().strftime("%Z %z")
     reset = _c(_RESET, color)

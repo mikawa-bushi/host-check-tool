@@ -1,12 +1,10 @@
-"""Contract every built-in rule must meet so the engine can judge its coverage."""
-
 from __future__ import annotations
 
 import sqlite3
 
 import pytest
 
-import procdiag.diagnosis  # noqa: F401  (registers the built-in rules)
+import procdiag.diagnosis  # noqa: F401
 from procdiag.core import all_rules
 from procdiag.storage import Storage
 

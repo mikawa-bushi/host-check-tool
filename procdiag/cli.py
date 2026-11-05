@@ -429,11 +429,6 @@ cli.add_command(check, name="advise")
 cli.commands["advise"].hidden = True  # type: ignore[attr-defined]
 
 
-# ---------------------------------------------------------------------------
-# compare
-# ---------------------------------------------------------------------------
-
-
 @cli.command()
 @click.argument("dbs", nargs=-1, type=click.Path(), metavar="[BEFORE_DB AFTER_DB]")
 @_db_option("1 つの DB の 2 期間を比べるときの DB (既定: config の db_path)。")

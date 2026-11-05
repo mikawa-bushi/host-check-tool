@@ -145,11 +145,6 @@ def fit_all(
     min_points: int,
     min_span_hours: float,
 ) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
-    """Yield ``(key, series, fit)`` for every series :func:`fit_linear` accepts.
-
-    No R² gate: a flat, noisy series (R² near 0) is the evidence that a leak
-    is gone, so the measuring side of a rule needs its slope too.
-    """
     for key, series in series_by_key.items():
         fit = fit_linear(series, min_points=min_points, min_span_hours=min_span_hours)
         if fit is not None:
@@ -163,11 +158,6 @@ def fit_each(
     min_span_hours: float,
     min_r2: float,
 ) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
-    """:func:`fit_all` restricted to fits with ``r2 >= min_r2`` (a sustained trend).
-
-    The slope threshold stays with the caller because each rule states it in
-    its own unit (MB/h, FDs/h, threads/h).
-    """
     for key, series, fit in fit_all(
         series_by_key, min_points=min_points, min_span_hours=min_span_hours
     ):
@@ -183,12 +173,6 @@ def proc_trend_observations(
     min_span_hours: float,
     unit: float = 1.0,
 ) -> list[Observation]:
-    """One Observation per process whose *column* series can be fitted.
-
-    *rows* are ``proc_rollup_1m`` rows, *identities* is
-    ``Storage.proc_identities()``; the value is the slope per hour in
-    multiples of *unit*.
-    """
     observations = []
     for proc_id, series, fit in fit_all(
         group_series(rows, key="proc_id", value=column),
@@ -214,7 +198,6 @@ def proc_trend_observations(
 
 
 def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:
-    """The :class:`TrendFit` behind a trend observation."""
     ev = obs.evidence
     return TrendFit(obs.value * unit, ev["r2"], ev["n"], ev["span_hours"])
 

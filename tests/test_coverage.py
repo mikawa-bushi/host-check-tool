@@ -1,5 +1,3 @@
-"""The engine owns "was this rule evaluable": schema skew and missing rows."""
-
 from __future__ import annotations
 
 import json
@@ -33,7 +31,6 @@ def _cfg(min_hours: float = 6.0) -> ProcdiagConfig:
 
 
 def _rollup_only_db(tmp_path):
-    """12h of rollups for a leaking process; raw samples pruned away."""
     store = make_db(tmp_path, hours=12)
     add_sys_baseline(store, hours=12)
     add_proc_series(
@@ -47,7 +44,6 @@ def _rollup_only_db(tmp_path):
 
 
 def _v2_db(tmp_path):
-    """Schema v2: a v3 DB without thermal_samples."""
     db = tmp_path / "v2.db"
     _make_v3_db(db)
     conn = sqlite3.connect(db)
@@ -132,7 +128,7 @@ class TestCheckExitCodes:
     def test_uncovered_rules_do_not_change_the_exit_code(self, tmp_path):
         db = _rollup_only_db(tmp_path)
         result = CliRunner().invoke(cli, ["check", "--db", str(db), "--format", "json"])
-        assert result.exit_code == 1  # the MEM-LEAK warning, as before
+        assert result.exit_code == 1
         data = json.loads(result.output)
         assert _RAW_RULES <= {r["rule_id"] for r in data["uncovered_rules"]}
 
@@ -185,6 +181,6 @@ class TestExplicitWindow:
 
     def test_required_hours_is_the_longest_configured_minimum(self):
         engine = Engine(_cfg(6.0))
-        assert engine.required_hours() == 24.0  # MEM-PRESSURE-01
+        assert engine.required_hours() == 24.0
         assert engine.required_hours(skip=["MEM-PRESSURE-01"]) == 6.0
         assert engine.required_hours(only=["SWAP-THRASH-01"]) == 0.0

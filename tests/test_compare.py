@@ -1,9 +1,3 @@
-"""procdiag.compare: verdicts, identity matching, notes and exit codes.
-
-Built on hand-made Diagnosis objects so each case states exactly what the two
-sides said; tests/test_compare_cli.py drives the same logic from real DBs.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -11,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import procdiag.diagnosis  # noqa: F401  (registers the built-in rules)
+import procdiag.diagnosis  # noqa: F401
 from procdiag.compare import (
     Clear,
     CompareError,
@@ -65,7 +59,6 @@ def _finding(rule_id, subject, severity=Severity.WARNING, **evidence):
 
 
 def _leak(subject, slope, *, identity=None, fires=None, r2=0.99, severity=None):
-    """A MEM-LEAK-01 measurement; it fires when slope >= 1.0 unless told otherwise."""
     obs = Observation(
         subject=subject,
         identity=identity or f"hash_{subject}",
@@ -126,11 +119,6 @@ def _leak_cmp(before_ms, after_ms, **kw):
         _diag(measurements={"MEM-LEAK-01": after_ms}),
         **kw,
     )
-
-
-# ---------------------------------------------------------------------------
-# The canonical story and A4 (resolved only well below the threshold)
-# ---------------------------------------------------------------------------
 
 
 class TestMeasuredRows:
@@ -396,11 +384,6 @@ class TestLabels:
             detail = {"before": "a", "after": "b", "raw_hours": 1.0, "span_hours": 2.0}
             note = Note(kind, SideName.BEFORE, {**detail, "rules": ["X"]})
             assert note.message and not note.message.isascii()
-
-
-# ---------------------------------------------------------------------------
-# Requests
-# ---------------------------------------------------------------------------
 
 
 class TestPlanRequest:

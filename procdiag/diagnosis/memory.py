@@ -152,7 +152,6 @@ class MemLeakRule(MeasuredRule):
     min_r2: float = _MEM_LEAK_MIN_R2
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
-        """The RSS slope (MB/h) of every process with enough rollup points."""
         return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
             store.proc_identities(),
@@ -164,7 +163,6 @@ class MemLeakRule(MeasuredRule):
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
-        """A sustained (R²) slope at or above the warning threshold."""
         fit = observed_fit(obs, MiB)
         slope_mb_h = obs.value
         if fit.r2 < self.min_r2 or slope_mb_h < self.slope_warning_mb_h:
@@ -173,14 +171,12 @@ class MemLeakRule(MeasuredRule):
         proc_id = obs.evidence["proc_id"]
         process_name = obs.subject
 
-        # Severity escalation.
         severity = (
             Severity.CRITICAL
             if slope_mb_h >= self.slope_critical_mb_h
             else Severity.WARNING
         )
 
-        # Confidence from R² × observation time (baseline).
         confidence = confidence_from_fit(
             fit, min_observation_hours=self.min_observation_hours
         )
@@ -212,11 +208,6 @@ class MemLeakRule(MeasuredRule):
             store, window, proc_id, confidence, evidence
         )
 
-        # Reboot-crossing escalation (EXT-03): a leaking identity whose
-        # first_seen predates the current boot has recurred across at least
-        # one reboot, pointing at a systemic (driver/config) cause.  Promote
-        # MEDIUM -> HIGH and record it.  Existing data only; offline/non-root.
-        # Absent / unparseable boot_time simply disables the check.
         try:
             boot_time: float | None = float(store.meta().get("boot_time", "")) or None
         except (TypeError, ValueError):

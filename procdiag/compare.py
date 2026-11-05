@@ -1,16 +1,4 @@
-"""Compare a period before a fix with one after it (EXT-06).
-
-Both periods are diagnosed by the same rules with the same thresholds.  A
-row is a (rule, subject) detected on at least one side; its verdict follows
-from the two side states by one pure table (:func:`classify`).  Measured
-rules (:class:`~procdiag.core.MeasuredRule`) contribute a value on a side
-where nothing fired, so a fix reads "38.0 → 0.2 MB/h"; a side that cannot
-judge a subject says why instead of reading as fixed.
-
-Public surface: :func:`plan_request`, :func:`run_compare`,
-:func:`build_comparison`, :func:`exit_code`, :class:`CompareError` and the
-result types the renderers in ``report.py`` read.
-"""
+"""Compare a period before a fix with one after it."""
 
 from __future__ import annotations
 
@@ -40,19 +28,13 @@ if TYPE_CHECKING:
     from .config import ProcdiagConfig
 
 COMPARE_FORMAT = "procdiag-compare/1"
-# Two still-firing values closer than this (relative) are 変化なし.
 MATERIAL_CHANGE = 0.2
 
 _SEVERITY_RANK = {Severity.INFO: 0, Severity.WARNING: 1, Severity.CRITICAL: 2}
 
 
 class CompareError(ValueError):
-    """A usage problem (Japanese message); the CLI maps it to exit 4."""
-
-
-# ---------------------------------------------------------------------------
-# Requests
-# ---------------------------------------------------------------------------
+    pass
 
 
 @dataclass(frozen=True)
@@ -65,17 +47,12 @@ class Period:
 
 @dataclass(frozen=True)
 class SplitRequest:
-    """``--at``: one DB split at the fix.  The before period mirrors the after
-    one in length, but is never shorter than the longest rule minimum."""
-
     db: Path
     at: float
 
 
 @dataclass(frozen=True)
 class PeriodsRequest:
-    """Explicit periods in one DB, or two DBs (default: each whole recording)."""
-
     before_db: Path
     after_db: Path
     before: Period
@@ -125,7 +102,6 @@ def plan_request(
     before: Optional[str],
     after: Optional[str],
 ) -> CompareRequest:
-    """Turn the CLI arguments into a request, or raise :class:`CompareError`."""
     if len(dbs) not in (0, 2):
         raise CompareError(
             "DB は 2 つ (修正前 修正後) 指定するか、省略して --db / 設定の DB を使ってください"
@@ -156,7 +132,6 @@ def plan_request(
 
 
 def check_order(before: Period, after: Period) -> None:
-    """In one DB the before period must end where (or before) the after one starts."""
     end = before.until if before.until is not None else float("inf")
     start = after.since if after.since is not None else float("-inf")
     if end > start:
@@ -164,11 +139,6 @@ def check_order(before: Period, after: Period) -> None:
             "修正前と修正後の期間が重なっています。"
             "1 つの DB では、修正前の期間は修正後の期間より前に終わる必要があります"
         )
-
-
-# ---------------------------------------------------------------------------
-# Per-side state of one (rule, subject)
-# ---------------------------------------------------------------------------
 
 
 class Why(str, Enum):
@@ -183,7 +153,6 @@ class Why(str, Enum):
     SEVERITY_HIGHER = "severity_higher"
     VALUE_WORSE = "value_worse"
     FINDING_APPEARED = "finding_appeared"
-    # a side that cannot judge
     NO_DATA = "no_data"
     TOO_SHORT = "too_short"
     NOT_RECORDED = "not_recorded"
@@ -217,36 +186,28 @@ _WHY_JA = {
 
 @dataclass(frozen=True)
 class Detected:
-    """The rule reported the subject; worst of ``count`` findings."""
-
     severity: Severity
     count: int
-    value: Optional[float]  # set for measured rules
+    value: Optional[float]
     finding: Finding
 
 
 @dataclass(frozen=True)
 class Clear:
-    """The rule ran and did not report the subject; ``value`` for measured rules."""
-
     value: Optional[float]
     evidence: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Unknown:
-    """This side cannot say anything about the subject."""
-
     why: Why
-    detail: str  # Japanese
+    detail: str
 
 
 SideState = Union[Detected, Clear, Unknown]
 
 
 class Verdict(str, Enum):
-    """Row classification.  Definition order is display order (problems first)."""
-
     WORSE = "worse"
     NEW = "new"
     UNCHANGED = "unchanged"
@@ -283,22 +244,6 @@ def _material_change(before: float, after: float) -> Optional[Why]:
 def classify(
     before: SideState, after: SideState, threshold: Optional[float]
 ) -> tuple[Verdict, Why]:
-    """The verdict for one row; the whole policy is this table.
-
-    ::
-
-                         after: Detected          Clear          Unknown
-        before Detected  severity, then value     RESOLVED (*)   NOT_EVALUABLE
-        before Clear     NEW                      (no row)       (no row)
-        before Unknown   NOT_EVALUABLE            (no row)       (no row)
-
-    (*) For a measured rule (``threshold`` is the configured warning
-    threshold) a Clear after side is RESOLVED only at or below half the
-    threshold; above it, a material drop is 改善 (しきい値未満) and anything
-    else keeps comparing values, because a slope the rule merely declined
-    (0.9 MB/h, or a noisy fit) is not a fix.  Confidence never takes part: it
-    depends on host-local reads (journal, boot time).
-    """
     if isinstance(after, Unknown):
         return Verdict.NOT_EVALUABLE, after.why
     if isinstance(before, Unknown):
@@ -337,14 +282,12 @@ def classify(
 
 @dataclass(frozen=True)
 class ComparisonRow:
-    """One (rule, subject) detected on at least one side."""
-
     rule_id: str
     title: str
     subject: str
-    identity: Optional[str]  # cmdline hash for per-process measured rules
-    headline: Optional[Headline]  # None for plain rules
-    threshold: Optional[float]  # the configured headline threshold
+    identity: Optional[str]
+    headline: Optional[Headline]
+    threshold: Optional[float]
     before: SideState
     after: SideState
 
@@ -362,15 +305,9 @@ class ComparisonRow:
 
     @property
     def label(self) -> str:
-        """``"改善 (しきい値未満)"`` for that case, else the verdict label."""
         if self.why is Why.BELOW_THRESHOLD:
             return f"{self.verdict.label} ({self.why.label})"
         return self.verdict.label
-
-
-# ---------------------------------------------------------------------------
-# Sides and the comparison
-# ---------------------------------------------------------------------------
 
 
 class SideName(str, Enum):
@@ -384,10 +321,8 @@ class SideName(str, Enum):
 
 @dataclass(frozen=True)
 class Evaluated:
-    """A side whose period held data."""
-
-    window: Window  # the period clipped to what was recorded
-    raw_hours: float  # sys_samples span inside the window
+    window: Window
+    raw_hours: float
     diagnosis: Diagnosis
 
 
@@ -397,9 +332,9 @@ class Side:
     db: Path
     hostname: Optional[str]
     schema_version: Optional[str]
-    recording_config: Optional[str]  # meta.config
+    recording_config: Optional[str]
     requested: Period
-    result: Optional[Evaluated]  # None: no system sample in the requested period
+    result: Optional[Evaluated]
 
 
 class NoteKind(str, Enum):
@@ -411,8 +346,6 @@ class NoteKind(str, Enum):
 
 @dataclass(frozen=True)
 class Note:
-    """Something about the comparison as a whole a reader should know."""
-
     kind: NoteKind
     side: Optional[SideName] = None
     detail: Mapping[str, Any] = field(default_factory=dict)
@@ -446,7 +379,7 @@ class Note:
 class Comparison:
     before: Side
     after: Side
-    rows: tuple[ComparisonRow, ...]  # Verdict order, then rule_id, subject
+    rows: tuple[ComparisonRow, ...]
     notes: tuple[Note, ...]
 
     def verdict_counts(self) -> dict[Verdict, int]:
@@ -454,7 +387,6 @@ class Comparison:
 
 
 def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
-    """Why *side* cannot judge *rule_id* at all, or None when the rule ran."""
     if side.result is None or side.result.diagnosis.no_data:
         return Unknown(Why.NO_DATA, "期間内に記録がありません")
     diag = side.result.diagnosis
@@ -496,13 +428,6 @@ def _measured_state(gap: Optional[Unknown], m: Optional[Measurement]) -> SideSta
 def _pair(
     before: list[Measurement], after: list[Measurement]
 ) -> list[tuple[Optional[Measurement], Optional[Measurement]]]:
-    """Match subjects across sides by (name, identity), then by name.
-
-    The name-only fallback pairs a name's single leftover identity on each
-    side (a cmdline that changed with the fix); with more than one leftover
-    on either side nothing is guessed.
-    """
-
     def key(m: Measurement) -> tuple[str, Optional[str]]:
         return m.observation.subject, m.observation.identity
 
@@ -615,7 +540,6 @@ def _note_list(before: Side, after: Side) -> list[Note]:
 
 
 def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Comparison:
-    """Rows and notes from two evaluated sides.  Pure."""
     rows: list[ComparisonRow] = []
     measured = {
         rid
@@ -676,19 +600,7 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Reading the DBs
-# ---------------------------------------------------------------------------
-
-
 def _resolve(store: Storage, period: Period) -> Optional[tuple[Window, float]]:
-    """Clip *period* to what was recorded: ``(window, raw_hours)`` or None.
-
-    The extent is the union of raw and rollup system rows, not
-    ``window_bounds()``, which prefers raw rows and would cut a week to the
-    last 48 hours.  ``until`` is exclusive, so a row stamped exactly at the
-    split belongs to the after side.
-    """
     until = None if period.until is None else period.until - 1e-3
     bounds = [
         b

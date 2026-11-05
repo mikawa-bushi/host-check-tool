@@ -1,5 +1,3 @@
-"""``procdiag compare`` end to end on synthetic recordings (tests/synth.py)."""
-
 from __future__ import annotations
 
 import json
@@ -30,11 +28,6 @@ def _recording(
     after_slope: float = 0.2,
     hostname: str = "synth-host",
 ):
-    """myapp leaks *before_slope* MB/h, then (from the fix) grows *after_slope*.
-
-    Raw samples older than 48 h are pruned, like a real recording.
-    Returns ``(db_path, fix_ts)``.
-    """
     directory.mkdir(parents=True, exist_ok=True)
     now = time.time()
     at = now - after_h * _HOUR
@@ -68,7 +61,6 @@ def _run(*args):
 
 @pytest.fixture(scope="module")
 def story(tmp_path_factory):
-    """Three days leaking, then three days fixed, in one DB."""
     return _recording(tmp_path_factory.mktemp("story"), before_h=72, after_h=72)
 
 

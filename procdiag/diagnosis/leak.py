@@ -109,7 +109,6 @@ class FdLeakRule(MeasuredRule):
     min_r2: float = _FD_LEAK_MIN_R2
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
-        """The FD-count slope (FDs/h) of every process with enough rollup points."""
         return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
             store.proc_identities(),
@@ -120,7 +119,6 @@ class FdLeakRule(MeasuredRule):
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
-        """A sustained (R²) slope at or above the warning threshold."""
         fit = observed_fit(obs)
         slope_fd_h = obs.value
         if fit.r2 < self.min_r2 or slope_fd_h < self.slope_warning_fd_h:
@@ -132,8 +130,6 @@ class FdLeakRule(MeasuredRule):
             fit, min_observation_hours=self.min_observation_hours
         )
 
-        # Estimate days until the soft/hard FD limit is reached — the
-        # process's recorded RLIMIT_NOFILE when known, else common defaults.
         current_fds = obs.evidence["last_value"]
         limits = store.proc_fd_limits(proc_id)
         soft, hard = limits or (_FD_SOFT_LIMIT_DEFAULT, _FD_HARD_LIMIT_DEFAULT)
@@ -207,7 +203,6 @@ class ThreadLeakRule(MeasuredRule):
     min_r2: float = _THREAD_LEAK_MIN_R2
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
-        """The thread-count slope (/h) of every process with enough rollup points."""
         return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
             store.proc_identities(),
@@ -218,7 +213,6 @@ class ThreadLeakRule(MeasuredRule):
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
-        """A sustained (R²) slope at or above the warning threshold."""
         fit = observed_fit(obs)
         slope_h = obs.value
         if fit.r2 < self.min_r2 or slope_h < self.slope_warning_h:
@@ -229,7 +223,6 @@ class ThreadLeakRule(MeasuredRule):
             fit, min_observation_hours=self.min_observation_hours
         )
 
-        # Estimate days until a nominal thread-max limit is reached.
         current_threads = obs.evidence["last_value"]
         days_to_thread_max = days_until(current_threads, _THREADS_MAX_DEFAULT, slope_h)
 
@@ -302,7 +295,6 @@ class ZombieRule(MeasuredRule):
     slope_warning_h: float = 0.0
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
-        """The zombie-count slope (/h): exact counts, else the pre-v4 approximation."""
         series = self._counted_series(store, window)
         exact = bool(series)
         if not exact:
@@ -332,7 +324,6 @@ class ZombieRule(MeasuredRule):
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
-        """Any upward trend fires INFO."""
         fit = observed_fit(obs)
         slope_h = obs.value
         if slope_h <= self.slope_warning_h:

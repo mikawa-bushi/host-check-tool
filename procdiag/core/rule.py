@@ -48,9 +48,6 @@ class Rule:
     what: str = ""  # what pattern is detected (Japanese)
     why: str = ""  # why this detection method (Japanese)
     manual_commands: list[str] = []
-    # The engine, not the rule, decides whether the data can speak for a
-    # window; a rule whose inputs are missing goes to Diagnosis.uncovered_rules
-    # instead of silently reporting "nothing found".
     # requires_schema: tables / "table.column" that must exist in the DB
     #   (event tables included).
     # requires_rows: sampled tables without whose rows in the window the rule
@@ -154,7 +151,6 @@ class MeasuredRule(Rule):
         )
 
     def assess(self, store: "Storage", window: Window) -> list[Measurement]:
-        """Every observation with its judgement; what the engine calls."""
         return [
             Measurement(obs, self.judge(store, window, obs))
             for obs in self.observe(store, window)

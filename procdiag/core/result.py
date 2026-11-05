@@ -146,9 +146,9 @@ class Headline:
     value (``compare``) takes the configured threshold from the rule itself.
     """
 
-    label: str  # "RSS 増加率"
-    unit: str  # "MB/h"
-    threshold: str  # e.g. "slope_warning_mb_h"
+    label: str
+    unit: str
+    threshold: str
     digits: int = 1
 
 
@@ -169,19 +169,13 @@ class Observation:
 
 @dataclass(frozen=True)
 class Measurement:
-    """An observation and the Finding ``judge`` made of it (None = declined)."""
-
     observation: Observation
     finding: Optional[Finding]
 
 
 class CoverageGap(str, Enum):
-    """Why a selected rule's input data cannot speak for the window."""
-
-    SCHEMA_MISSING = "schema_missing"  # DB recorded before the table / column existed
-    NOT_RECORDED = (
-        "not_recorded"  # no rows inside the window (raw retention, sampler off)
-    )
+    SCHEMA_MISSING = "schema_missing"
+    NOT_RECORDED = "not_recorded"
 
 
 @dataclass
@@ -199,14 +193,12 @@ class UncoveredRule:
 
     @property
     def detail(self) -> str:
-        """Japanese reason, e.g. ``"期間内に sys_samples の記録がありません"``."""
         names = ", ".join(self.missing)
         if self.reason is CoverageGap.SCHEMA_MISSING:
             return f"DB の版が古く {names} がありません"
         return f"期間内に {names} の記録がありません"
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a plain-dict representation."""
         return {
             "rule_id": self.rule_id,
             "title": self.title,
@@ -233,10 +225,7 @@ class Diagnosis:
     skipped_rules: list[SkippedRule] = field(default_factory=list)
     errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
     uncovered_rules: list[UncoveredRule] = field(default_factory=list)
-    # In memory only (never serialised by check): every measurement of every
-    # evaluated measured rule; a key's presence means the rule ran.
     measurements: dict[str, list[Measurement]] = field(default_factory=dict)
-    # In memory only: findings fold() absorbed into a parent's ``related``.
     folded: list[Finding] = field(default_factory=list)
 
     @property
