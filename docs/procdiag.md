@@ -113,6 +113,8 @@ procdiag report --out report.html --json report.json
 | `0` | Finding なし (正常) |
 | `1` | critical / warning の Finding あり |
 | `2` | info レベルの Finding のみ |
+| `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
+| `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
 
 CI で info を失敗扱いにしたくない場合は `procdiag check --exit-zero-on-info` を使うと、info のみのときに `0` を返す（`1` / `0` の判定は変わらない）。
 

@@ -164,7 +164,7 @@ numpy・pandas・rich は**不要**。外部ネットワーク通信ゼロ。
 
 ## 詳細ドキュメント
 
-設計・アーキテクチャ・ルールカタログは [docs/procdiag.md](docs/procdiag.md) を参照。
+設計・アーキテクチャ・ルールカタログは [docs/procdiag.md](https://github.com/mikawa-bushi/host-check-tool/blob/main/docs/procdiag.md) を参照。
 
 ## ライセンス
 
