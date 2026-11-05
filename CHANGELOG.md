@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-05
+
 ### Added
 - **`procdiag snapshot`**: 記録なしで数秒のうちに現在のホスト状態を網羅チェック (CPU・メモリ・I/O の圧迫、ディスク容量・inode・読み取り専用化、ファイルハンドル、ゾンビ・上位プロセス、failed / 自動再起動したサービス、直近 24 時間のカーネル異常、温度、時刻同期、記録の稼働状況)。warning / critical があれば exit 1。判定しきい値は各ルールの値 (`rules.overrides` 込み) を流用。
 - **`procdiag bundle`**: 記録 DB (記録中でも一貫したコピー)・HTML/JSON レポート・snapshot・doctor・status・config を 1 つの tar.gz にまとめる (USB 持ち出し解析用)。秘密情報を含み得るプロセスのコマンドラインは既定で削除 (`--keep-cmdline` で保持)。DB が無くても snapshot / doctor だけのバンドルを作成。

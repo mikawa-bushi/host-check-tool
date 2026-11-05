@@ -8,4 +8,4 @@ This is the sibling tool of *netdiag* (network-check-tool): same design
 vocabulary, same code idioms, same user-facing output style.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
