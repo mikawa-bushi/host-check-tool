@@ -8,14 +8,20 @@ from __future__ import annotations
 
 from .result import (
     Confidence,
+    CoverageGap,
     Diagnosis,
     Finding,
+    Headline,
+    Measurement,
+    Observation,
     ObservationQuality,
     Severity,
     SkippedRule,
+    UncoveredRule,
     Window,
 )
 from .rule import (
+    MeasuredRule,
     Rule,
     all_rules,
     configure_rule,
@@ -54,8 +60,14 @@ __all__ = [
     "ObservationQuality",
     "Diagnosis",
     "SkippedRule",
+    "UncoveredRule",
+    "CoverageGap",
+    "Headline",
+    "Observation",
+    "Measurement",
     # rule
     "Rule",
+    "MeasuredRule",
     "register",
     "get_rule",
     "all_rules",

@@ -71,6 +71,7 @@ class DiskFullRule(Rule):
     title = "ディスク満杯予測"
     default_severity = Severity.WARNING
     min_observation_hours = 1.0  # disk only needs a few readings
+    requires_rows = ("disk_samples",)
     what = (
         "disk_samples の used 系列を線形外挿し、"
         "capacity 到達までの残り日数を算出する"
@@ -197,6 +198,7 @@ class IoBottleneckRule(Rule):
     title = "I/Oボトルネック"
     default_severity = Severity.WARNING
     min_observation_hours = 0.5
+    requires_rows = ("sys_samples",)
     what = (
         "psi_io_some10 が閾値を超えた継続時間を計測し、"
         "15分以上継続している場合に発火する"
@@ -428,6 +430,7 @@ class DiskGrowthRule(Rule):
     title = "ディレクトリ急増"
     default_severity = Severity.INFO
     min_observation_hours = 1.0
+    requires_rows = ("dir_samples",)
     what = "dir_samples のパスごと増分を計算し、日次増分が閾値を超えたら発火する"
     why = (
         "急激なディレクトリ肥大はディスク満杯の前兆であることが多く、"
@@ -571,6 +574,7 @@ class DiskJournalRule(Rule):
     title = "journaldサイズ超過"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0  # single-point check; no trend needed
+    requires_rows = ("dir_samples",)
     what = (
         "dir_samples の /var/log/journal* パスの最新サイズが"
         " journal_size_warn_gb 閾値を超えているか確認する"
@@ -679,6 +683,8 @@ class DiskInodeRule(Rule):
     title = "inode 枯渇"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0  # the current usage alone is decisive
+    requires_schema = ("disk_samples.inodes_total", "disk_samples.inodes_used")
+    requires_rows = ("disk_samples",)
     what = "disk_samples の inodes_used / inodes_total の最新値と増加傾向を確認する"
     why = (
         "小さなファイルが大量にあると、容量に空きがあっても inode が尽きて"
@@ -696,8 +702,6 @@ class DiskInodeRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-INODE-01 against the observation window."""
-        if not store.has_column("disk_samples", "inodes_total"):
-            return []  # DB recorded before schema v4
         rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
 
         by_mount: dict[str, list] = {}
@@ -774,6 +778,8 @@ class FsReadOnlyRule(Rule):
     title = "ファイルシステムの読み取り専用化"
     default_severity = Severity.CRITICAL
     min_observation_hours = 0.0
+    requires_schema = ("disk_samples.read_only",)
+    requires_rows = ("disk_samples",)
     what = "disk_samples の read_only フラグが記録中に 0→1 へ変わったマウントを検出する"
     why = (
         "ファイルシステムはエラーを検出すると自動的に読み取り専用で再マウントされる。"
@@ -786,8 +792,6 @@ class FsReadOnlyRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run FS-READONLY-01 against the observation window."""
-        if not store.has_column("disk_samples", "read_only"):
-            return []  # DB recorded before schema v4
         rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
 
         flags: dict[str, list[tuple[float, int]]] = {}

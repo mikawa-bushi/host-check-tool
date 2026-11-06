@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 
 class Severity(str, Enum):
@@ -137,6 +137,76 @@ class SkippedRule:
         }
 
 
+@dataclass(frozen=True)
+class Headline:
+    """What a measured rule's ``Observation.value`` means, for people.
+
+    Lower values are better for every measured rule.  ``threshold`` names the
+    tunable that ``judge`` compares the value against, so a reader of the
+    value (``compare``) takes the configured threshold from the rule itself.
+    """
+
+    label: str
+    unit: str
+    threshold: str
+    digits: int = 1
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One subject's measured value over a window, before any threshold.
+
+    ``identity`` tells two subjects with the same name apart across DBs
+    (the process's cmdline hash); None for host-wide subjects.  ``evidence``
+    is JSON-serialisable and carries what ``judge`` needs (r2, n, ...).
+    """
+
+    subject: str
+    identity: Optional[str]
+    value: float
+    evidence: dict
+
+
+@dataclass(frozen=True)
+class Measurement:
+    observation: Observation
+    finding: Optional[Finding]
+
+
+class CoverageGap(str, Enum):
+    SCHEMA_MISSING = "schema_missing"
+    NOT_RECORDED = "not_recorded"
+
+
+@dataclass
+class UncoveredRule:
+    """A selected rule that was not run because its input data is missing.
+
+    ``missing`` names the tables (or ``table.column``) behind ``reason``.
+    Unlike :class:`SkippedRule`, recording longer does not help.
+    """
+
+    rule_id: str
+    title: str
+    reason: CoverageGap
+    missing: tuple[str, ...]
+
+    @property
+    def detail(self) -> str:
+        names = ", ".join(self.missing)
+        if self.reason is CoverageGap.SCHEMA_MISSING:
+            return f"DB の版が古く {names} がありません"
+        return f"期間内に {names} の記録がありません"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "title": self.title,
+            "reason": self.reason.value,
+            "missing": list(self.missing),
+        }
+
+
 @dataclass
 class Diagnosis:
     """Aggregated result of running all rules against the stored data.
@@ -154,11 +224,18 @@ class Diagnosis:
     evaluated_rules: list[str] = field(default_factory=list)
     skipped_rules: list[SkippedRule] = field(default_factory=list)
     errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
+    uncovered_rules: list[UncoveredRule] = field(default_factory=list)
+    measurements: dict[str, list[Measurement]] = field(default_factory=dict)
+    folded: list[Finding] = field(default_factory=list)
 
     @property
     def fully_evaluated(self) -> bool:
         """True when every selected rule ran to completion."""
-        return not self.skipped_rules and not self.errored_rules
+        return (
+            not self.skipped_rules
+            and not self.errored_rules
+            and not self.uncovered_rules
+        )
 
     @property
     def primary(self) -> Finding | None:

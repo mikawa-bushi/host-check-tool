@@ -41,6 +41,9 @@ procdiag record
 # 別のターミナルから — または記録停止後に実行
 procdiag check
 
+# 提案どおり対策したら記録を続け、対策の前後を数値で比べる
+procdiag compare --at "2026-10-28 09:00"
+
 # HTML + JSON レポートを生成
 procdiag report --out report.html --json report.json
 
@@ -56,6 +59,7 @@ procdiag bundle
 | `procdiag init [DIR]` | `config.py` と `data/` を生成 |
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 |
+| `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag report` | HTML + JSON レポートを一括生成 |
 | `procdiag status` | 記録期間・サンプル数・自己負荷を表示 |
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
@@ -74,6 +78,7 @@ procdiag bundle
 procdiag record --duration 24h --config config.py --db data/procdiag.db
 procdiag check  --format json --output findings.json
 procdiag check  --only MEM-LEAK-01,DISK-FULL-01
+procdiag compare --at "2026-10-28 09:00" --format json
 procdiag status --config /etc/procdiag/config.py   # DB の場所は config の db_path から
 ```
 
@@ -82,7 +87,51 @@ DB の場所 (`db_path`) と保持期間などを設定ファイルから解決�
 
 記録時間が短いと、長期の観測が必要なルール (リーク系は 6 時間、慢性メモリ圧迫は 24 時間)
 は評価されない。`check` はその場合「評価範囲: 20 ルール中 N 件のみ評価」と未評価の
-ルール・必要な残り時間を表示する (JSON では `skipped_rules`)。
+ルール・必要な残り時間を表示する (JSON では `skipped_rules`)。生データの保持期間 (既定 48 時間)
+を過ぎた期間や古い版の DB のように、ルールが読む表・列・行が無い場合も「記録なしで未評価」
+として理由とともに表示する (JSON では `uncovered_rules`)。
+
+## 対策の効果を確かめる (compare)
+
+`check` の提案どおりに対策したら、記録を続けたうえで `procdiag compare` で前後を比べる。
+両方の期間に同じルール・同じしきい値 (`--config` の `rules.overrides` を含む) を当て、検出ごとに
+解消 / 改善 / 変化なし / 悪化 / 新規 / 判定不能 を示す。リーク系のルール (MEM-LEAK-01 /
+FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01) は検出が消えた期間でも同じ計算で値を測るので、
+前後の数値が並ぶ。
+
+```
+# 1 つの DB を対策した時刻で分ける (修正前 = 修正後と同じ長さの直前の期間。最低 24 時間)
+procdiag compare --at "2026-10-28 09:00"
+
+# 期間を明示する (START..END は END を含まない。片側は省略可)
+procdiag compare --before 2026-10-20..2026-10-27 --after "2026-10-28 09:00.."
+
+# 2 つの DB (対策前に持ち出した DB と、対策後に記録し直した DB。既定はそれぞれの全期間)
+procdiag compare before.db after.db --format json --output compare.json
+```
+
+出力例:
+
+```
+修正前: 2026-10-21 09:00 〜 2026-10-28 08:59  168.0 時間 (うち生データ 0.0 時間)
+修正後: 2026-10-28 09:00 〜 2026-11-04 08:59  168.0 時間 (うち生データ 48.0 時間)
+時刻はこのホストのローカルタイム (JST +0900)
+
+✔ 解消  [MEM-LEAK-01]      myapp            RSS 増加率 38.0 → 0.2 MB/h
+
+修正前の未評価:
+  CPU-SATURATION-01, IO-BOTTLENECK-01, SWAP-THRASH-01: 期間内に sys_samples の記録がありません
+結果: 解消 1 件。修正前に検出された問題はすべて解消しました。
+```
+
+- 時刻はオフセットなしならこのホストのローカルタイム、`+09:00` や `Z` 付きならその時刻帯。
+- 修正後の値がしきい値の半分以下なら「解消」。しきい値は下回ったがそこまで下がっていないときは
+  「改善 (しきい値未満)」とし、修正後の値と R² を示す (0.9 MB/h でも直線的に増え続けていれば
+  リークは残っている)。修正前から 20% 以上下がっていなければ「変化なし」または「悪化」。
+- 記録時間不足・生データの保持期間外・DB の版が古い・対象のプロセスが動いていない、など
+  片側で判定できないものは「判定不能」とし理由を示す。「解消」とは表示しない。
+- 記録ホスト・DB の版・記録時の設定が 2 つの DB で違うときは「注意:」で知らせる。
+- `--format` は `text` と `json`。JSON は `"format": "procdiag-compare/1"` を持ち、キー名は固定。
 
 ## 終了コード
 
@@ -96,6 +145,16 @@ DB の場所 (`db_path`) と保持期間などを設定ファイルから解決�
 | `2` | info レベルの Finding のみ (`--exit-zero-on-info` で 0 に畳める) |
 | `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
 | `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
+
+`procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):
+
+| コード | 意味 |
+|---|---|
+| `0` | 修正後に critical / warning が無く、修正前の critical / warning はすべて判定できた |
+| `1` | 修正後に critical / warning が残っている、または新たに出た |
+| `2` | 修正後に info のみ残る (`--exit-zero-on-info` で 0 に畳める) |
+| `3` | どちらかの期間に記録が無い、または修正前の critical / warning が修正後に判定不能 (記録を続ければ判定できる) |
+| `4` | 前提条件エラー (期間指定の誤り・1 つの DB で期間が重なる・DB が無い・DB の版が新しすぎる) |
 
 ## systemd 運用
 

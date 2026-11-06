@@ -21,17 +21,25 @@ Design doc reference: §6.2 FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ..core import (
     Confidence,
     Finding,
-    Rule,
+    Headline,
+    MeasuredRule,
+    Observation,
     Severity,
     Window,
     register,
 )
-from .trend import confidence_from_fit, days_until, fit_each, fit_linear, group_series
+from .trend import (
+    confidence_from_fit,
+    days_until,
+    fit_linear,
+    observed_fit,
+    proc_trend_observations,
+)
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -67,7 +75,7 @@ _THREADS_MAX_DEFAULT: int = 32768
 
 
 @register
-class FdLeakRule(Rule):
+class FdLeakRule(MeasuredRule):
     """Detect per-process FD leaks via linear regression on fds_max rollups.
 
     Queries ``proc_rollup_1m`` for each registered process, fits a line to
@@ -83,6 +91,8 @@ class FdLeakRule(Rule):
     title = "ファイルディスクリプタリーク疑い"
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
+    requires_rows = ("proc_rollup_1m",)
+    headline = Headline("FD 増加率", "/h", threshold="slope_warning_fd_h")
     what = "proc_rollup_1m の fds_max に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "FD リークは open() のクローズ忘れによる単調増加として現れる。"
@@ -98,72 +108,63 @@ class FdLeakRule(Rule):
     slope_warning_fd_h: float = _FD_LEAK_SLOPE_WARNING_FD_H
     min_r2: float = _FD_LEAK_MIN_R2
 
-    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
-        """Run FD-LEAK-01 against the observation window."""
-        findings: list[Finding] = []
-
-        fds_by_proc = group_series(
+    def observe(self, store: "Storage", window: Window) -> list[Observation]:
+        return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
-            key="proc_id",
-            value="fds_max",
+            store.proc_identities(),
+            "fds_max",
+            min_span_hours=self.min_observation_hours,
         )
 
-        for proc_id, series, fit in fit_each(
-            fds_by_proc,
-            min_points=12,
-            min_span_hours=self.min_observation_hours,
-            min_r2=self.min_r2,
-        ):
-            slope_fd_h = fit.slope_per_hour
-            if slope_fd_h < self.slope_warning_fd_h:
-                continue
+    def judge(
+        self, store: "Storage", window: Window, obs: Observation
+    ) -> Optional[Finding]:
+        fit = observed_fit(obs)
+        slope_fd_h = obs.value
+        if fit.r2 < self.min_r2 or slope_fd_h < self.slope_warning_fd_h:
+            return None
 
-            process_name = store.proc_name(proc_id)
-            confidence = confidence_from_fit(
-                fit, min_observation_hours=self.min_observation_hours
-            )
+        proc_id = obs.evidence["proc_id"]
+        process_name = obs.subject
+        confidence = confidence_from_fit(
+            fit, min_observation_hours=self.min_observation_hours
+        )
 
-            # Estimate days until the soft/hard FD limit is reached — the
-            # process's recorded RLIMIT_NOFILE when known, else common defaults.
-            current_fds = series[-1][1]
-            limits = store.proc_fd_limits(proc_id)
-            soft, hard = limits or (_FD_SOFT_LIMIT_DEFAULT, _FD_HARD_LIMIT_DEFAULT)
-            days_to_soft_limit = days_until(current_fds, soft, slope_fd_h)
-            days_to_hard_limit = days_until(current_fds, hard, slope_fd_h)
+        current_fds = obs.evidence["last_value"]
+        limits = store.proc_fd_limits(proc_id)
+        soft, hard = limits or (_FD_SOFT_LIMIT_DEFAULT, _FD_HARD_LIMIT_DEFAULT)
+        days_to_soft_limit = days_until(current_fds, soft, slope_fd_h)
+        days_to_hard_limit = days_until(current_fds, hard, slope_fd_h)
 
-            evidence = {
-                "proc_id": proc_id,
-                "process_name": process_name,
-                "slope_fd_per_h": slope_fd_h,
-                "r2": fit.r2,
-                "n": fit.n,
-                "span_hours": fit.span_hours,
-                "current_fds": current_fds,
-                "days_to_soft_limit": days_to_soft_limit,
-                "days_to_hard_limit": days_to_hard_limit,
-                "fd_soft_limit": soft,
-                "fd_hard_limit": hard,
-                "fd_limit_source": "measured" if limits else "default",
-            }
+        evidence = {
+            "proc_id": proc_id,
+            "process_name": process_name,
+            "slope_fd_per_h": slope_fd_h,
+            "r2": fit.r2,
+            "n": fit.n,
+            "span_hours": fit.span_hours,
+            "current_fds": current_fds,
+            "days_to_soft_limit": days_to_soft_limit,
+            "days_to_hard_limit": days_to_hard_limit,
+            "fd_soft_limit": soft,
+            "fd_hard_limit": hard,
+            "fd_limit_source": "measured" if limits else "default",
+        }
 
-            summary = (
-                f"{process_name}: FD数 +{slope_fd_h:.1f}/h で単調増加"
-                f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
-            )
+        summary = (
+            f"{process_name}: FD数 +{slope_fd_h:.1f}/h で単調増加"
+            f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
+        )
 
-            findings.append(
-                Finding(
-                    rule_id=self.rule_id,
-                    severity=Severity.WARNING,
-                    subject=process_name,
-                    summary=summary,
-                    evidence=evidence,
-                    detected_at=(window.start_ts, window.end_ts),
-                    confidence=confidence,
-                )
-            )
-
-        return findings
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.WARNING,
+            subject=process_name,
+            summary=summary,
+            evidence=evidence,
+            detected_at=(window.start_ts, window.end_ts),
+            confidence=confidence,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +173,7 @@ class FdLeakRule(Rule):
 
 
 @register
-class ThreadLeakRule(Rule):
+class ThreadLeakRule(MeasuredRule):
     """Detect per-process thread leaks via linear regression on threads_max rollups.
 
     Queries ``proc_rollup_1m`` for each registered process, fits a line to
@@ -185,6 +186,8 @@ class ThreadLeakRule(Rule):
     title = "スレッドリーク疑い"
     default_severity = Severity.WARNING
     min_observation_hours = 6.0
+    requires_rows = ("proc_rollup_1m",)
+    headline = Headline("スレッド増加率", "/h", threshold="slope_warning_h")
     what = "proc_rollup_1m の threads_max に線形回帰をかけ、増加傾向と R² で判定する"
     why = (
         "スレッドリークはスレッドの生成後に join/detach が漏れる典型的バグ。"
@@ -199,67 +202,56 @@ class ThreadLeakRule(Rule):
     slope_warning_h: float = _THREAD_LEAK_SLOPE_WARNING_H
     min_r2: float = _THREAD_LEAK_MIN_R2
 
-    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
-        """Run THREAD-LEAK-01 against the observation window."""
-        findings: list[Finding] = []
-
-        threads_by_proc = group_series(
+    def observe(self, store: "Storage", window: Window) -> list[Observation]:
+        return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
-            key="proc_id",
-            value="threads_max",
+            store.proc_identities(),
+            "threads_max",
+            min_span_hours=self.min_observation_hours,
         )
 
-        for proc_id, series, fit in fit_each(
-            threads_by_proc,
-            min_points=12,
-            min_span_hours=self.min_observation_hours,
-            min_r2=self.min_r2,
-        ):
-            slope_h = fit.slope_per_hour
-            if slope_h < self.slope_warning_h:
-                continue
+    def judge(
+        self, store: "Storage", window: Window, obs: Observation
+    ) -> Optional[Finding]:
+        fit = observed_fit(obs)
+        slope_h = obs.value
+        if fit.r2 < self.min_r2 or slope_h < self.slope_warning_h:
+            return None
 
-            process_name = store.proc_name(proc_id)
-            confidence = confidence_from_fit(
-                fit, min_observation_hours=self.min_observation_hours
-            )
+        process_name = obs.subject
+        confidence = confidence_from_fit(
+            fit, min_observation_hours=self.min_observation_hours
+        )
 
-            # Estimate days until a nominal thread-max limit is reached.
-            current_threads = series[-1][1]
-            days_to_thread_max = days_until(
-                current_threads, _THREADS_MAX_DEFAULT, slope_h
-            )
+        current_threads = obs.evidence["last_value"]
+        days_to_thread_max = days_until(current_threads, _THREADS_MAX_DEFAULT, slope_h)
 
-            evidence = {
-                "proc_id": proc_id,
-                "process_name": process_name,
-                "slope_threads_per_h": slope_h,
-                "r2": fit.r2,
-                "n": fit.n,
-                "span_hours": fit.span_hours,
-                "current_threads": current_threads,
-                "days_to_thread_max": days_to_thread_max,
-                "thread_max_estimate": _THREADS_MAX_DEFAULT,
-            }
+        evidence = {
+            "proc_id": obs.evidence["proc_id"],
+            "process_name": process_name,
+            "slope_threads_per_h": slope_h,
+            "r2": fit.r2,
+            "n": fit.n,
+            "span_hours": fit.span_hours,
+            "current_threads": current_threads,
+            "days_to_thread_max": days_to_thread_max,
+            "thread_max_estimate": _THREADS_MAX_DEFAULT,
+        }
 
-            summary = (
-                f"{process_name}: スレッド数 +{slope_h:.1f}/h で単調増加"
-                f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
-            )
+        summary = (
+            f"{process_name}: スレッド数 +{slope_h:.1f}/h で単調増加"
+            f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
+        )
 
-            findings.append(
-                Finding(
-                    rule_id=self.rule_id,
-                    severity=Severity.WARNING,
-                    subject=process_name,
-                    summary=summary,
-                    evidence=evidence,
-                    detected_at=(window.start_ts, window.end_ts),
-                    confidence=confidence,
-                )
-            )
-
-        return findings
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.WARNING,
+            subject=process_name,
+            summary=summary,
+            evidence=evidence,
+            detected_at=(window.start_ts, window.end_ts),
+            confidence=confidence,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +260,7 @@ class ThreadLeakRule(Rule):
 
 
 @register
-class ZombieRule(Rule):
+class ZombieRule(MeasuredRule):
     """Detect accumulating zombie processes from the per-scan zombie count.
 
     The process sampler records the number of processes in the zombie state on
@@ -284,6 +276,8 @@ class ZombieRule(Rule):
     title = "ゾンビプロセス増加疑い"
     default_severity = Severity.INFO
     min_observation_hours = 6.0
+    requires_rows = ("proc_samples",)
+    headline = Headline("ゾンビ増加率", "/h", threshold="slope_warning_h", digits=2)
     what = (
         "プロセス走査ごとのゾンビ数 (proc_counts) を時系列化し、"
         "増加傾向を線形回帰で検出する"
@@ -300,15 +294,11 @@ class ZombieRule(Rule):
     # Minimum slope (zombies/h) to emit INFO.
     slope_warning_h: float = 0.0
 
-    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
-        """Run ZOMBIE-01 against the observation window."""
+    def observe(self, store: "Storage", window: Window) -> list[Observation]:
         series = self._counted_series(store, window)
         exact = bool(series)
         if not exact:
             series = self._approx_series(store, window)
-        if not series:
-            return []
-
         fit = fit_linear(
             series,
             min_points=12,
@@ -316,15 +306,35 @@ class ZombieRule(Rule):
         )
         if fit is None:
             return []
+        return [
+            Observation(
+                subject="zombie_processes",
+                identity=None,
+                value=fit.slope_per_hour,
+                evidence={
+                    "method": "status" if exact else "approx",
+                    "r2": fit.r2,
+                    "n": fit.n,
+                    "span_hours": fit.span_hours,
+                    "last_value": series[-1][1],
+                },
+            )
+        ]
 
-        slope_h = fit.slope_per_hour
+    def judge(
+        self, store: "Storage", window: Window, obs: Observation
+    ) -> Optional[Finding]:
+        fit = observed_fit(obs)
+        slope_h = obs.value
         if slope_h <= self.slope_warning_h:
-            return []
+            return None
 
+        exact = obs.evidence["method"] == "status"
+        current = obs.evidence["last_value"]
         if exact:
             summary = (
                 f"ゾンビプロセス数が +{slope_h:.2f}/h の傾向で増加中"
-                f" (現在 {series[-1][1]:.0f} 個, R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
+                f" (現在 {current:.0f} 個, R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
             )
         else:
             summary = (
@@ -338,22 +348,20 @@ class ZombieRule(Rule):
             "r2": fit.r2,
             "n": fit.n,
             "span_hours": fit.span_hours,
-            "method": "status" if exact else "approx",
-            "current_zombies": series[-1][1] if exact else None,
+            "method": obs.evidence["method"],
+            "current_zombies": current if exact else None,
             "confidence": confidence.value,
         }
 
-        return [
-            Finding(
-                rule_id=self.rule_id,
-                severity=Severity.INFO,
-                subject="zombie_processes",
-                summary=summary,
-                evidence=evidence,
-                detected_at=(window.start_ts, window.end_ts),
-                confidence=confidence,
-            )
-        ]
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.INFO,
+            subject="zombie_processes",
+            summary=summary,
+            evidence=evidence,
+            detected_at=(window.start_ts, window.end_ts),
+            confidence=confidence,
+        )
 
     @staticmethod
     def _counted_series(store: "Storage", window: Window) -> list[tuple[float, float]]:

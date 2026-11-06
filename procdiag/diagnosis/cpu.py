@@ -67,6 +67,7 @@ class CpuPeriodicRule(Rule):
     title = "周期的 CPU スパイク"
     default_severity = Severity.INFO
     min_observation_hours = 0.0  # periodicity detection needs calendar span
+    requires_schema = ("spike_events",)
     what = (
         "spike_events の発火時刻に周期性検出アルゴリズムをかけ、"
         "日次・時次の反復パターンを探す"
@@ -157,6 +158,7 @@ class CpuSinglecoreRule(Rule):
     title = "シングルコア飽和"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
+    requires_rows = ("sys_rollup_1m",)
     what = (
         "sys_rollup_1m で cpu_max_core_max ≥ 95% かつ cpu_avg < 50% の"
         "連続分数を数え、15分以上継続したらプロセスを突合する"
@@ -348,6 +350,7 @@ class CpuSaturationRule(Rule):
     title = "CPU 飽和 (PSI)"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
+    requires_rows = ("sys_samples",)
     what = (
         "sys_samples の psi_cpu_some10 が閾値超の連続分数を数え、15分以上継続したら"
         "spike_events の top_processes から犯人プロセスを集計して列挙する"

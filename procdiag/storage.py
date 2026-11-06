@@ -358,7 +358,7 @@ def make_row(table: str, **values: Any) -> tuple:
 # ---------------------------------------------------------------------------
 
 # Raw high-frequency samples: kept for ``retention.raw`` (e.g. 48h).
-_RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
+RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
 # 1-minute rollups: keyed by ``ts_min`` and kept for ``retention.rollup``.
 _ROLLUP_TABLES = ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m")
 # Low-frequency raw samples that are cheap enough to keep as long as rollups.
@@ -369,13 +369,16 @@ _LONG_LIVED_TABLES = (
     "service_events",
     "kernel_events",
 )
+# Samplers that legitimately never write on some hosts (no thermal sensor, no
+# watch_dirs configured).
+OPTIONAL_SAMPLER_TABLES = frozenset({"thermal_samples", "dir_samples"})
 # Tables without a ``ts`` column (lookups, and the tiny session history that is
 # kept for good so reboots can be compared across the whole recording).
 _NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry", "sessions")
 # Every table, in the order ``counts()`` reports them.
 _ALL_TABLES = (
     *_NO_TS_TABLES,
-    *_RAW_TABLES,
+    *RAW_TABLES,
     *_LONG_LIVED_TABLES,
     "spike_events",
     "ops_events",
@@ -710,7 +713,7 @@ class Storage:
         rollup_cutoff = now - parse_duration(rollup)
 
         with self.conn:
-            raw_deleted = self._delete_before(_RAW_TABLES, raw_cutoff)
+            raw_deleted = self._delete_before(RAW_TABLES, raw_cutoff)
         with self.conn:
             rollup_deleted = self._delete_before(
                 _ROLLUP_TABLES + _LONG_LIVED_TABLES, rollup_cutoff
@@ -982,16 +985,28 @@ class Storage:
             result["db_bytes"] = 0
         return result
 
-    def time_bounds(self, table: str) -> Optional[Tuple[float, float]]:
+    def time_bounds(
+        self,
+        table: str,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
         """Return ``(min_ts, max_ts)`` of *table*, or ``None`` when it is empty.
 
+        *since* / *until* restrict the rows like :meth:`rows` (inclusive).
         Aggregated in SQL so callers that only need the recorded span (status,
         window detection) never materialise a long recording into Python.
         """
         ts_col = _ts_column(table)
-        row = self.conn.execute(
-            f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table}"
-        ).fetchone()
+        q = f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table} WHERE 1=1"
+        params: List[Any] = []
+        if since is not None:
+            q += f" AND {ts_col} >= ?"
+            params.append(since)
+        if until is not None:
+            q += f" AND {ts_col} <= ?"
+            params.append(until)
+        row = self.conn.execute(q, params).fetchone()
         if row is None or row["lo"] is None:
             return None
         return float(row["lo"]), float(row["hi"])
@@ -1132,6 +1147,16 @@ class Storage:
             "SELECT name FROM proc_registry WHERE proc_id = ?", (proc_id,)
         ).fetchone()
         return row["name"] if row else f"proc_{proc_id}"
+
+    def proc_identities(self) -> Dict[int, Tuple[str, str]]:
+        """``{proc_id: (name, cmdline_hash)}`` for every registered process.
+
+        The pair is ``proc_registry``'s UNIQUE key and is stable across DBs.
+        """
+        return {
+            r["proc_id"]: (r["name"], r["cmdline_hash"])
+            for r in self.rows("proc_registry")
+        }
 
     def proc_first_seen(self, proc_id: int) -> Optional[float]:
         """Return the ``first_seen`` timestamp for *proc_id*, or None.

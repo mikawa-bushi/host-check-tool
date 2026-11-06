@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import (
     TYPE_CHECKING,
+    Any,
+    ClassVar,
     Dict,
     List,
     Mapping,
@@ -21,7 +23,7 @@ from typing import (
     Union,
 )
 
-from .result import Finding, Severity, Window
+from .result import Finding, Headline, Measurement, Observation, Severity, Window
 
 if TYPE_CHECKING:
     # Avoid circular imports at runtime; both are only referenced in type hints.
@@ -46,6 +48,14 @@ class Rule:
     what: str = ""  # what pattern is detected (Japanese)
     why: str = ""  # why this detection method (Japanese)
     manual_commands: list[str] = []
+    # requires_schema: tables / "table.column" that must exist in the DB
+    #   (event tables included).
+    # requires_rows: sampled tables without whose rows in the window the rule
+    #   cannot fire.  Never event tables (empty is their normal state) and
+    #   never tables read only to attribute a finding.  Tables listed here must
+    #   exist as well.
+    requires_schema: tuple[str, ...] = ()
+    requires_rows: tuple[str, ...] = ()
 
     @classmethod
     def tunables(cls) -> Dict[str, Union[int, float]]:
@@ -91,6 +101,63 @@ class Rule:
         raise NotImplementedError(
             f"ルール {self.__class__.__name__} は evaluate() を実装していません"
         )
+
+
+class MeasuredRule(Rule):
+    """A rule that measures every subject, then judges which are problems.
+
+    ``observe`` returns one Observation per measurable subject with no
+    threshold applied; ``judge`` turns one into a Finding or declines.
+    ``evaluate`` is derived from the two and cannot be overridden, so the
+    findings ``check`` prints and the values ``compare`` shows for a subject
+    that no longer fires come from one computation.  A subject missing from
+    ``observe`` means "not measurable here", never "fine".
+    """
+
+    headline: ClassVar[Headline]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        overridden = {"evaluate", "assess"} & set(vars(cls))
+        if overridden:
+            raise TypeError(
+                f"{cls.__name__}: MeasuredRule は {', '.join(sorted(overridden))}()"
+                " を上書きできません (observe / judge を実装してください)"
+            )
+        headline = getattr(cls, "headline", None)
+        if not isinstance(headline, Headline):
+            raise TypeError(f"{cls.__name__}: headline を宣言してください")
+        if headline.threshold not in cls.tunables():
+            raise TypeError(
+                f"{cls.__name__}: headline.threshold '{headline.threshold}'"
+                " は調整可能なしきい値ではありません"
+            )
+
+    def observe(self, store: "Storage", window: Window) -> list[Observation]:
+        """Measure every subject in *window*; no thresholds."""
+        raise NotImplementedError(
+            f"ルール {self.__class__.__name__} は observe() を実装していません"
+        )
+
+    def judge(
+        self, store: "Storage", window: Window, obs: Observation
+    ) -> Optional[Finding]:
+        """The Finding for *obs* when it crosses this rule's thresholds, else None.
+
+        May read *store* only to enrich a Finding that already fires.
+        """
+        raise NotImplementedError(
+            f"ルール {self.__class__.__name__} は judge() を実装していません"
+        )
+
+    def assess(self, store: "Storage", window: Window) -> list[Measurement]:
+        return [
+            Measurement(obs, self.judge(store, window, obs))
+            for obs in self.observe(store, window)
+        ]
+
+    def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
+        return [m.finding for m in self.assess(store, window) if m.finding]
 
 
 def resolve_overrides(
