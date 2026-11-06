@@ -1,9 +1,7 @@
 name: CI
 
-# Formatting (black), lint (ruff) and the full pytest suite in one workflow.
-# It is kept to two short jobs per push so the organisation stays inside the
-# free Actions minutes (private repos: 2,000 Linux minutes / month, every job
-# rounded up to a whole minute).
+# Formatting (black), lint (ruff) and the full pytest suite in one workflow,
+# kept to two short jobs per push.
 on:
   push:
     branches:
@@ -29,7 +27,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A hung test would otherwise bill up to the 6 h job limit.
+    # A hung test would otherwise run up to the 6 h job limit.
     timeout-minutes: 10
     name: pytest (Python ${{ matrix.python-version }})
     strategy:

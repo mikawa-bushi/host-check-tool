@@ -94,7 +94,3 @@ jobs:
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         skip-existing: true
-        # Attestations are signed into the public Sigstore log, which would
-        # expose this private repo's workflow and commit details. Turn them
-        # on if the repository becomes public.
-        attestations: false
