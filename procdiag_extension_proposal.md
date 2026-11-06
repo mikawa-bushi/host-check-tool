@@ -3,7 +3,7 @@
 対象: host-check-tool / procdiag 0.1.1(13ルール・M1〜M8完了・PyPI公開済み)
 ステータス: 提案 (2026-06-12)。採用範囲が決まり次第、tasks/ ゴールファイル方式で実装に落とす。
 
-> **対応状況 (v0.4.0, 2026-11-05)**: EXT-01 (OOM-KILL-01)、EXT-02 (PSS 精査の自動配線)、EXT-09 (`doctor`)、EXT-11 (DB 自己防衛) は実装済み。EXT-03 は簡略版 (初出が現在の起動より前かだけを見る)、EXT-04 は MEM-PRESSURE-01 のみ、EXT-05 は温度 (THERMAL-01) のみ実装。未着手は EXT-05 の残り (SMART・ファン)、EXT-06 `compare`、EXT-07 定期レポート、EXT-08 AlertSink、EXT-10 英語レポート (設定 `report.lang` はあるがどこからも読まれていない)、EXT-12 Prometheus 出力。EXT-13・EXT-14 は §3 のロードマップのとおり保留。
+> **対応状況 (v0.5.0, 2026-11-06)**: EXT-01 (OOM-KILL-01)、EXT-02 (PSS 精査の自動配線)、EXT-06 (`compare`、v0.5.0)、EXT-09 (`doctor`)、EXT-11 (DB 自己防衛) は実装済み。EXT-06 の出力は text / json の 2 形式で、html は未対応。EXT-03 は簡略版 (初出が現在の起動より前かだけを見る)、EXT-04 は MEM-PRESSURE-01 のみ、EXT-05 は温度 (THERMAL-01) のみ実装。未着手は EXT-05 の残り (SMART・ファン)、EXT-07 定期レポート、EXT-08 AlertSink、EXT-10 英語レポート (設定 `report.lang` はあるがどこからも読まれていない)、EXT-12 Prometheus 出力。EXT-13・EXT-14 は §3 のロードマップのとおり保留。
 
 ---
 

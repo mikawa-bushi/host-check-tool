@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-06
+
 ### Added
 - **`procdiag compare`**: 対策の前後 (1 つの DB を `--at` で分ける / `--before` `--after` で期間を指定する / 2 つの DB) を同じルール・しきい値で比べ、検出ごとに 解消 / 改善 / 変化なし / 悪化 / 新規 / 判定不能 を示す。リーク系 4 ルールは検出が消えた期間でも値を測り、「RSS 増加率 38.0 → 0.2 MB/h」のように前後の数値を並べる。記録時間不足・生データの保持期間外・古い版の DB などで判定できないものは理由つきで「判定不能」とし、終了コード 3 で知らせる。出力は text / json (`"format": "procdiag-compare/1"`)。
 - タグ `vX.Y.Z` の push で PyPI へ公開する GitHub Actions ワークフロー (`.github/workflows/publish.yml`)。trusted publishing (OIDC) を使うため PyPI のトークンをどこにも保存しない。タグと `pyproject.toml` の版が一致し、タグのコミットが `main` 上にあって CI に通っていることを確かめてからビルド・公開する。配布ファイルには PEP 740 の来歴証明 (attestations) を付ける。
