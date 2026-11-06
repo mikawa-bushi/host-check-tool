@@ -220,10 +220,7 @@ class Engine:
         if window is None:
             window, has_data = self._determine_window(store, reasoning)
         else:
-            has_data = any(
-                store.time_bounds(t, window.start_ts, window.end_ts) is not None
-                for t in ("sys_samples", "sys_rollup_1m")
-            )
+            has_data = store.system_bounds(window.start_ts, window.end_ts) is not None
 
         if not has_data:
             reasoning.append(

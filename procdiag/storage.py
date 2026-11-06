@@ -990,10 +990,13 @@ class Storage:
         table: str,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        *,
+        before: Optional[float] = None,
     ) -> Optional[Tuple[float, float]]:
         """Return ``(min_ts, max_ts)`` of *table*, or ``None`` when it is empty.
 
-        *since* / *until* restrict the rows like :meth:`rows` (inclusive).
+        *since* / *until* restrict the rows like :meth:`rows` (inclusive);
+        *before* is an exclusive upper bound.
         Aggregated in SQL so callers that only need the recorded span (status,
         window detection) never materialise a long recording into Python.
         """
@@ -1006,6 +1009,9 @@ class Storage:
         if until is not None:
             q += f" AND {ts_col} <= ?"
             params.append(until)
+        if before is not None:
+            q += f" AND {ts_col} < ?"
+            params.append(before)
         row = self.conn.execute(q, params).fetchone()
         if row is None or row["lo"] is None:
             return None
@@ -1185,6 +1191,28 @@ class Storage:
         if bounds is not None:
             return bounds[0], bounds[1], True
         return None
+
+    def system_bounds(
+        self,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        *,
+        before: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Return ``(min_ts, max_ts)`` over ``sys_samples`` and ``sys_rollup_1m``
+        combined, or ``None`` when neither has a row in range.
+
+        Bounds as in :meth:`time_bounds`.
+        """
+        found = [
+            bounds
+            for table in ("sys_samples", "sys_rollup_1m")
+            if (bounds := self.time_bounds(table, since, until, before=before))
+            is not None
+        ]
+        if not found:
+            return None
+        return min(lo for lo, _ in found), max(hi for _, hi in found)
 
     def proc_fd_limits(self, proc_id: int) -> Optional[Tuple[int, int]]:
         """Return the recorded ``(soft, hard)`` RLIMIT_NOFILE for *proc_id*.

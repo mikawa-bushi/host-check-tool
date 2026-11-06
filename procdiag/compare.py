@@ -601,15 +601,10 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
 
 
 def _resolve(store: Storage, period: Period) -> Optional[tuple[Window, float]]:
-    until = None if period.until is None else period.until - 1e-3
-    bounds = [
-        b
-        for t in ("sys_samples", "sys_rollup_1m")
-        if (b := store.time_bounds(t, period.since, until)) is not None
-    ]
-    if not bounds:
+    bounds = store.system_bounds(period.since, before=period.until)
+    if bounds is None:
         return None
-    window = Window(min(b[0] for b in bounds), max(b[1] for b in bounds))
+    window = Window(*bounds)
     raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
     return window, (raw[1] - raw[0]) / 3600.0 if raw else 0.0
 
