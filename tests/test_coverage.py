@@ -159,6 +159,14 @@ class TestExplicitWindow:
         store.close()
         assert diag.no_data is True
 
+    def test_a_sample_on_the_window_end_counts_as_data(self, tmp_path):
+        store = make_db(tmp_path, hours=2)
+        start = time.time() - 2 * _HOUR
+        add_sys_baseline(store, hours=2, start_ts=start)
+        diag = Engine(_cfg()).run(store, window=Window(start - 600.0, start))
+        store.close()
+        assert diag.no_data is False
+
     def test_gap_and_throttle_counts_cover_only_the_window(self, tmp_path):
         store = make_db(tmp_path, hours=24)
         add_sys_baseline(store, hours=24)
