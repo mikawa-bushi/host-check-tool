@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from synth import add_sys_baseline, make_db
 
 import procdiag.diagnosis  # noqa: F401
 from procdiag.compare import (
@@ -27,6 +28,7 @@ from procdiag.compare import (
     exit_code,
     parse_instant,
     plan_request,
+    run_compare,
 )
 from procdiag.config import ProcdiagConfig
 from procdiag.core import (
@@ -446,3 +448,24 @@ class TestPlanRequest:
         ]:
             with pytest.raises(CompareError, match="重なって"):
                 check_order(before, after)
+
+
+class TestSplitBoundary:
+    _AT = 1_790_000_040.0
+
+    def _split(self, tmp_path, first_sample_ts):
+        store = make_db(tmp_path, hours=2)
+        add_sys_baseline(store, hours=2, start_ts=first_sample_ts)
+        store.close()
+        cmp = run_compare(_CFG, SplitRequest(store.path, self._AT))
+        return cmp.before.result.window, cmp.after.result.window
+
+    def test_a_sample_at_the_split_belongs_to_after_only(self, tmp_path):
+        before, after = self._split(tmp_path, self._AT - 3600.0)
+        assert after.start_ts == self._AT
+        assert before.end_ts == self._AT - 60.0
+
+    def test_a_sample_just_before_the_split_belongs_to_before(self, tmp_path):
+        before, after = self._split(tmp_path, self._AT - 3600.0 - 0.0005)
+        assert before.end_ts == self._AT - 0.0005
+        assert after.start_ts == self._AT + 59.9995

@@ -202,9 +202,11 @@ class Engine:
            keep the class default follow ``config.rules.min_observation_hours``
            (one knob for the regression rules, per design §6.3/§8), while rules
            that override it (e.g. 0.0 for instantaneous checks like
-           SWAP-THRASH-01) use their own value.  A rule whose declared inputs
-           (``requires_schema`` / ``requires_rows``) are missing for the
-           window is not run and is listed in ``uncovered_rules``.
+           SWAP-THRASH-01) use their own value, and so does a rule given
+           ``min_observation_hours`` in ``config.rules.overrides``.  A rule
+           whose declared inputs (``requires_schema`` / ``requires_rows``)
+           are missing for the window is not run and is listed in
+           ``uncovered_rules``.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
         5. Sort by severity → confidence.
@@ -220,10 +222,7 @@ class Engine:
         if window is None:
             window, has_data = self._determine_window(store, reasoning)
         else:
-            has_data = any(
-                store.time_bounds(t, window.start_ts, window.end_ts) is not None
-                for t in ("sys_samples", "sys_rollup_1m")
-            )
+            has_data = store.system_bounds(window.start_ts, window.end_ts) is not None
 
         if not has_data:
             reasoning.append(
@@ -347,7 +346,9 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _required_hours(self, rule: Rule) -> float:
-        if rule.min_observation_hours == Rule.min_observation_hours:
+        overridden = "min_observation_hours" in vars(rule)
+        uses_global = type(rule).min_observation_hours == Rule.min_observation_hours
+        if uses_global and not overridden:
             return self.config.rules.min_observation_hours
         return rule.min_observation_hours
 

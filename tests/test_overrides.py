@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 from click.testing import CliRunner
-from synth import add_cpu_saturation_samples, make_db
+from synth import (
+    add_cpu_saturation_samples,
+    add_proc_series,
+    add_sys_baseline,
+    make_db,
+)
 
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RulesConfig
@@ -85,6 +90,26 @@ class TestTunables:
 
 
 class TestEngineAndCli:
+    @pytest.mark.parametrize(
+        "overrides, ran",
+        [({}, False), ({"MEM-LEAK-01": {"min_observation_hours": 6.0}}, True)],
+    )
+    def test_min_hours_override_equal_to_the_default_wins(
+        self, tmp_path, overrides, ran
+    ):
+        store = make_db(tmp_path, hours=8)
+        add_sys_baseline(store, hours=8)
+        add_proc_series(
+            store, "myapp", rss_start=100 * 2**20, rss_slope_per_h=0.0, hours=8
+        )
+        config = ProcdiagConfig(
+            rules=RulesConfig(min_observation_hours=60.0, overrides=overrides)
+        )
+        diag = Engine(config).run(store, only=["MEM-LEAK-01"])
+        store.close()
+        assert ("MEM-LEAK-01" in diag.evaluated_rules) is ran
+        assert bool(diag.skipped_rules) is not ran
+
     def _saturated_db(self, tmp_path):
         store = make_db(tmp_path, hours=1.0)
         add_cpu_saturation_samples(store, psi_cpu_high=35.0, duration_minutes=20)
