@@ -78,6 +78,7 @@ procdiag bundle
 procdiag record --duration 24h --config config.py --db data/procdiag.db
 procdiag check  --format json --output findings.json
 procdiag check  --only MEM-LEAK-01,DISK-FULL-01
+procdiag check  --since "2026-10-01 00:00"   # 期間を選ぶ (既定は生データの残っている期間)
 procdiag compare --at "2026-10-28 09:00" --format json
 procdiag status --config /etc/procdiag/config.py   # DB の場所は config の db_path から
 ```
@@ -143,7 +144,7 @@ procdiag compare before.db after.db --format json --output compare.json
 | `0` | Finding なし (正常) |
 | `1` | critical / warning の Finding あり |
 | `2` | info レベルの Finding のみ (`--exit-zero-on-info` で 0 に畳める) |
-| `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
+| `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない、または `--since` / `--until` の期間に記録がない) |
 | `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
 
 `procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):

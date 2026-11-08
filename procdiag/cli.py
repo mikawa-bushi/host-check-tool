@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .config import ProcdiagConfig
     from .core import Diagnosis
     from .report import ChartData
+    from .storage import Storage
 
 # ---------------------------------------------------------------------------
 # Shared command helpers
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 # kept distinct from the diagnosis-result codes (0/1/2/3) so automation can
 # tell a broken observation pipeline (no DB = record never ran) from an
 # unhealthy host.
+_EXIT_NO_DATA = 3
 _EXIT_USAGE = 4
 
 _DB_MISSING_MSG = (
@@ -64,6 +66,18 @@ def _config_option(
         "--config", "config_path", default=None, type=click.Path(), help=help_text
     )
 
+
+_since_option = click.option(
+    "--since",
+    default=None,
+    help="診断する期間の始まり (例: '2026-10-28 09:00')。"
+    "省略すると生データの残っている範囲を診断する。",
+)
+_until_option = click.option(
+    "--until",
+    default=None,
+    help="診断する期間の終わり。この時刻ちょうどの記録は含まない。",
+)
 
 _quiet_option = click.option(
     "--quiet",
@@ -163,31 +177,116 @@ def _load_registries() -> None:
     from . import diagnosis, samplers  # noqa: F401  (imported for registration)
 
 
+def _parse_period(
+    since: Optional[str], until: Optional[str]
+) -> tuple[Optional[float], Optional[float]]:
+    """``--since`` / ``--until`` as epoch seconds; exit (code 4) when unreadable."""
+    from .compare import CompareError, parse_instant
+
+    try:
+        start = parse_instant(since) if since else None
+        end = parse_instant(until) if until else None
+    except CompareError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
+    if start is not None and end is not None and start >= end:
+        click.echo("エラー: --since は --until より前の時刻にしてください", err=True)
+        sys.exit(_EXIT_USAGE)
+    return start, end
+
+
+def _local_minute(ts: float) -> str:
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _period_notes(store: "Storage", diag: Diagnosis, *, chosen: bool) -> list[str]:
+    """Say what the diagnosed period leaves out, for the quality notes."""
+    from .core.rule import get_rule
+    from .storage import RAW_TABLES
+
+    window = diag.window
+    if window is None:
+        return []
+    notes = []
+    recorded = store.system_bounds()
+    if not chosen and recorded and recorded[0] < window.start_ts - 60:
+        notes.append(
+            f"記録は {_local_minute(recorded[0])} からありますが、診断したのは"
+            f"生データの残る {_local_minute(window.start_ts)} 以降の"
+            f" {window.span_hours:.1f} 時間です。それより前も診断するには --since を"
+            "指定してください (期間が長いほど時間とメモリを使います)。"
+        )
+    raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
+    raw_hours = (raw[1] - raw[0]) / 3600.0 if raw else 0.0
+    raw_rules = [
+        rid
+        for rid in diag.evaluated_rules
+        if (cls := get_rule(rid)) and set(cls.requires_rows) & set(RAW_TABLES)
+    ]
+    if raw_rules and 0 < raw_hours < window.span_hours - 1 / 60:
+        notes.append(
+            f"期間 {window.span_hours:.1f} 時間のうち生データがあるのは"
+            f" {raw_hours:.1f} 時間です。{', '.join(raw_rules)} は"
+            "生データのある範囲だけで評価しました。"
+        )
+    return notes
+
+
 def _diagnose(
     cfg: ProcdiagConfig,
     db: str,
     *,
     only: Optional[list[str]] = None,
     skip: Optional[list[str]] = None,
+    since: Optional[float] = None,
+    until: Optional[float] = None,
     verbose: bool = False,
     with_charts: bool = False,
 ) -> tuple[Diagnosis, Optional[ChartData], Optional[str]]:
     """Run the rules on *db*; return ``(diagnosis, charts, meta_hostname)``.
 
-    Charts and the recorded hostname are only needed for HTML output, so they
-    are read (inside the open connection) only when *with_charts* is set and
-    are ``None`` otherwise.
+    Without *since* / *until* the engine picks the period (the raw samples).
+    With either, the rules run over the records in ``[since, until)`` and the
+    command exits with code 3 when there are none.  Charts and the recorded
+    hostname are only needed for HTML output, so they are read (inside the
+    open connection) only when *with_charts* is set and are ``None`` otherwise.
     """
+    from .core import Window
     from .diagnosis import Engine
     from .report import build_charts
     from .storage import Storage
 
     charts = None
     meta_hostname = None
+    chosen = since is not None or until is not None
     with Storage(db, read_only=True) as store:
-        diag = Engine(cfg, verbose=verbose).run(store, only=only, skip=skip)
+        window = None
+        if chosen:
+            bounds = store.system_bounds(since, before=until)
+            if bounds is None:
+                recorded = store.system_bounds()
+                where = (
+                    f"記録があるのは {_local_minute(recorded[0])} 〜"
+                    f" {_local_minute(recorded[1])} です。"
+                    if recorded
+                    else "DB に記録がありません。"
+                )
+                click.echo(f"エラー: 指定した期間に記録がありません。{where}", err=True)
+                sys.exit(_EXIT_NO_DATA)
+            window = Window(*bounds)
+        diag = Engine(cfg, verbose=verbose).run(
+            store, only=only, skip=skip, window=window
+        )
+        diag.quality.notes.extend(_period_notes(store, diag, chosen=chosen))
         if with_charts:
-            charts = build_charts(store, config=cfg)
+            charts = build_charts(
+                store,
+                since=window.start_ts if window else None,
+                until=window.end_ts if window else None,
+                config=cfg,
+            )
             meta_hostname = store.meta().get("hostname")
     return diag, charts, meta_hostname
 
@@ -205,7 +304,7 @@ def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
     if diag.no_data and not diag.findings:
         # Empty DB / no observation at all — distinct from a healthy host so
         # callers (CI, wrappers) can tell "nothing recorded" from "all clear".
-        return 3
+        return _EXIT_NO_DATA
     return 0
 
 
@@ -352,6 +451,8 @@ def record(
 @_config_option("設定ファイルのパス。")
 @click.option("--only", default=None, help="カンマ区切りのルール ID のみ実行。")
 @click.option("--skip", default=None, help="カンマ区切りのルール ID をスキップ。")
+@_since_option
+@_until_option
 @click.option(
     "--format",
     "fmt",
@@ -375,6 +476,8 @@ def check(
     config_path: Optional[str],
     only: Optional[str],
     skip: Optional[str],
+    since: Optional[str],
+    until: Optional[str],
     fmt: str,
     output: Optional[str],
     verbose: bool,
@@ -384,19 +487,25 @@ def check(
 ) -> None:
     """記録済みデータに診断ルールを実行し、改善提案を出力します。
 
+    既定では生データの残っている期間を診断します。--since / --until で期間を
+    選べます (時刻はオフセットなしならこのホストのローカルタイム)。
+
     終了コード: 0=問題なし / 1=critical・warning あり / 2=info のみ /
-    3=観測データなし（DB にサンプルが1件もない＝記録が回っていない）/
-    4=前提条件エラー（DB ファイルが無い等）
+    3=観測データなし（DB にサンプルが1件もない＝記録が回っていない、
+    または指定した期間に記録がない）/ 4=前提条件エラー（DB ファイルが無い等）
     """
     from . import report as report_mod
     from .core.util import should_use_color
 
+    start, end = _parse_period(since, until)
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     diag, charts, meta_hostname = _diagnose(
         cfg,
         resolved_db,
         only=_split_ids(only),
         skip=_split_ids(skip),
+        since=start,
+        until=end,
         verbose=verbose,
         with_charts=fmt == "html",
     )
@@ -563,19 +672,26 @@ def compare(
     type=click.Path(),
     help="JSON レポートの出力先 (省略時はスキップ)。",
 )
+@_since_option
+@_until_option
 @_quiet_option
 def report(
     db_path: Optional[str],
     config_path: Optional[str],
     html_out: str,
     json_out: Optional[str],
+    since: Optional[str],
+    until: Optional[str],
     quiet: bool,
 ) -> None:
     """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
     from . import report as report_mod
 
+    start, end = _parse_period(since, until)
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-    diag, charts, meta_hostname = _diagnose(cfg, resolved_db, with_charts=True)
+    diag, charts, meta_hostname = _diagnose(
+        cfg, resolved_db, since=start, until=end, with_charts=True
+    )
 
     html_text = report_mod.render_html(
         diag,

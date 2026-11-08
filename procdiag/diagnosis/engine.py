@@ -333,6 +333,7 @@ class Engine:
             reasoning=reasoning,
             quality=quality,
             no_data=not has_data,
+            window=window if has_data else None,
             evaluated_rules=evaluated,
             skipped_rules=skipped,
             errored_rules=errored,
