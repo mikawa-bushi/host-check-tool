@@ -76,10 +76,17 @@ _quiet_option = click.option(
 def _load_config(
     config_path: Optional[str], db_path: Optional[str] = None
 ) -> ProcdiagConfig:
-    """Load the config (``./config.py`` by default) with an optional DB override."""
+    """Load the config (``./config.py`` by default) with an optional DB override.
+
+    Exits with code 4 when the config file is missing or broken.
+    """
     from .config import load_config
 
-    cfg = load_config(Path(config_path) if config_path else None)
+    try:
+        cfg = load_config(Path(config_path) if config_path else None)
+    except ValueError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
     if db_path:
         cfg = cfg.model_copy(update={"db_path": db_path})
     if cfg.rules.overrides:

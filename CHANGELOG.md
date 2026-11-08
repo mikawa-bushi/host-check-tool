@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Fixed
+- 設定ファイルが無い・文法が誤っている・`config` 変数が無いときに、各コマンドがエラーメッセージではなく Python のトレースバックを出して終了コード 1 で止まっていた。メッセージを表示して終了コード 4 で終わる。
 - `rules.overrides` で MEM-LEAK-01 / FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 の最低観測時間 (`min_observation_hours`) を 6.0 に上書きしても、全体設定 `rules.min_observation_hours` が 6.0 以外だと上書きが無視され、全体設定の時間が使われていた。
 - `procdiag compare --at` で、区切り時刻の直前 1 ミリ秒以内に記録されたサンプルが、修正前と修正後のどちらの期間にも入っていなかった。
 

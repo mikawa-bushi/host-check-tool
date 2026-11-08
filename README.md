@@ -144,7 +144,7 @@ procdiag compare before.db after.db --format json --output compare.json
 | `1` | critical / warning の Finding あり |
 | `2` | info レベルの Finding のみ (`--exit-zero-on-info` で 0 に畳める) |
 | `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
-| `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
+| `4` | 前提条件エラー (DB ファイルが無い、設定ファイルが無い・読み込めない等)。`1` の異常検出と区別される |
 
 `procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):
 
@@ -154,7 +154,7 @@ procdiag compare before.db after.db --format json --output compare.json
 | `1` | 修正後に critical / warning が残っている、または新たに出た |
 | `2` | 修正後に info のみ残る (`--exit-zero-on-info` で 0 に畳める) |
 | `3` | どちらかの期間に記録が無い、または修正前の critical / warning が修正後に判定不能 (記録を続ければ判定できる) |
-| `4` | 前提条件エラー (期間指定の誤り・1 つの DB で期間が重なる・DB が無い・DB の版が新しすぎる) |
+| `4` | 前提条件エラー (期間指定の誤り・1 つの DB で期間が重なる・DB が無い・DB の版が新しすぎる・設定ファイルが無い・読み込めない) |
 
 ## systemd 運用
 
