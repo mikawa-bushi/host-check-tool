@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from click.testing import CliRunner
 
+from procdiag.cli import cli
 from procdiag.config import (
     CONFIG_TEMPLATE,
     BudgetConfig,
@@ -167,3 +169,25 @@ def test_config_template_is_string():
     assert isinstance(CONFIG_TEMPLATE, str)
     assert "ProcdiagConfig" in CONFIG_TEMPLATE
     assert "SamplingConfig" in CONFIG_TEMPLATE
+
+
+@pytest.mark.parametrize(
+    "source, message",
+    [
+        (None, "見つかりません"),
+        ("x = 1\n", "'config' 変数が定義されていません"),
+        ("config = 1\n", "ProcdiagConfig のインスタンスではありません"),
+        ("config = (\n", "読み込みに失敗しました"),
+    ],
+)
+@pytest.mark.parametrize("command", ["check", "status", "snapshot"])
+def test_cli_reports_a_broken_config_file_and_exits_4(
+    tmp_path, command, source, message
+):
+    path = tmp_path / "broken_config.py"
+    if source is not None:
+        path.write_text(source, encoding="utf-8")
+    result = CliRunner().invoke(cli, [command, "--config", str(path)])
+    assert result.exit_code == 4, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert message in result.output
