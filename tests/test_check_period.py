@@ -142,7 +142,7 @@ class TestPeriodLength:
         report = _check_json(
             db, "--since", _iso(start), "--until", _iso(start + 24 * _HOUR)
         )
-        assert "MEM-PRESSURE-01" not in _skipped(report)
+        assert "MEM-PRESSURE-01" in report["evaluated_rules"]
 
     def test_a_period_minutes_short_still_skips_the_leak_rules(self, leaking_recording):
         db, start = leaking_recording

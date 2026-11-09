@@ -491,6 +491,7 @@ class TestObservationGuard:
         assert any("MEM-PRESSURE-01: 観測時間不足" in r for r in diag.reasoning)
         store.close()
 
+    @pytest.mark.parametrize("short_by", [0, 90], ids=["exact", "90s-short"])
     @pytest.mark.parametrize(
         ("rule_id", "growth"),
         [
@@ -499,20 +500,23 @@ class TestObservationGuard:
             ("THREAD-LEAK-01", {"rss_slope_per_h": 0.0, "threads_slope": 5.0}),
         ],
     )
-    def test_a_recording_exactly_as_long_as_required_reports_the_leak(
-        self, tmp_path, rule_id, growth
+    def test_a_recording_long_enough_to_evaluate_reports_the_leak(
+        self, tmp_path, rule_id, growth, short_by
     ):
         start = time.time() - 7 * _HOUR
+        duration = 6 * _HOUR - short_by
         store = make_db(tmp_path, hours=6.0)
-        add_sys_baseline(store, hours=6.0 + 1 / 60, start_ts=start)
+        add_sys_baseline(store, hours=duration / _HOUR, start_ts=start)
+        add_sys_baseline(store, hours=1 / 60, start_ts=start + duration)
         # The recorder never rolls up the minute in progress at stop, so the
-        # process rows of a 6 h recording end a minute before the system rows.
+        # process rows end with the last whole minute before it while the
+        # system rows run until the stop.
         add_proc_series(
             store,
             "leaky",
             rss_start=200 * _MB,
             **growth,
-            hours=6.0,
+            hours=duration / _HOUR,
             start_ts=start,
         )
 
@@ -522,6 +526,36 @@ class TestObservationGuard:
         assert rule_id in diag.evaluated_rules
         found = [f for f in diag.findings if f.rule_id == rule_id]
         assert [f.subject for f in found] == ["leaky"]
+        assert found[0].confidence == Confidence.MEDIUM
+
+    def test_a_disk_series_a_hair_under_6h_keeps_medium_confidence(self, tmp_path):
+        start = time.time() - 7 * _HOUR
+        store = make_db(tmp_path, hours=6.0)
+        add_sys_baseline(store, hours=6.0 + 1 / 60, start_ts=start)
+        # Real disk sample times drift by milliseconds: the disk rows of a
+        # 12-minute recording spanned 12 minutes less 14 ms.
+        span = 6 * _HOUR - 0.014
+        used_per_minute = 10 * _GB // (24 * 60)
+        rows = [
+            (
+                start + span * i / 360,
+                "/var",
+                100 * _GB,
+                90 * _GB + used_per_minute * i,
+                None,
+                None,
+                None,
+            )
+            for i in range(361)
+        ]
+        store.buffer("disk_samples", rows)
+        store.flush(reason="test")
+
+        diag = Engine(_cfg()).run(store, only=["DISK-FULL-01"])
+        store.close()
+
+        found = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
+        assert [f.subject for f in found] == ["/var"]
         assert found[0].confidence == Confidence.MEDIUM
 
     def test_instant_rule_runs_on_short_window(self, tmp_path):
