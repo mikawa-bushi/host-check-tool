@@ -738,6 +738,52 @@ class TestCheckHtmlCharts:
 
 
 # ---------------------------------------------------------------------------
+# check --output: the suffix picks the format unless --format is given
+# ---------------------------------------------------------------------------
+
+
+class TestCheckOutputFormat:
+    def _check(self, runner, db, *args):
+        result = runner.invoke(cli, ["check", "--db", str(db), *args])
+        assert result.exit_code == 0, result.output
+        return result
+
+    @pytest.mark.parametrize("name", ["r.html", "r.htm", "R.HTML"])
+    def test_html_suffix_writes_html_with_charts(
+        self, runner, db_with_data, tmp_path, name
+    ):
+        out = tmp_path / name
+        self._check(runner, db_with_data, "-o", str(out))
+        html = out.read_text(encoding="utf-8")
+        assert html.startswith("<!doctype html>")
+        assert "<polyline" in html
+
+    def test_json_suffix_writes_parseable_json(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "r.json"
+        self._check(runner, db_with_data, "--output", str(out))
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["no_data"] is False
+
+    @pytest.mark.parametrize(
+        ("name", "args"), [("r.txt", []), ("r.json", ["--format", "text"])]
+    )
+    def test_other_suffix_or_explicit_text_writes_terminal_text(
+        self, runner, db_with_data, tmp_path, name, args
+    ):
+        out = tmp_path / name
+        stdout = self._check(runner, db_with_data, "--no-color").output
+        self._check(runner, db_with_data, "--no-color", *args, "-o", str(out))
+        assert out.read_text(encoding="utf-8") + "\n" == stdout
+
+    def test_explicit_format_overrides_html_suffix(
+        self, runner, db_with_data, tmp_path
+    ):
+        out = tmp_path / "r.html"
+        self._check(runner, db_with_data, "--format", "json", "-o", str(out))
+        assert json.loads(out.read_text(encoding="utf-8"))["no_data"] is False
+
+
+# ---------------------------------------------------------------------------
 # check --exit-zero-on-info (issue #6 §5-3)
 # ---------------------------------------------------------------------------
 

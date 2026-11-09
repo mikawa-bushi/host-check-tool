@@ -75,7 +75,7 @@ procdiag report --out report.html --json report.json
 | `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェックする (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成する |
 | `procdiag record` | 常駐ループで 3 層サンプリングを実行する |
-| `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する |
+| `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する。`-o report.html` / `-o report.json` でファイルに書き出す |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag report` | HTML + JSON レポートを一括生成する (`check` のラッパー) |
 | `procdiag status` | 記録期間・サンプル数・自己負荷の概況を表示する |
@@ -100,8 +100,8 @@ procdiag report --out report.html --json report.json
 ### check / report の主要オプション
 
 ```
---format text|json|html   # 出力フォーマット
---output FILE             # ファイルに書き出す
+--format text|json|html   # 出力フォーマット (既定: --output の拡張子から判断し、それ以外は text)
+-o, --output FILE         # ファイルに書き出す (.html/.htm → html、.json → json)
 --only MEM-LEAK-01,...    # 指定ルールのみ実行
 --skip ZOMBIE-01,...      # 指定ルールをスキップ
 --verbose                 # 推論過程を表示

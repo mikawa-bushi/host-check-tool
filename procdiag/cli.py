@@ -192,6 +192,11 @@ def _diagnose(
     return diag, charts, meta_hostname
 
 
+# ``check --output`` suffix -> format, used when ``--format`` is not given, so
+# ``-o report.html`` writes HTML instead of terminal text in an .html file.
+_FORMAT_BY_SUFFIX = {".html": "html", ".htm": "html", ".json": "json"}
+
+
 def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
     """Map a diagnosis to the documented ``check`` exit code.
 
@@ -356,11 +361,16 @@ def record(
     "--format",
     "fmt",
     type=click.Choice(["text", "json", "html"]),
-    default="text",
-    help="出力フォーマット。",
+    default=None,
+    help="出力フォーマット (既定: --output の拡張子が .html/.htm なら html、"
+    ".json なら json、それ以外は text)。",
 )
 @click.option(
-    "--output", type=click.Path(), default=None, help="レポートをファイルに書き出す。"
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="レポートをファイルに書き出す (例: -o report.html)。",
 )
 @click.option("--verbose", is_flag=True, help="推論過程を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
@@ -375,7 +385,7 @@ def check(
     config_path: Optional[str],
     only: Optional[str],
     skip: Optional[str],
-    fmt: str,
+    fmt: Optional[str],
     output: Optional[str],
     verbose: bool,
     no_color: bool,
@@ -391,6 +401,7 @@ def check(
     from . import report as report_mod
     from .core.util import should_use_color
 
+    fmt = fmt or _FORMAT_BY_SUFFIX.get(Path(output or "").suffix.lower(), "text")
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     diag, charts, meta_hostname = _diagnose(
         cfg,

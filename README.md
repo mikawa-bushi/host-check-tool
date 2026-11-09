@@ -58,7 +58,7 @@ procdiag bundle
 | `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェック (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成 |
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
-| `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 |
+| `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 (`-o report.html` / `-o report.json` でファイルに) |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag report` | HTML + JSON レポートを一括生成 |
 | `procdiag status` | 記録期間・サンプル数・自己負荷を表示 |
@@ -76,7 +76,7 @@ procdiag bundle
 
 ```
 procdiag record --duration 24h --config config.py --db data/procdiag.db
-procdiag check  --format json --output findings.json
+procdiag check  -o findings.json   # 拡張子で形式を決める (.html/.htm → HTML、.json → JSON。--format が優先)
 procdiag check  --only MEM-LEAK-01,DISK-FULL-01
 procdiag compare --at "2026-10-28 09:00" --format json
 procdiag status --config /etc/procdiag/config.py   # DB の場所は config の db_path から
