@@ -33,6 +33,12 @@ from procdiag.storage import Storage
 # ---------------------------------------------------------------------------
 
 
+def _listed_commands(help_text: str) -> set[str]:
+    """Command names in the ``Commands:`` section of ``procdiag --help``."""
+    section = help_text.split("Commands:", 1)[1]
+    return {line.split()[0] for line in section.splitlines() if line.strip()}
+
+
 def _group_of(listing: str, name: str) -> str:
     """The ``[group]`` header above the line listing *name* in ``explain``."""
     group = ""
@@ -132,27 +138,40 @@ class TestHelpAndVersion:
             "init",
             "record",
             "check",
-            "report",
             "status",
             "explain",
-            "list-rules",
-            "list-samplers",
             "export",
             "prune",
             "service",
         ):
             assert cmd in result.output, f"'{cmd}' が --help に見つかりません"
 
-    def test_advise_is_hidden(self, runner):
-        """advise must not appear in the main --help listing."""
+    def test_help_does_not_list_removed_commands(self, runner):
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
-        assert "advise" not in result.output
+        listed = _listed_commands(result.output)
+        assert "check" in listed
+        assert not listed & {"report", "list-rules", "list-samplers", "advise"}
 
-    def test_advise_help_works(self, runner):
-        """advise must still be callable (just hidden)."""
-        result = runner.invoke(cli, ["advise", "--help"])
-        assert result.exit_code == 0
+    @pytest.mark.parametrize(
+        ("args", "replacement"),
+        [
+            (["report", "--out", "x.html"], "procdiag check --output report.html"),
+            (["list-rules"], "procdiag explain"),
+            (["list-samplers"], "procdiag explain"),
+            (["advise", "--help"], "procdiag check"),
+        ],
+    )
+    def test_removed_command_names_its_replacement(self, runner, args, replacement):
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 4
+        assert f"procdiag {args[0]} は削除されました" in result.output
+        assert replacement in result.output
+
+    def test_unknown_command_still_fails_normally(self, runner):
+        result = runner.invoke(cli, ["no-such-command"])
+        assert result.exit_code == 2
+        assert "削除されました" not in result.output
 
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
@@ -229,7 +248,7 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
-# explain / list-rules / list-samplers
+# explain
 # ---------------------------------------------------------------------------
 
 
@@ -327,37 +346,6 @@ class TestExplain:
         names = {ln.split()[0] for ln in result.output.splitlines() if ln[:2] == "  "}
         assert set(all_rules()) | set(all_samplers()) <= names
         assert {"system", "cgroup", "process", "disk", "thermal"} <= names
-
-
-class TestListRules:
-    def test_shows_fake_rule(self, runner, fake_rule):
-        result = runner.invoke(cli, ["list-rules"])
-        assert result.exit_code == 0
-        assert "FAKE-TEST-01" in result.output
-        assert "テスト用フェイクルール" in result.output
-
-    def test_no_crash_without_rules(self, runner):
-        result = runner.invoke(cli, ["list-rules"])
-        assert result.exit_code == 0
-
-
-class TestListSamplers:
-    def test_shows_fake_sampler(self, runner, fake_sampler):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        assert "fake_sampler" in result.output
-        assert "T1" in result.output
-
-    def test_no_crash_without_samplers(self, runner):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-
-    def test_lists_every_builtin_sampler(self, runner):
-        """All recorder samplers are listed (thermal used to be missing)."""
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        for name in ("system", "cgroup", "process", "disk", "thermal"):
-            assert name in result.output
 
     def test_explain_thermal_sampler(self, runner):
         result = runner.invoke(cli, ["explain", "thermal"])
@@ -758,23 +746,6 @@ class TestCheckHtmlCharts:
         # the 'データなし: <label>' placeholder.  The bug produced the latter.
         assert "<polyline" in html
         assert "データなし: CPU使用率" not in html
-
-    def test_check_html_matches_report_charts(self, runner, db_with_data, tmp_path):
-        out = tmp_path / "report.html"
-        res_report = runner.invoke(
-            cli, ["report", "--db", str(db_with_data), "--out", str(out)]
-        )
-        assert res_report.exit_code == 0, res_report.output
-        report_html = out.read_text(encoding="utf-8")
-
-        res_check = runner.invoke(
-            cli, ["check", "--db", str(db_with_data), "--format", "html"]
-        )
-        assert res_check.exit_code == 0, res_check.output
-
-        # Both paths must draw charts; previously only `report` did.
-        assert "<polyline" in report_html
-        assert "<polyline" in res_check.output
 
 
 # ---------------------------------------------------------------------------

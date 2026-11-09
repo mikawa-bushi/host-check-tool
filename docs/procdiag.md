@@ -62,8 +62,8 @@ procdiag status
 # 記録終了後に診断
 procdiag check
 
-# HTML + JSON レポートを一括生成
-procdiag report --out report.html --json report.json
+# HTML レポートを書き出す (拡張子が .json なら JSON)
+procdiag check -o report.html
 ```
 
 ---
@@ -77,12 +77,9 @@ procdiag report --out report.html --json report.json
 | `procdiag record` | 常駐ループで 3 層サンプリングを実行する |
 | `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する。`-o report.html` / `-o report.json` でファイルに書き出す |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
-| `procdiag report` | HTML + JSON レポートを一括生成する (`check` のラッパー) |
 | `procdiag status` | 記録期間・サンプル数・自己負荷の概況を表示する |
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/journal/センサ/DB空き) を診断する。降格ありで exit 2 |
-| `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する |
-| `procdiag list-rules` | 登録済みルールをカテゴリ別に一覧表示する |
-| `procdiag list-samplers` | 登録済みサンプラーを Tier 別に一覧表示する |
+| `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する。引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示する |
 | `procdiag export` | 記録データを CSV または JSON でエクスポートする |
 | `procdiag prune` | 保持ポリシーを手動実行する |
 | `procdiag bundle` | 記録 DB・レポート・snapshot・doctor を 1 つの tar.gz にまとめる (持ち出し解析用) |
@@ -97,7 +94,7 @@ procdiag report --out report.html --json report.json
 --db FILE        # DB ファイルパス (config の db_path を上書き)
 ```
 
-### check / report の主要オプション
+### check の主要オプション
 
 ```
 --format text|json|html   # 出力フォーマット (既定: --output の拡張子から判断し、それ以外は text)
@@ -169,7 +166,7 @@ procdiag compare before.db after.db                              # 2 つの DB (
 ```
 host-check-tool/
 ├── procdiag/
-│   ├── cli.py            # Click CLI (record / check / report / status / ...)
+│   ├── cli.py            # Click CLI (record / check / status / ...)
 │   ├── config.py         # Pydantic 設定モデル (ProcdiagConfig)
 │   ├── recorder.py       # 常駐ループ (Recorder) — サンプラーを束ねる
 │   ├── scheduler.py      # TierScheduler — 多間隔ジョブの軽量実行
@@ -211,7 +208,7 @@ host-check-tool/
 │       ├── crash.py      # OOM-KILL-01 / UNCLEAN-SHUTDOWN-01 / SERVICE-RESTART-01 / KERNEL-ERROR-01
 │       └── thermal.py    # THERMAL-01
 └── tests/
-    ├── test_e2e.py       # E2E: init→record→check→report の通し検証
+    ├── test_e2e.py       # E2E: init→record→check の通し検証
     ├── test_recorder.py  # Recorder / TierScheduler の単体テスト
     ├── test_sampler_*.py # 各サンプラーの単体テスト
     └── fixtures/         # /proc・/sys/fs/cgroup のモックツリー

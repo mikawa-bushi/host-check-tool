@@ -68,7 +68,7 @@ select = ["I", "F"]
 [tool.pytest.ini_options]
 markers = [
     "real_proc: 実マシンの /proc に対して実行するスモークテスト",
-    "e2e: record→check→report を通しで実行する統合テスト",
+    "e2e: record→check を通しで実行する統合テスト",
 ]
 
 [tool.coverage.run]
