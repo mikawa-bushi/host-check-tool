@@ -491,6 +491,39 @@ class TestObservationGuard:
         assert any("MEM-PRESSURE-01: 観測時間不足" in r for r in diag.reasoning)
         store.close()
 
+    @pytest.mark.parametrize(
+        ("rule_id", "growth"),
+        [
+            ("MEM-LEAK-01", {"rss_slope_per_h": 50 * _MB}),
+            ("FD-LEAK-01", {"rss_slope_per_h": 0.0, "fds_slope": 5.0}),
+            ("THREAD-LEAK-01", {"rss_slope_per_h": 0.0, "threads_slope": 5.0}),
+        ],
+    )
+    def test_a_recording_exactly_as_long_as_required_reports_the_leak(
+        self, tmp_path, rule_id, growth
+    ):
+        start = time.time() - 7 * _HOUR
+        store = make_db(tmp_path, hours=6.0)
+        add_sys_baseline(store, hours=6.0 + 1 / 60, start_ts=start)
+        # The recorder never rolls up the minute in progress at stop, so the
+        # process rows of a 6 h recording end a minute before the system rows.
+        add_proc_series(
+            store,
+            "leaky",
+            rss_start=200 * _MB,
+            **growth,
+            hours=6.0,
+            start_ts=start,
+        )
+
+        diag = Engine(_cfg(min_obs_hours=6.0)).run(store, only=[rule_id])
+        store.close()
+
+        assert rule_id in diag.evaluated_rules
+        found = [f for f in diag.findings if f.rule_id == rule_id]
+        assert [f.subject for f in found] == ["leaky"]
+        assert found[0].confidence == Confidence.MEDIUM
+
     def test_instant_rule_runs_on_short_window(self, tmp_path):
         """min_observation_hours=0.0 rules fire even on short recordings.
 
