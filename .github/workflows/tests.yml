@@ -38,7 +38,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     # setup-python's poetry cache asks Poetry where the venvs live, so Poetry
     # has to be installed first.
@@ -46,7 +46,7 @@ jobs:
       run: pipx install poetry==2.5.1
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
         cache: poetry
