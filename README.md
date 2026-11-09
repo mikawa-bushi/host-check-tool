@@ -157,7 +157,7 @@ procdiag compare before.db after.db --format json --output compare.json
 | `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
 
 `procdiag quick` も同じ番号を返す。診断のほか、最初の snapshot に warning / critical があるときも `1` になる。
-`--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を使えないとき、レポートを書けなかったときは `4`。
+`--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を使えないとき、レポートを書けなかったときは `4`。レポートを書けなかったときは、診断の結果より `4` を優先する。
 
 `procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):
 
