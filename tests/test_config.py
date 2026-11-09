@@ -180,14 +180,20 @@ def test_config_template_is_string():
         ("config = (\n", "読み込みに失敗しました"),
     ],
 )
-@pytest.mark.parametrize("command", ["check", "status", "snapshot"])
+@pytest.mark.parametrize(
+    "command",
+    [["check"], ["status"], ["snapshot"], ["quick", "--duration", "1s", "--out", "q"]],
+    ids=["check", "status", "snapshot", "quick"],
+)
 def test_cli_reports_a_broken_config_file_and_exits_4(
-    tmp_path, command, source, message
+    tmp_path, monkeypatch, command, source, message
 ):
+    monkeypatch.chdir(tmp_path)
     path = tmp_path / "broken_config.py"
     if source is not None:
         path.write_text(source, encoding="utf-8")
-    result = CliRunner().invoke(cli, [command, "--config", str(path)])
+    result = CliRunner().invoke(cli, [*command, "--config", str(path)])
     assert result.exit_code == 4, result.output
     assert isinstance(result.exception, SystemExit)
     assert message in result.output
+    assert not (tmp_path / "q").exists()
