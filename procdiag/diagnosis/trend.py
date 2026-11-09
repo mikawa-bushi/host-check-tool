@@ -63,10 +63,12 @@ class Period:
 # ---------------------------------------------------------------------------
 
 
-# The engine gate measures the window up to the last raw sample.  A process
-# series has only rollup rows, stamped with the start of their minute, and the
-# minute in progress at stop is never rolled up, so the series can run up to
-# two minutes shorter than a window the gate let through.
+# Rollup rows carry the start of their minute, the row stamped before the
+# window start is left out, and the minute in progress at stop is never rolled
+# up.  A rollup series inside a window the engine gate let through therefore
+# spans at least the requirement less four minutes (for a whole-minute
+# requirement).  On raw series such as disk rows or proc_counts this only adds
+# leniency.
 def _series_covers(span_hours: float, hours: float) -> bool:
     return covers(span_hours + 2 / 60, hours)
 

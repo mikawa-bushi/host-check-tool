@@ -65,7 +65,9 @@ _SPAN_ALLOWANCE_HOURS = 2 / 60
 
 def covers(span_hours: float, hours: float) -> bool:
     """Whether an observed span is long enough for a requirement of *hours*."""
-    return span_hours + _SPAN_ALLOWANCE_HOURS >= hours
+    # Spans between minute-stamped rows land exactly on the allowance, where
+    # float error in hours would decide the tie, so compare in microseconds.
+    return round((span_hours + _SPAN_ALLOWANCE_HOURS - hours) * 3600, 6) >= 0
 
 
 @dataclass
