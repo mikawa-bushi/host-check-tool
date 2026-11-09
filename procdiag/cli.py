@@ -275,7 +275,7 @@ class _ProcdiagGroup(click.Group):
 def cli() -> None:
     """procdiag — local-first Linux ホスト資源診断ツール。
 
-    初めての方は procdiag quick を実行してください。いまの状態の確認・30 分の記録・診断を 1 回で行います。
+    初めての方は procdiag quick を実行してください。いまの状態の確認・1 時間の記録・診断を 1 回で行います。
     """
     load_plugins()
 
@@ -490,9 +490,9 @@ def check(
 @cli.command()
 @click.option(
     "--duration",
-    default="30m",
+    default="1h",
     show_default=True,
-    help="記録する時間 (例: 10m, 1h)。",
+    help="記録する時間 (例: 30m, 2h)。",
 )
 @click.option(
     "--out",
