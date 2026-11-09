@@ -4,7 +4,22 @@
 
 ## [Unreleased]
 
+### Added
+- **`procdiag quick`**: 初めての人がこれだけ実行すれば診断まで終わるコマンド。いまの状態の確認 (snapshot)、短い記録 (既定 1 時間、`--duration`)、その記録の診断 (check と同じルール) を続けて行い、記録 DB と HTML レポートを `--out` (既定 `./procdiag-quick-<日時>`) に置く。記録中の Ctrl-C は記録を早めに終えるだけで、それまでの記録を診断する。最後に、snapshot で warning / critical だった項目をもう一度表示する。終了コードは check と同じで、snapshot に warning / critical があるときも 1。出力先を使えないときと、レポートを書けなかったときは 4。`procdiag --help` の冒頭で案内する。
+
+### Changed
+- `procdiag check --output` が拡張子から出力形式を決めるようになった (`.html` / `.htm` → HTML、`.json` → JSON、それ以外は text)。これまでは `--format` を付け忘れると `check --output report.html` が端末向けのテキストを .html ファイルに書いていた。`--format` を指定すればそちらが優先する。`--output` の短縮形 `-o` を追加。
+- `procdiag explain` (引数なし) の一覧を、ルールはカテゴリ別にタイトルつきで、サンプラーは Tier 別に記録間隔の設定名とタイトルつきで表示するようにした (`list-rules` / `list-samplers` と同じ表示)。
+
+### Removed
+- 重複していたコマンドを削除。削除した名前を実行すると、代わりのコマンドを示して終了コード 4 (前提条件エラー) で終わる。check の 2 (info のみ) と区別するため。
+  - `procdiag report` → `procdiag check -o report.html` (JSON は `-o report.json`)
+    - `report` は所見があっても終了コード 0 で終わっていた。`check` は critical / warning があると 1、info だけなら 2 で終わる。cron などで常に 0 が必要なら `|| true` を付ける。
+  - `procdiag list-rules` / `procdiag list-samplers` → `procdiag explain`
+  - `procdiag advise` (`check` の隠し別名) → `procdiag check`
+
 ### Fixed
+- `procdiag --help` のコマンド一覧に `check` が出ていなかった。隠し別名 `advise` を隠す設定が、同じコマンドの `check` まで隠していた。
 - 設定ファイルが無い・文法が誤っている・`config` 変数が無いときに、各コマンドがエラーメッセージではなく Python のトレースバックを出して終了コード 1 で止まっていた。メッセージを表示して終了コード 4 で終わる。
 - `rules.overrides` で MEM-LEAK-01 / FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 の最低観測時間 (`min_observation_hours`) を 6.0 に上書きしても、全体設定 `rules.min_observation_hours` が 6.0 以外だと上書きが無視され、全体設定の時間が使われていた。
 - `procdiag compare --at` で、区切り時刻の直前 1 ミリ秒以内に記録されたサンプルが、修正前と修正後のどちらの期間にも入っていなかった。

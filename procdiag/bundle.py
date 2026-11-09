@@ -186,7 +186,7 @@ def _readme(hostname: str, result: BundleResult) -> str:
         "別 PC での解析:",
         "  pip install host-check-tool",
         "  procdiag check  --db procdiag.db --verbose",
-        "  procdiag report --db procdiag.db --out report.html",
+        "  procdiag check  --db procdiag.db -o report.html",
         "",
     ]
     return "\n".join(lines)

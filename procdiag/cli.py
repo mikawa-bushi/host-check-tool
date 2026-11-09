@@ -1,8 +1,9 @@
 """``procdiag`` command-line interface.
 
 Conclusion-first host-resource diagnosis: ``procdiag record`` collects
-metrics, ``procdiag check`` (alias ``advise``) runs all rules and prints
-the root cause and next steps.  The remaining commands support that core
+metrics, ``procdiag check`` runs all rules and prints the root cause and
+next steps.  ``procdiag quick`` runs snapshot, a short record and check in
+one go for a first-time user.  The remaining commands support that core
 workflow (status, export, explain, prune) or system integration (service).
 
 Design mirrors netdiag's ``cli.py`` where possible:
@@ -16,6 +17,7 @@ Design mirrors netdiag's ``cli.py`` where possible:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -117,8 +119,8 @@ def _ensure_db_and_config(
 ) -> tuple[ProcdiagConfig, str]:
     """Load config, resolve the DB path, and exit (code 4) if the DB is absent.
 
-    Centralises the load_config + existence-check shared by check/report/
-    status/export/prune, and gives the DB-missing case its own exit code (4)
+    Centralises the load_config + existence-check shared by check/status/
+    export/prune, and gives the DB-missing case its own exit code (4)
     instead of overloading the diagnosis code 1.
     """
     cfg = _load_config(config_path, db_path)
@@ -199,6 +201,35 @@ def _diagnose(
     return diag, charts, meta_hostname
 
 
+# ``check --output`` suffix -> format, used when ``--format`` is not given, so
+# ``-o report.html`` writes HTML instead of terminal text in an .html file.
+_FORMAT_BY_SUFFIX = {".html": "html", ".htm": "html", ".json": "json"}
+
+
+def _render_html(
+    cfg: ProcdiagConfig,
+    diag: Diagnosis,
+    charts: Optional[ChartData],
+    meta_hostname: Optional[str],
+) -> str:
+    """The self-contained HTML report, as ``check`` and ``quick`` write it."""
+    from .report import render_html
+
+    return render_html(
+        diag,
+        charts,
+        hostname_label=cfg.report.hostname_label,
+        meta_hostname=meta_hostname,
+    )
+
+
+def _host_label(cfg: ProcdiagConfig) -> str:
+    """Host name shown by ``snapshot``: ``report.hostname_label`` or the real one."""
+    import socket
+
+    return cfg.report.hostname_label or socket.gethostname()
+
+
 def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
     """Map a diagnosis to the documented ``check`` exit code.
 
@@ -221,10 +252,39 @@ def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
-@click.group()
+# Removed command name -> what to run instead.  Kept so an old script or
+# muscle memory gets a pointer instead of click's bare "No such command".
+_REMOVED_COMMANDS = {
+    "report": "procdiag check --output report.html",
+    "list-rules": "procdiag explain",
+    "list-samplers": "procdiag explain",
+    "advise": "procdiag check",
+}
+
+
+class _ProcdiagGroup(click.Group):
+    def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
+        replacement = _REMOVED_COMMANDS.get(cmd_name)
+        if replacement is not None:
+            # Exit 4, not click's usage code 2: an old CI job calling a removed
+            # name must not read as check's "info only" (2) and pass.
+            err = click.UsageError(
+                f"procdiag {cmd_name} は削除されました。"
+                f"代わりに {replacement} を使ってください。",
+                ctx,
+            )
+            err.exit_code = _EXIT_USAGE
+            raise err
+        return super().get_command(ctx, cmd_name)
+
+
+@click.group(cls=_ProcdiagGroup)
 @click.version_option(version=__version__, prog_name="procdiag")
 def cli() -> None:
-    """procdiag — local-first Linux ホスト資源診断ツール。"""
+    """procdiag — local-first Linux ホスト資源診断ツール。
+
+    初めての方は procdiag quick を実行してください。いまの状態の確認・1 時間の記録・診断を 1 回で行います。
+    """
     load_plugins()
 
 
@@ -294,14 +354,12 @@ def snapshot(
 
     終了コード: 0=警告なし / 1=warning・critical あり
     """
-    import socket
-
     from . import snapshot as snapshot_mod
     from .core.util import should_use_color
 
     cfg = _load_config(config_path)
     items = snapshot_mod.run_snapshot(cfg)
-    hostname = cfg.report.hostname_label or socket.gethostname()
+    hostname = _host_label(cfg)
     if fmt == "json":
         click.echo(snapshot_mod.render_json(items, hostname=hostname))
     else:
@@ -363,11 +421,16 @@ def record(
     "--format",
     "fmt",
     type=click.Choice(["text", "json", "html"]),
-    default="text",
-    help="出力フォーマット。",
+    default=None,
+    help="出力フォーマット (既定: --output の拡張子が .html/.htm なら html、"
+    ".json なら json、それ以外は text)。",
 )
 @click.option(
-    "--output", type=click.Path(), default=None, help="レポートをファイルに書き出す。"
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="レポートをファイルに書き出す (例: -o report.html)。",
 )
 @click.option("--verbose", is_flag=True, help="推論過程を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
@@ -382,7 +445,7 @@ def check(
     config_path: Optional[str],
     only: Optional[str],
     skip: Optional[str],
-    fmt: str,
+    fmt: Optional[str],
     output: Optional[str],
     verbose: bool,
     no_color: bool,
@@ -398,6 +461,7 @@ def check(
     from . import report as report_mod
     from .core.util import should_use_color
 
+    fmt = fmt or _FORMAT_BY_SUFFIX.get(Path(output or "").suffix.lower(), "text")
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     diag, charts, meta_hostname = _diagnose(
         cfg,
@@ -411,12 +475,7 @@ def check(
     if fmt == "json":
         text = report_mod.render_json(diag)
     elif fmt == "html":
-        text = report_mod.render_html(
-            diag,
-            charts,
-            hostname_label=cfg.report.hostname_label,
-            meta_hostname=meta_hostname,
-        )
+        text = _render_html(cfg, diag, charts, meta_hostname)
     else:
         color = should_use_color(no_color)
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
@@ -431,9 +490,144 @@ def check(
     sys.exit(_exit_code(diag, exit_zero_on_info=exit_zero_on_info))
 
 
-# Register ``advise`` as a hidden alias for ``check`` (design doc §3).
-cli.add_command(check, name="advise")
-cli.commands["advise"].hidden = True  # type: ignore[attr-defined]
+# ---------------------------------------------------------------------------
+# quick
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--duration",
+    default="1h",
+    show_default=True,
+    help="記録する時間 (例: 30m, 2h)。",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    default=None,
+    # readable=False: an unusable path gets quick's own exit-4 message, not
+    # click's usage error, whose code 2 means "info only" for check.
+    type=click.Path(readable=False),
+    help="記録 DB とレポートを置くディレクトリ (既定: ./procdiag-quick-<日時>)。"
+    "空でないディレクトリは指定できません。",
+)
+@_config_option()
+@click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
+def quick(
+    duration: str, out_dir: Optional[str], config_path: Optional[str], no_color: bool
+) -> None:
+    """いまの状態の確認・短い記録・診断を 1 回で行います (初めての方向け)。
+
+    snapshot でいまの状態を確認し、--duration の間だけ記録してから check
+    と同じルールで診断します。記録中に Ctrl-C
+    を押すと記録を早めに終え、そこまでの記録を診断します。記録 DB と HTML
+    レポートは --out のディレクトリに置きます。
+
+    終了コード: 0=問題なし / 1=snapshot か診断に critical・warning あり /
+    2=info のみ / 3=観測データなし / 4=前提条件エラー
+    """
+    from . import report as report_mod
+    from . import snapshot as snapshot_mod
+    from .core.util import humanize_duration, parse_duration, should_use_color
+    from .recorder import Recorder
+
+    try:
+        seconds = parse_duration(duration)
+    except ValueError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
+    if seconds <= 0:
+        click.echo(
+            f"エラー: --duration には 0 より長い時間を指定してください: {duration}",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    cfg = _load_config(config_path)
+    out = Path(out_dir or time.strftime("procdiag-quick-%Y%m%d-%H%M%S"))
+    try:
+        occupied = out.exists() and (not out.is_dir() or any(out.iterdir()))
+        if not occupied:
+            out.mkdir(parents=True, exist_ok=True)
+            if not os.access(out, os.W_OK | os.X_OK):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+    except OSError as exc:
+        click.echo(
+            f"エラー: 出力先を使えません: {out} ({exc.strerror})\n"
+            "書き込めるディレクトリで実行するか、--out で書き込める場所を指定してください。",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    if occupied:
+        click.echo(
+            f"エラー: 出力先が空のディレクトリではありません: {out}\n"
+            "まだ無いパスか、空のディレクトリを --out に指定してください。",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    db = out / "procdiag.db"
+    color = should_use_color(no_color)
+
+    click.echo("[1/3] いまの状態を確認します (snapshot)\n")
+    # The "recording" line would tell the user to run procdiag record, which
+    # is what step 2 does next.
+    items = [i for i in snapshot_mod.run_snapshot(cfg) if i.name != "recording"]
+    click.echo(
+        snapshot_mod.render_text(
+            items,
+            hostname=_host_label(cfg),
+            color=color,
+            ascii_only=_use_ascii(False),
+            next_step="",
+        )
+    )
+    problems = [
+        i for i in items if i.status in (snapshot_mod.WARNING, snapshot_mod.CRITICAL)
+    ]
+
+    end = time.strftime("%H:%M:%S", time.localtime(time.time() + seconds))
+    click.echo(f"\n[2/3] {humanize_duration(seconds)} 記録します ({end} に終わります)")
+    click.echo("Ctrl-C で早めに終えても、それまでの記録を診断します。")
+    Recorder(cfg.model_copy(update={"db_path": str(db)}), duration=seconds).run()
+
+    diag, charts, meta_hostname = _diagnose(cfg, str(db), with_charts=True)
+    # Write the report before printing anything more: when an SSH drop ended
+    # the recording (SIGHUP), the terminal is gone and the next echo fails.
+    report = out / "report.html"
+    try:
+        report.write_text(
+            _render_html(cfg, diag, charts, meta_hostname), encoding="utf-8"
+        )
+    except OSError as exc:
+        report_error = (
+            f"エラー: HTML レポートを書けませんでした: {report} ({exc.strerror})"
+        )
+    else:
+        report_error = ""
+    click.echo("\n[3/3] 記録を診断しました (check)\n")
+    click.echo(report_mod.render_terminal(diag, color=color).lstrip("\n"))
+    if problems:
+        click.echo(
+            f"\n[1/3] いまの状態の確認で、注意が必要な項目が {len(problems)} 件ありました:"
+        )
+        marks = {snapshot_mod.CRITICAL: "重大", snapshot_mod.WARNING: "警告"}
+        for item in problems:
+            click.echo(f"  [{marks[item.status]}] {item.label}: {item.detail}")
+            if item.hint:
+                click.echo(f"      → {item.hint}")
+
+    if report_error:
+        click.echo(f"\n{report_error}", err=True)
+    else:
+        click.echo(f"\nHTML レポートを書き出しました: {report}")
+    click.echo(f"記録 DB: {db}")
+    click.echo(
+        "メモリリークや慢性的なメモリ不足を見るには、"
+        "procdiag record --duration 24h で記録してから procdiag check を実行してください。"
+    )
+    if report_error:
+        sys.exit(_EXIT_USAGE)
+    sys.exit(1 if problems else _exit_code(diag))
 
 
 @cli.command()
@@ -546,59 +740,6 @@ def compare(
         click.echo(text)
 
     sys.exit(compare_exit_code(result, exit_zero_on_info=exit_zero_on_info))
-
-
-# ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
-
-
-@cli.command()
-@_db_option("診断対象の DB ファイル。")
-@_config_option("設定ファイルのパス。")
-@click.option(
-    "--out",
-    "html_out",
-    default="report.html",
-    type=click.Path(),
-    help="HTML レポートの出力先 (既定: report.html)。",
-)
-@click.option(
-    "--json",
-    "json_out",
-    default=None,
-    type=click.Path(),
-    help="JSON レポートの出力先 (省略時はスキップ)。",
-)
-@_quiet_option
-def report(
-    db_path: Optional[str],
-    config_path: Optional[str],
-    html_out: str,
-    json_out: Optional[str],
-    quiet: bool,
-) -> None:
-    """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
-    from . import report as report_mod
-
-    cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-    diag, charts, meta_hostname = _diagnose(cfg, resolved_db, with_charts=True)
-
-    html_text = report_mod.render_html(
-        diag,
-        charts,
-        hostname_label=cfg.report.hostname_label,
-        meta_hostname=meta_hostname,
-    )
-    Path(html_out).write_text(html_text, encoding="utf-8")
-    quiet_mode = _is_quiet(quiet)
-    if not quiet_mode:
-        click.echo(f"HTML レポートを書き出しました: {html_out}")
-
-    if json_out:
-        Path(json_out).write_text(report_mod.render_json(diag), encoding="utf-8")
-        if not quiet_mode:
-            click.echo(f"JSON レポートを書き出しました: {json_out}")
 
 
 # ---------------------------------------------------------------------------
@@ -737,21 +878,21 @@ def explain(name: Optional[str]) -> None:
 
     if name is None:
         rules = all_rules()
+        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━")
+        for category, rule_ids in _group_by(rules, "category").items():
+            click.echo(f"\n[{category}]")
+            for rid in rule_ids:
+                click.echo(f"  {rid.ljust(22)} {rules[rid].title}")
+
         samplers = all_samplers()
-
-        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━\n")
-        for rid in sorted(rules):
-            what = getattr(rules[rid], "what", "") or ""
-            click.echo(f"  {rid.ljust(22)} {what[:60]}")
-
-        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━\n")
-        for sname in sorted(
-            samplers, key=lambda n: (getattr(samplers[n], "tier", ""), n)
-        ):
-            cls = samplers[sname]
-            tier = getattr(cls, "tier", "?")
-            what = getattr(cls, "what", "") or ""
-            click.echo(f"  {sname.ljust(14)} [{tier.ljust(3)}]  {what[:50]}")
+        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━")
+        for tier, names in _group_by(samplers, "tier").items():
+            click.echo(f"\n[{tier}]")
+            for sname in names:
+                cls = samplers[sname]
+                click.echo(
+                    f"  {sname.ljust(14)} {cls.interval_key.ljust(20)} {cls.title}"
+                )
         return
 
     # Look up by rule_id (uppercase convention) or sampler name (lowercase).
@@ -775,6 +916,14 @@ def explain(name: Optional[str]) -> None:
         sys.exit(1)
 
 
+def _group_by(registry: dict[str, type], attr: str) -> dict[str, list[str]]:
+    """Registry names grouped by a class attribute (``category`` / ``tier``), sorted."""
+    groups: dict[str, list[str]] = {}
+    for name in sorted(registry):
+        groups.setdefault(getattr(registry[name], attr) or "?", []).append(name)
+    return dict(sorted(groups.items()))
+
+
 def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
     """Print a rule's / sampler's what, why and manual check commands."""
     click.echo(f"{heading}\n")
@@ -792,53 +941,6 @@ def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
         )
         for name, default in tunables.items():
             click.echo(f"  {name} ({default})")
-
-
-# ---------------------------------------------------------------------------
-# list-rules / list-samplers
-# ---------------------------------------------------------------------------
-
-
-@cli.command(name="list-rules")
-def list_rules() -> None:
-    """登録済みルールを rule_id / category / title の一覧で表示します。"""
-    from .core.rule import all_rules
-
-    _load_registries()
-    rules = all_rules()
-
-    by_cat: dict[str, list[str]] = {}
-    for rid, cls in rules.items():
-        cat = getattr(cls, "category", "other") or "other"
-        by_cat.setdefault(cat, []).append(rid)
-
-    for cat in sorted(by_cat):
-        click.echo(f"\n[{cat}]")
-        for rid in sorted(by_cat[cat]):
-            title = getattr(rules[rid], "title", "") or ""
-            click.echo(f"  {rid.ljust(22)} {title}")
-
-
-@cli.command(name="list-samplers")
-def list_samplers() -> None:
-    """登録済みサンプラーを Tier ごとに一覧表示します。"""
-    from .core.sampler import all_samplers
-
-    _load_registries()
-    samplers = all_samplers()
-
-    by_tier: dict[str, list[str]] = {}
-    for sname, cls in samplers.items():
-        tier = getattr(cls, "tier", "?") or "?"
-        by_tier.setdefault(tier, []).append(sname)
-
-    for tier in sorted(by_tier):
-        click.echo(f"\n[{tier}]")
-        for sname in sorted(by_tier[tier]):
-            cls = samplers[sname]
-            title = getattr(cls, "title", "") or ""
-            interval_key = getattr(cls, "interval_key", "") or ""
-            click.echo(f"  {sname.ljust(14)} {title.ljust(20)} ({interval_key})")
 
 
 # ---------------------------------------------------------------------------

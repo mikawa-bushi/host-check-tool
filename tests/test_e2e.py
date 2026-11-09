@@ -1,6 +1,6 @@
 """End-to-end integration tests for procdiag.
 
-Exercises the full ``init → record → check → report`` pipeline using the real
+Exercises the full ``init → record → check`` pipeline using the real
 ``procdiag`` entry point (subprocess) so that signal handling, process
 lifecycle, and DB I/O are all exercised in a realistic way.
 
@@ -10,7 +10,8 @@ environment, write to ``tmp_path``, and may take 10-15 seconds each because
 
 Test cases
 ----------
-1. ``test_full_pipeline`` — init → record 8 s → status → check → report.
+1. ``test_full_pipeline`` — init → record 8 s → status → check (terminal,
+   then ``-o report.html`` / ``-o report.json``).
    Assertions: sys_samples > 0, check exits 0-2, report.html/report.json
    generated with no external references.
 
@@ -19,10 +20,17 @@ Test cases
 
 3. ``test_self_cpu_under_budget`` — after an 8-second record run the
    steady-state self_cpu (startup transient excluded) must be below 10 %.
+
+4. ``test_quick_runs_all_three_steps`` — ``quick --duration 2s`` prints the
+   three step headings and leaves procdiag.db and report.html in ``--out``.
+
+5. ``test_quick_ctrl_c_during_recording_still_diagnoses`` — SIGINT during the
+   recording ends it early; the diagnosis and report.html still follow.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import signal
 import sqlite3
@@ -148,7 +156,7 @@ def _self_cpu_avg(db_path: Path, skip_first_sec: float = 2.0) -> Optional[float]
 
 @pytest.mark.e2e
 def test_full_pipeline(tmp_path: Path) -> None:
-    """init → record 8 s → status → check → report.
+    """init → record 8 s → status → check → check -o report.html / report.json.
 
     Verifies:
     - sys_samples has rows after recording
@@ -204,26 +212,18 @@ def test_full_pipeline(tmp_path: Path) -> None:
         2,
     ), f"check returned unexpected code {ck.returncode}:\n{ck.stderr}"
 
-    # --- report ---------------------------------------------------------------
+    # --- check -o report.html / report.json -----------------------------------
     html_out = tmp_path / "report.html"
     json_out = tmp_path / "report.json"
-    rp = _run(
-        [
-            "report",
-            "--db",
-            str(db_path),
-            "--config",
-            str(config_path),
-            "--out",
-            str(html_out),
-            "--json",
-            str(json_out),
-        ],
-        timeout=30,
-    )
-    assert rp.returncode == 0, f"report failed: {rp.stderr}"
-    assert html_out.exists(), "report.html was not created"
-    assert json_out.exists(), "report.json was not created"
+    for out in (html_out, json_out):
+        rp = _run(
+            ["check", "--db", str(db_path), "--config", str(config_path)]
+            + ["-o", str(out)],
+            timeout=30,
+        )
+        assert rp.returncode in (0, 1, 2), f"check -o {out.name} failed: {rp.stderr}"
+    assert html_out.read_text(encoding="utf-8").startswith("<!doctype html>")
+    assert "findings" in json.loads(json_out.read_text(encoding="utf-8"))
 
     # report.html must contain no external URL references (no CDN, no http://)
     html_text = html_out.read_text(encoding="utf-8")
@@ -330,3 +330,65 @@ def test_self_cpu_under_budget(tmp_path: Path) -> None:
         f"procdiag self-CPU overhead too high: avg={avg:.2f}% >= 10%.\n"
         "Check SelfMeter wiring and sampling intervals."
     )
+
+
+# ---------------------------------------------------------------------------
+# quick: snapshot, a short record and the diagnosis in one command
+# ---------------------------------------------------------------------------
+
+_QUICK_HEADINGS = ("[1/3]", "[2/3]", "[3/3]")
+
+
+def _assert_quick_finished(out_dir: Path, stdout: str, returncode: int) -> None:
+    assert returncode in (0, 1, 2), f"quick exited {returncode}:\n{stdout}"
+    positions = [stdout.find(h) for h in _QUICK_HEADINGS]
+    assert -1 not in positions and positions == sorted(positions), stdout
+    assert _count_rows(out_dir / "procdiag.db", "sys_samples") > 0
+    report = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert report.startswith("<!doctype html>")
+
+
+@pytest.mark.e2e
+def test_quick_runs_all_three_steps(tmp_path: Path) -> None:
+    out_dir = tmp_path / "q"
+    config_path = tmp_path / "config.py"
+    _write_config(config_path, tmp_path / "unused.db")
+    result = _run(
+        ["quick", "--duration", "2s", "--out", str(out_dir), "--no-color"]
+        + ["--config", str(config_path)],
+        timeout=60,
+    )
+    _assert_quick_finished(out_dir, result.stdout, result.returncode)
+    assert str(out_dir / "report.html") in result.stdout
+
+
+@pytest.mark.e2e
+def test_quick_ctrl_c_during_recording_still_diagnoses(tmp_path: Path) -> None:
+    """SIGINT while recording ends the recording early, not the command."""
+    out_dir = tmp_path / "q"
+    config_path = tmp_path / "config.py"
+    _write_config(config_path, tmp_path / "unused.db")
+    proc = subprocess.Popen(
+        [_PROCDIAG, "quick", "--duration", "10m", "--out", str(out_dir), "--no-color"]
+        + ["--config", str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    seen = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        seen.append(line)
+        if line.startswith("[2/3]"):
+            break
+    # The recorder installs its handler after setting up the samplers.
+    time.sleep(2.0)
+    proc.send_signal(signal.SIGINT)
+    try:
+        rest, _err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail("quick did not finish within 60 s after SIGINT")
+
+    _assert_quick_finished(out_dir, "".join(seen) + rest, proc.returncode)

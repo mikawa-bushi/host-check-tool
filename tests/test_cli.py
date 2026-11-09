@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -31,6 +32,23 @@ from procdiag.storage import Storage
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _listed_commands(help_text: str) -> set[str]:
+    """Command names in the ``Commands:`` section of ``procdiag --help``."""
+    section = help_text.split("Commands:", 1)[1]
+    return {line.split()[0] for line in section.splitlines() if line.strip()}
+
+
+def _group_of(listing: str, name: str) -> str:
+    """The ``[group]`` header above the line listing *name* in ``explain``."""
+    group = ""
+    for line in listing.splitlines():
+        if line.startswith("["):
+            group = line
+        elif line.split()[:1] == [name]:
+            return group
+    raise AssertionError(f"{name} が一覧にありません")
 
 
 @pytest.fixture()
@@ -121,27 +139,40 @@ class TestHelpAndVersion:
             "init",
             "record",
             "check",
-            "report",
             "status",
             "explain",
-            "list-rules",
-            "list-samplers",
             "export",
             "prune",
             "service",
         ):
             assert cmd in result.output, f"'{cmd}' が --help に見つかりません"
 
-    def test_advise_is_hidden(self, runner):
-        """advise must not appear in the main --help listing."""
+    def test_help_does_not_list_removed_commands(self, runner):
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
-        assert "advise" not in result.output
+        listed = _listed_commands(result.output)
+        assert "check" in listed
+        assert not listed & {"report", "list-rules", "list-samplers", "advise"}
 
-    def test_advise_help_works(self, runner):
-        """advise must still be callable (just hidden)."""
-        result = runner.invoke(cli, ["advise", "--help"])
-        assert result.exit_code == 0
+    @pytest.mark.parametrize(
+        ("args", "replacement"),
+        [
+            (["report", "--out", "x.html"], "procdiag check --output report.html"),
+            (["list-rules"], "procdiag explain"),
+            (["list-samplers"], "procdiag explain"),
+            (["advise", "--help"], "procdiag check"),
+        ],
+    )
+    def test_removed_command_names_its_replacement(self, runner, args, replacement):
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 4
+        assert f"procdiag {args[0]} は削除されました" in result.output
+        assert replacement in result.output
+
+    def test_unknown_command_still_fails_normally(self, runner):
+        result = runner.invoke(cli, ["no-such-command"])
+        assert result.exit_code == 2
+        assert "削除されました" not in result.output
 
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
@@ -218,7 +249,7 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
-# explain / list-rules / list-samplers
+# explain
 # ---------------------------------------------------------------------------
 
 
@@ -288,36 +319,34 @@ class TestExplain:
         result = runner.invoke(cli, ["explain"])
         assert result.exit_code == 0
 
+    def test_list_groups_rules_by_category_with_title(self, runner, fake_rule):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "FAKE-TEST-01") == "[test]"
+        assert _group_of(result.output, "MEM-LEAK-01") == "[memory]"
+        line = next(ln for ln in result.output.splitlines() if "FAKE-TEST-01" in ln)
+        assert "テスト用フェイクルール" in line
+        assert "procdiag explain <RULE-ID>" in result.output
 
-class TestListRules:
-    def test_shows_fake_rule(self, runner, fake_rule):
-        result = runner.invoke(cli, ["list-rules"])
+    def test_list_groups_samplers_by_tier_with_interval_key(self, runner, fake_sampler):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "fake_sampler") == "[T1]"
+        assert _group_of(result.output, "disk") == "[T3]"
+        line = next(ln for ln in result.output.splitlines() if "fake_sampler" in ln)
+        assert "フェイクサンプラー" in line
+        assert "system_interval" in line
+        assert "procdiag explain <name>" in result.output
+
+    def test_list_shows_every_registered_rule_and_sampler(self, runner):
+        """Every rule and sampler is listed (thermal used to be missing)."""
+        from procdiag import diagnosis, samplers  # noqa: F401
+        from procdiag.core.rule import all_rules
+        from procdiag.core.sampler import all_samplers
+
+        result = runner.invoke(cli, ["explain"])
         assert result.exit_code == 0
-        assert "FAKE-TEST-01" in result.output
-        assert "テスト用フェイクルール" in result.output
-
-    def test_no_crash_without_rules(self, runner):
-        result = runner.invoke(cli, ["list-rules"])
-        assert result.exit_code == 0
-
-
-class TestListSamplers:
-    def test_shows_fake_sampler(self, runner, fake_sampler):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        assert "fake_sampler" in result.output
-        assert "T1" in result.output
-
-    def test_no_crash_without_samplers(self, runner):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-
-    def test_lists_every_builtin_sampler(self, runner):
-        """All recorder samplers are listed (thermal used to be missing)."""
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        for name in ("system", "cgroup", "process", "disk", "thermal"):
-            assert name in result.output
+        names = {ln.split()[0] for ln in result.output.splitlines() if ln[:2] == "  "}
+        assert set(all_rules()) | set(all_samplers()) <= names
+        assert {"system", "cgroup", "process", "disk", "thermal"} <= names
 
     def test_explain_thermal_sampler(self, runner):
         result = runner.invoke(cli, ["explain", "thermal"])
@@ -719,22 +748,180 @@ class TestCheckHtmlCharts:
         assert "<polyline" in html
         assert "データなし: CPU使用率" not in html
 
-    def test_check_html_matches_report_charts(self, runner, db_with_data, tmp_path):
-        out = tmp_path / "report.html"
-        res_report = runner.invoke(
-            cli, ["report", "--db", str(db_with_data), "--out", str(out)]
-        )
-        assert res_report.exit_code == 0, res_report.output
-        report_html = out.read_text(encoding="utf-8")
 
-        res_check = runner.invoke(
-            cli, ["check", "--db", str(db_with_data), "--format", "html"]
-        )
-        assert res_check.exit_code == 0, res_check.output
+# ---------------------------------------------------------------------------
+# check --output: the suffix picks the format unless --format is given
+# ---------------------------------------------------------------------------
 
-        # Both paths must draw charts; previously only `report` did.
-        assert "<polyline" in report_html
-        assert "<polyline" in res_check.output
+
+class TestCheckOutputFormat:
+    def _check(self, runner, db, *args):
+        result = runner.invoke(cli, ["check", "--db", str(db), *args])
+        assert result.exit_code == 0, result.output
+        return result
+
+    @pytest.mark.parametrize("name", ["r.html", "r.htm", "R.HTML"])
+    def test_html_suffix_writes_html_with_charts(
+        self, runner, db_with_data, tmp_path, name
+    ):
+        out = tmp_path / name
+        self._check(runner, db_with_data, "-o", str(out))
+        html = out.read_text(encoding="utf-8")
+        assert html.startswith("<!doctype html>")
+        assert "<polyline" in html
+
+    def test_json_suffix_writes_parseable_json(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "r.json"
+        self._check(runner, db_with_data, "--output", str(out))
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["no_data"] is False
+
+    @pytest.mark.parametrize(
+        ("name", "args"), [("r.txt", []), ("r.json", ["--format", "text"])]
+    )
+    def test_other_suffix_or_explicit_text_writes_terminal_text(
+        self, runner, db_with_data, tmp_path, name, args
+    ):
+        out = tmp_path / name
+        stdout = self._check(runner, db_with_data, "--no-color").output
+        self._check(runner, db_with_data, "--no-color", *args, "-o", str(out))
+        assert out.read_text(encoding="utf-8") + "\n" == stdout
+
+    def test_explicit_format_overrides_html_suffix(
+        self, runner, db_with_data, tmp_path
+    ):
+        out = tmp_path / "r.html"
+        self._check(runner, db_with_data, "--format", "json", "-o", str(out))
+        assert json.loads(out.read_text(encoding="utf-8"))["no_data"] is False
+
+
+# ---------------------------------------------------------------------------
+# quick: precondition errors (the full run is in test_e2e.py)
+# ---------------------------------------------------------------------------
+
+
+class TestQuickRefusals:
+    @pytest.mark.parametrize("duration", ["0s", "0m", "abc", "10"])
+    def test_bad_duration_exits_4_before_doing_anything(
+        self, runner, tmp_path, duration
+    ):
+        out = tmp_path / "q"
+        result = runner.invoke(
+            cli, ["quick", "--duration", duration, "--out", str(out)]
+        )
+        assert result.exit_code == 4, result.output
+        assert "エラー" in result.output
+        assert "[1/3]" not in result.output
+        assert not out.exists()
+
+    def test_non_empty_out_dir_exits_4_and_is_left_alone(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.mkdir()
+        (out / "keep.txt").write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+        assert "空のディレクトリではありません" in result.output
+        assert [p.name for p in out.iterdir()] == ["keep.txt"]
+
+    def test_out_path_that_is_a_file_exits_4(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    @pytest.mark.parametrize(
+        ("mode", "target"),
+        [(0o500, "q"), (0o500, "."), (0o000, "."), (0o000, "q")],
+        ids=[
+            "parent-not-writable",
+            "empty-dir-not-writable",
+            "dir-not-readable",
+            "parent-not-searchable",
+        ],
+    )
+    def test_out_path_that_cannot_be_used_exits_4(self, runner, tmp_path, mode, target):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(mode)
+        try:
+            result = runner.invoke(
+                cli, ["quick", "--duration", "2s", "--out", str(locked / target)]
+            )
+        finally:
+            locked.chmod(0o700)
+        assert result.exit_code == 4, result.output
+        assert "出力先を使えません" in result.output
+        assert "Traceback" not in result.output
+        assert "[1/3]" not in result.output
+
+    def test_root_help_points_first_time_users_to_quick(self, runner):
+        result = runner.invoke(cli, ["--help"])
+        assert "初めての方は procdiag quick" in result.output
+        assert "quick" in _listed_commands(result.output)
+
+
+class TestQuickRun:
+    def test_snapshot_warning_is_repeated_after_the_diagnosis(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag import snapshot
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            snapshot,
+            "run_snapshot",
+            lambda cfg: [
+                snapshot.SnapshotItem(
+                    "システム",
+                    "recording",
+                    "記録状況",
+                    snapshot.INFO,
+                    "未記録",
+                    "procdiag record で記録してください",
+                ),
+                snapshot.SnapshotItem(
+                    "プロセス",
+                    "zombies",
+                    "ゾンビプロセス",
+                    snapshot.WARNING,
+                    "55 個",
+                    "親プロセスを確認してください",
+                ),
+            ],
+        )
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 1, result.output
+        after_diagnosis = result.output.split("[3/3]", 1)[1]
+        assert "[警告] ゾンビプロセス: 55 個" in after_diagnosis
+        assert "→ 親プロセスを確認してください" in after_diagnosis
+        assert "procdiag record で記録してください" not in result.output
+        report = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
+        assert report.startswith("<!doctype html>")
+
+    def test_diagnosis_is_still_shown_when_the_report_cannot_be_written(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag.recorder import Recorder
+
+        monkeypatch.chdir(tmp_path)
+        record = Recorder.run
+
+        def record_then_block_the_report(self):
+            code = record(self)
+            (tmp_path / "q" / "report.html").mkdir()
+            return code
+
+        monkeypatch.setattr(Recorder, "run", record_then_block_the_report)
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 4, result.output
+        assert "[3/3]" in result.output
+        assert "HTML レポートを書けませんでした" in result.output
+        assert "Traceback" not in result.output
 
 
 # ---------------------------------------------------------------------------
