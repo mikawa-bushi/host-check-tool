@@ -72,6 +72,7 @@ procdiag check -o report.html
 
 | コマンド | 目的 |
 |---|---|
+| `procdiag quick` | 初めての人向け。snapshot・短い記録 (既定 1 時間、`--duration`)・診断を 1 回で行い、記録 DB と HTML レポートを `--out` (既定 `./procdiag-quick-<日時>`) に置く。Ctrl-C で記録を早めに終えても診断する。snapshot か診断に warning/critical があれば exit 1 |
 | `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェックする (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成する |
 | `procdiag record` | 常駐ループで 3 層サンプリングを実行する |

@@ -570,9 +570,17 @@ def _summary(items: List[SnapshotItem]) -> Dict[str, int]:
 
 
 def render_text(
-    items: List[SnapshotItem], *, hostname: str, color: bool, ascii_only: bool
+    items: List[SnapshotItem],
+    *,
+    hostname: str,
+    color: bool,
+    ascii_only: bool,
+    next_step: str = "長期傾向は procdiag record で記録してから procdiag check",
 ) -> str:
-    """Terminal output: one line per item grouped by category, summary last."""
+    """Terminal output: one line per item grouped by category, summary last.
+
+    *next_step* is shown in parentheses after the summary; empty omits it.
+    """
     symbols = _SYMBOLS[ascii_only]
     reset = "\033[0m" if color else ""
     now = time.strftime("%Y-%m-%d %H:%M")
@@ -591,7 +599,7 @@ def render_text(
     n = _summary(items)
     lines.append(
         f"\n結果: 重大 {n[CRITICAL]} 件 / 警告 {n[WARNING]} 件 / 正常 {n[OK]} 件"
-        " (長期傾向は procdiag record で記録してから procdiag check)"
+        + (f" ({next_step})" if next_step else "")
     )
     return "\n".join(lines)
 

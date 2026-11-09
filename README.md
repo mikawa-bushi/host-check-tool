@@ -9,8 +9,9 @@ CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録�
 工場のエッジ PC・ラインサーバーなど IT 人材が常駐しない環境を主用途とする。
 
 - **オフライン・閉域網ファースト** — 外部通信ゼロ。レポートは CDN 参照なしの単一 HTML
-- **まず 1 コマンドで現状確認** — `procdiag snapshot` が記録なしで数秒のうちに
-  CPU・メモリ・ディスク (容量/inode/読み取り専用化)・サービス・カーネル異常・温度などを網羅チェック
+- **まず 1 コマンドで診断** — `procdiag quick` が、いまの状態の網羅チェック (CPU・メモリ・
+  ディスク (容量/inode/読み取り専用化)・サービス・カーネル異常・温度など)、1 時間の記録、
+  その記録の診断を続けて行う。記録なしの網羅チェックだけなら `procdiag snapshot` (数秒)
 - **3 コマンドで傾向診断** — `pip install` → `procdiag init` → `procdiag record`
 - **決定論的な診断** — 20 の検出ルール × テンプレートで提案を生成 (LLM 非依存)。
   出力は機械可読 (JSON) で、外部での活用は利用者に委ねる
@@ -26,6 +27,17 @@ CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録�
 # インストール (閉域網の PC へは docs/offline-install.md の手順で)
 pip install host-check-tool
 
+# これだけで診断: いまの状態の確認 → 1 時間の記録 → 診断
+# 結果は画面に出る。記録の診断は ./procdiag-quick-<日時>/report.html にも書き出す。
+# Ctrl-C で記録を早めに終えても診断する
+procdiag quick
+```
+
+1 時間の記録で評価できるのは、短い記録で判断できるルールだけ (リーク系は 6 時間、
+慢性メモリ圧迫は 24 時間の記録が必要)。未評価のルールと、あと何時間の記録が必要かは
+診断結果に表示される。長期の傾向まで診断するには、記録を続ける:
+
+```bash
 # 記録なしで、いまの状態をその場でチェック (数秒)
 procdiag snapshot
 
@@ -55,6 +67,7 @@ procdiag bundle
 
 | コマンド | 内容 |
 |---|---|
+| `procdiag quick` | 初めての人向け。snapshot・短い記録 (既定 1 時間)・診断を 1 回で行い、HTML レポートを書き出す (Ctrl-C で記録を早めに終えても診断する) |
 | `procdiag snapshot` | 記録なしで現在のホスト状態を網羅チェック (warning/critical で exit 1) |
 | `procdiag init [DIR]` | `config.py` と `data/` を生成 |
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
@@ -142,6 +155,9 @@ procdiag compare before.db after.db --format json --output compare.json
 | `2` | info レベルの Finding のみ (`--exit-zero-on-info` で 0 に畳める) |
 | `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない) |
 | `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
+
+`procdiag quick` も同じ番号を返す。診断のほか、最初の snapshot に warning / critical があるときも `1` になる。
+`--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を使えないとき、レポートを書けなかったときは `4`。レポートを書けなかったときは、診断の結果より `4` を優先する。
 
 `procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):
 

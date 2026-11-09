@@ -7,8 +7,9 @@ disk, a spike trigger, a self-throttle meter, and a 60-second flush cadence.
 Key design decisions (mirroring netdiag/Watcher):
 - All components are injected via ``__init__`` so the recorder is testable
   without importing the real sampler modules (T02–T04 run in parallel).
-- Signal handlers (SIGTERM/SIGINT) are registered only when running in the
-  main thread; calling ``run()`` from a worker thread is safe but no signal
+- Signal handlers (SIGTERM/SIGINT/SIGHUP) are registered only when running
+  in the main thread, and ``run()`` puts the previous handlers back before it
+  returns; calling ``run()`` from a worker thread is safe but no signal
   handling occurs.
 - The scheduler uses ``time.monotonic`` as its clock so suspend/resume gaps
   are visible in ops_events without distorting wall-clock timestamps.
@@ -502,7 +503,7 @@ class Recorder:
             sched.add("pss_precheck", sc.pss_precheck_interval, self._job_pss_precheck)
 
         # Register signal handlers (main thread only).
-        self._register_signals()
+        previous_handlers = self._register_signals()
 
         # Duration-based stop: add a lightweight polling job to the scheduler
         # that checks the monotonic clock and sets _stop when the duration
@@ -548,33 +549,44 @@ class Recorder:
             except Exception:
                 logger.exception("Storage close 例外")
 
+        # A caller that keeps running (procdiag quick diagnoses next) must get
+        # Ctrl-C back as KeyboardInterrupt instead of a no-op stop request.
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         return 0
 
     # ------------------------------------------------------------------
     # Signal handling
     # ------------------------------------------------------------------
 
-    def _register_signals(self) -> None:
+    def _register_signals(self) -> Dict[int, Any]:
         """Register SIGTERM/SIGINT/SIGHUP handlers if we are in the main thread.
 
         SIGHUP (the terminal running a foreground ``record`` was closed) is a
         deliberate stop too; without a handler the process would die without
         closing its session, which would read as an unclean shutdown.
+
+        Returns the handlers that were replaced, keyed by signal number.
         """
+        previous: Dict[int, Any] = {}
         if threading.current_thread() is not threading.main_thread():
-            return
+            return previous
 
         def _handler(signum: int, frame: Any) -> None:
             logger.info("シグナル %d を受信しました — 停止します", signum)
             self._stop.set()
 
         try:
-            signal.signal(signal.SIGTERM, _handler)
-            signal.signal(signal.SIGINT, _handler)
-            signal.signal(signal.SIGHUP, _handler)
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                # None: the old handler was not installed from Python and
+                # cannot be reinstalled from here.
+                old = signal.signal(signum, _handler)
+                if old is not None:
+                    previous[signum] = old
         except (OSError, ValueError):
             # Can happen in non-main threads or restricted environments.
             pass
+        return previous
 
 
 def _records(batches: list[SampleBatch], table: str) -> list[dict]:

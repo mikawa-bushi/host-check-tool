@@ -19,6 +19,7 @@ event, so ``run()`` returns without any real-time waiting.
 from __future__ import annotations
 
 import json
+import signal
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -682,3 +683,31 @@ class TestRecorder:
         )
         result = rec.run()
         assert result == 0, "run() must return 0 even when a sampler always raises"
+
+    def test_run_restores_the_previous_signal_handlers(self, tmp_path: Path):
+        """After run() returns, Ctrl-C reaches the caller again (procdiag quick)."""
+        signums = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        originals = {s: signal.getsignal(s) for s in signums}
+
+        def caller_handler(signum, frame):
+            pass
+
+        clock = FakeClock(0.0)
+        rec = Recorder(
+            _make_config(),
+            db_path=tmp_path / "test.db",
+            samplers=_make_samplers(),
+            duration=1.0,
+            clock=clock,
+            sleep=_AdvancingSleep(clock),
+        )
+        try:
+            for s in signums:
+                signal.signal(s, caller_handler)
+            rec.run()
+            assert {s: signal.getsignal(s) for s in signums} == dict.fromkeys(
+                signums, caller_handler
+            )
+        finally:
+            for s, handler in originals.items():
+                signal.signal(s, handler)
