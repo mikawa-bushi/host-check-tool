@@ -33,6 +33,23 @@ from procdiag.storage import Storage
 # ---------------------------------------------------------------------------
 
 
+def _listed_commands(help_text: str) -> set[str]:
+    """Command names in the ``Commands:`` section of ``procdiag --help``."""
+    section = help_text.split("Commands:", 1)[1]
+    return {line.split()[0] for line in section.splitlines() if line.strip()}
+
+
+def _group_of(listing: str, name: str) -> str:
+    """The ``[group]`` header above the line listing *name* in ``explain``."""
+    group = ""
+    for line in listing.splitlines():
+        if line.startswith("["):
+            group = line
+        elif line.split()[:1] == [name]:
+            return group
+    raise AssertionError(f"{name} が一覧にありません")
+
+
 @pytest.fixture()
 def runner():
     """CliRunner instance."""
@@ -121,27 +138,40 @@ class TestHelpAndVersion:
             "init",
             "record",
             "check",
-            "report",
             "status",
             "explain",
-            "list-rules",
-            "list-samplers",
             "export",
             "prune",
             "service",
         ):
             assert cmd in result.output, f"'{cmd}' が --help に見つかりません"
 
-    def test_advise_is_hidden(self, runner):
-        """advise must not appear in the main --help listing."""
+    def test_help_does_not_list_removed_commands(self, runner):
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
-        assert "advise" not in result.output
+        listed = _listed_commands(result.output)
+        assert "check" in listed
+        assert not listed & {"report", "list-rules", "list-samplers", "advise"}
 
-    def test_advise_help_works(self, runner):
-        """advise must still be callable (just hidden)."""
-        result = runner.invoke(cli, ["advise", "--help"])
-        assert result.exit_code == 0
+    @pytest.mark.parametrize(
+        ("args", "replacement"),
+        [
+            (["report", "--out", "x.html"], "procdiag check --output report.html"),
+            (["list-rules"], "procdiag explain"),
+            (["list-samplers"], "procdiag explain"),
+            (["advise", "--help"], "procdiag check"),
+        ],
+    )
+    def test_removed_command_names_its_replacement(self, runner, args, replacement):
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 4
+        assert f"procdiag {args[0]} は削除されました" in result.output
+        assert replacement in result.output
+
+    def test_unknown_command_still_fails_normally(self, runner):
+        result = runner.invoke(cli, ["no-such-command"])
+        assert result.exit_code == 2
+        assert "削除されました" not in result.output
 
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
@@ -218,7 +248,7 @@ class TestInit:
 
 
 # ---------------------------------------------------------------------------
-# explain / list-rules / list-samplers
+# explain
 # ---------------------------------------------------------------------------
 
 
@@ -288,36 +318,34 @@ class TestExplain:
         result = runner.invoke(cli, ["explain"])
         assert result.exit_code == 0
 
+    def test_list_groups_rules_by_category_with_title(self, runner, fake_rule):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "FAKE-TEST-01") == "[test]"
+        assert _group_of(result.output, "MEM-LEAK-01") == "[memory]"
+        line = next(ln for ln in result.output.splitlines() if "FAKE-TEST-01" in ln)
+        assert "テスト用フェイクルール" in line
+        assert "procdiag explain <RULE-ID>" in result.output
 
-class TestListRules:
-    def test_shows_fake_rule(self, runner, fake_rule):
-        result = runner.invoke(cli, ["list-rules"])
+    def test_list_groups_samplers_by_tier_with_interval_key(self, runner, fake_sampler):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "fake_sampler") == "[T1]"
+        assert _group_of(result.output, "disk") == "[T3]"
+        line = next(ln for ln in result.output.splitlines() if "fake_sampler" in ln)
+        assert "フェイクサンプラー" in line
+        assert "system_interval" in line
+        assert "procdiag explain <name>" in result.output
+
+    def test_list_shows_every_registered_rule_and_sampler(self, runner):
+        """Every rule and sampler is listed (thermal used to be missing)."""
+        from procdiag import diagnosis, samplers  # noqa: F401
+        from procdiag.core.rule import all_rules
+        from procdiag.core.sampler import all_samplers
+
+        result = runner.invoke(cli, ["explain"])
         assert result.exit_code == 0
-        assert "FAKE-TEST-01" in result.output
-        assert "テスト用フェイクルール" in result.output
-
-    def test_no_crash_without_rules(self, runner):
-        result = runner.invoke(cli, ["list-rules"])
-        assert result.exit_code == 0
-
-
-class TestListSamplers:
-    def test_shows_fake_sampler(self, runner, fake_sampler):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        assert "fake_sampler" in result.output
-        assert "T1" in result.output
-
-    def test_no_crash_without_samplers(self, runner):
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-
-    def test_lists_every_builtin_sampler(self, runner):
-        """All recorder samplers are listed (thermal used to be missing)."""
-        result = runner.invoke(cli, ["list-samplers"])
-        assert result.exit_code == 0
-        for name in ("system", "cgroup", "process", "disk", "thermal"):
-            assert name in result.output
+        names = {ln.split()[0] for ln in result.output.splitlines() if ln[:2] == "  "}
+        assert set(all_rules()) | set(all_samplers()) <= names
+        assert {"system", "cgroup", "process", "disk", "thermal"} <= names
 
     def test_explain_thermal_sampler(self, runner):
         result = runner.invoke(cli, ["explain", "thermal"])
@@ -719,22 +747,51 @@ class TestCheckHtmlCharts:
         assert "<polyline" in html
         assert "データなし: CPU使用率" not in html
 
-    def test_check_html_matches_report_charts(self, runner, db_with_data, tmp_path):
-        out = tmp_path / "report.html"
-        res_report = runner.invoke(
-            cli, ["report", "--db", str(db_with_data), "--out", str(out)]
-        )
-        assert res_report.exit_code == 0, res_report.output
-        report_html = out.read_text(encoding="utf-8")
 
-        res_check = runner.invoke(
-            cli, ["check", "--db", str(db_with_data), "--format", "html"]
-        )
-        assert res_check.exit_code == 0, res_check.output
+# ---------------------------------------------------------------------------
+# check --output: the suffix picks the format unless --format is given
+# ---------------------------------------------------------------------------
 
-        # Both paths must draw charts; previously only `report` did.
-        assert "<polyline" in report_html
-        assert "<polyline" in res_check.output
+
+class TestCheckOutputFormat:
+    def _check(self, runner, db, *args):
+        result = runner.invoke(cli, ["check", "--db", str(db), *args])
+        assert result.exit_code == 0, result.output
+        return result
+
+    @pytest.mark.parametrize("name", ["r.html", "r.htm", "R.HTML"])
+    def test_html_suffix_writes_html_with_charts(
+        self, runner, db_with_data, tmp_path, name
+    ):
+        out = tmp_path / name
+        self._check(runner, db_with_data, "-o", str(out))
+        html = out.read_text(encoding="utf-8")
+        assert html.startswith("<!doctype html>")
+        assert "<polyline" in html
+
+    def test_json_suffix_writes_parseable_json(self, runner, db_with_data, tmp_path):
+        out = tmp_path / "r.json"
+        self._check(runner, db_with_data, "--output", str(out))
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["no_data"] is False
+
+    @pytest.mark.parametrize(
+        ("name", "args"), [("r.txt", []), ("r.json", ["--format", "text"])]
+    )
+    def test_other_suffix_or_explicit_text_writes_terminal_text(
+        self, runner, db_with_data, tmp_path, name, args
+    ):
+        out = tmp_path / name
+        stdout = self._check(runner, db_with_data, "--no-color").output
+        self._check(runner, db_with_data, "--no-color", *args, "-o", str(out))
+        assert out.read_text(encoding="utf-8") + "\n" == stdout
+
+    def test_explicit_format_overrides_html_suffix(
+        self, runner, db_with_data, tmp_path
+    ):
+        out = tmp_path / "r.html"
+        self._check(runner, db_with_data, "--format", "json", "-o", str(out))
+        assert json.loads(out.read_text(encoding="utf-8"))["no_data"] is False
 
 
 # ---------------------------------------------------------------------------

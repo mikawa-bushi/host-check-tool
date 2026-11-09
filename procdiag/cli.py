@@ -1,9 +1,9 @@
 """``procdiag`` command-line interface.
 
 Conclusion-first host-resource diagnosis: ``procdiag record`` collects
-metrics, ``procdiag check`` (alias ``advise``) runs all rules and prints
-the root cause and next steps.  The remaining commands support that core
-workflow (status, export, explain, prune) or system integration (service).
+metrics, ``procdiag check`` runs all rules and prints the root cause and
+next steps.  The remaining commands support that core workflow (status,
+export, explain, prune) or system integration (service).
 
 Design mirrors netdiag's ``cli.py`` where possible:
 
@@ -110,8 +110,8 @@ def _ensure_db_and_config(
 ) -> tuple[ProcdiagConfig, str]:
     """Load config, resolve the DB path, and exit (code 4) if the DB is absent.
 
-    Centralises the load_config + existence-check shared by check/report/
-    status/export/prune, and gives the DB-missing case its own exit code (4)
+    Centralises the load_config + existence-check shared by check/status/
+    export/prune, and gives the DB-missing case its own exit code (4)
     instead of overloading the diagnosis code 1.
     """
     cfg = _load_config(config_path, db_path)
@@ -192,6 +192,11 @@ def _diagnose(
     return diag, charts, meta_hostname
 
 
+# ``check --output`` suffix -> format, used when ``--format`` is not given, so
+# ``-o report.html`` writes HTML instead of terminal text in an .html file.
+_FORMAT_BY_SUFFIX = {".html": "html", ".htm": "html", ".json": "json"}
+
+
 def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
     """Map a diagnosis to the documented ``check`` exit code.
 
@@ -214,7 +219,33 @@ def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
-@click.group()
+# Removed command name -> what to run instead.  Kept so an old script or
+# muscle memory gets a pointer instead of click's bare "No such command".
+_REMOVED_COMMANDS = {
+    "report": "procdiag check --output report.html",
+    "list-rules": "procdiag explain",
+    "list-samplers": "procdiag explain",
+    "advise": "procdiag check",
+}
+
+
+class _ProcdiagGroup(click.Group):
+    def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
+        replacement = _REMOVED_COMMANDS.get(cmd_name)
+        if replacement is not None:
+            # Exit 4, not click's usage code 2: an old CI job calling a removed
+            # name must not read as check's "info only" (2) and pass.
+            err = click.UsageError(
+                f"procdiag {cmd_name} は削除されました。"
+                f"代わりに {replacement} を使ってください。",
+                ctx,
+            )
+            err.exit_code = _EXIT_USAGE
+            raise err
+        return super().get_command(ctx, cmd_name)
+
+
+@click.group(cls=_ProcdiagGroup)
 @click.version_option(version=__version__, prog_name="procdiag")
 def cli() -> None:
     """procdiag — local-first Linux ホスト資源診断ツール。"""
@@ -356,11 +387,16 @@ def record(
     "--format",
     "fmt",
     type=click.Choice(["text", "json", "html"]),
-    default="text",
-    help="出力フォーマット。",
+    default=None,
+    help="出力フォーマット (既定: --output の拡張子が .html/.htm なら html、"
+    ".json なら json、それ以外は text)。",
 )
 @click.option(
-    "--output", type=click.Path(), default=None, help="レポートをファイルに書き出す。"
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="レポートをファイルに書き出す (例: -o report.html)。",
 )
 @click.option("--verbose", is_flag=True, help="推論過程を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
@@ -375,7 +411,7 @@ def check(
     config_path: Optional[str],
     only: Optional[str],
     skip: Optional[str],
-    fmt: str,
+    fmt: Optional[str],
     output: Optional[str],
     verbose: bool,
     no_color: bool,
@@ -391,6 +427,7 @@ def check(
     from . import report as report_mod
     from .core.util import should_use_color
 
+    fmt = fmt or _FORMAT_BY_SUFFIX.get(Path(output or "").suffix.lower(), "text")
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     diag, charts, meta_hostname = _diagnose(
         cfg,
@@ -422,11 +459,6 @@ def check(
         click.echo(text)
 
     sys.exit(_exit_code(diag, exit_zero_on_info=exit_zero_on_info))
-
-
-# Register ``advise`` as a hidden alias for ``check`` (design doc §3).
-cli.add_command(check, name="advise")
-cli.commands["advise"].hidden = True  # type: ignore[attr-defined]
 
 
 @cli.command()
@@ -539,59 +571,6 @@ def compare(
         click.echo(text)
 
     sys.exit(compare_exit_code(result, exit_zero_on_info=exit_zero_on_info))
-
-
-# ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
-
-
-@cli.command()
-@_db_option("診断対象の DB ファイル。")
-@_config_option("設定ファイルのパス。")
-@click.option(
-    "--out",
-    "html_out",
-    default="report.html",
-    type=click.Path(),
-    help="HTML レポートの出力先 (既定: report.html)。",
-)
-@click.option(
-    "--json",
-    "json_out",
-    default=None,
-    type=click.Path(),
-    help="JSON レポートの出力先 (省略時はスキップ)。",
-)
-@_quiet_option
-def report(
-    db_path: Optional[str],
-    config_path: Optional[str],
-    html_out: str,
-    json_out: Optional[str],
-    quiet: bool,
-) -> None:
-    """HTML + JSON レポートを一括生成します (check のラッパーコマンド)。"""
-    from . import report as report_mod
-
-    cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-    diag, charts, meta_hostname = _diagnose(cfg, resolved_db, with_charts=True)
-
-    html_text = report_mod.render_html(
-        diag,
-        charts,
-        hostname_label=cfg.report.hostname_label,
-        meta_hostname=meta_hostname,
-    )
-    Path(html_out).write_text(html_text, encoding="utf-8")
-    quiet_mode = _is_quiet(quiet)
-    if not quiet_mode:
-        click.echo(f"HTML レポートを書き出しました: {html_out}")
-
-    if json_out:
-        Path(json_out).write_text(report_mod.render_json(diag), encoding="utf-8")
-        if not quiet_mode:
-            click.echo(f"JSON レポートを書き出しました: {json_out}")
 
 
 # ---------------------------------------------------------------------------
@@ -730,21 +709,21 @@ def explain(name: Optional[str]) -> None:
 
     if name is None:
         rules = all_rules()
+        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━")
+        for category, rule_ids in _group_by(rules, "category").items():
+            click.echo(f"\n[{category}]")
+            for rid in rule_ids:
+                click.echo(f"  {rid.ljust(22)} {rules[rid].title}")
+
         samplers = all_samplers()
-
-        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━\n")
-        for rid in sorted(rules):
-            what = getattr(rules[rid], "what", "") or ""
-            click.echo(f"  {rid.ljust(22)} {what[:60]}")
-
-        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━\n")
-        for sname in sorted(
-            samplers, key=lambda n: (getattr(samplers[n], "tier", ""), n)
-        ):
-            cls = samplers[sname]
-            tier = getattr(cls, "tier", "?")
-            what = getattr(cls, "what", "") or ""
-            click.echo(f"  {sname.ljust(14)} [{tier.ljust(3)}]  {what[:50]}")
+        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━")
+        for tier, names in _group_by(samplers, "tier").items():
+            click.echo(f"\n[{tier}]")
+            for sname in names:
+                cls = samplers[sname]
+                click.echo(
+                    f"  {sname.ljust(14)} {cls.interval_key.ljust(20)} {cls.title}"
+                )
         return
 
     # Look up by rule_id (uppercase convention) or sampler name (lowercase).
@@ -768,6 +747,14 @@ def explain(name: Optional[str]) -> None:
         sys.exit(1)
 
 
+def _group_by(registry: dict[str, type], attr: str) -> dict[str, list[str]]:
+    """Registry names grouped by a class attribute (``category`` / ``tier``), sorted."""
+    groups: dict[str, list[str]] = {}
+    for name in sorted(registry):
+        groups.setdefault(getattr(registry[name], attr) or "?", []).append(name)
+    return dict(sorted(groups.items()))
+
+
 def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
     """Print a rule's / sampler's what, why and manual check commands."""
     click.echo(f"{heading}\n")
@@ -785,53 +772,6 @@ def _print_detail(heading: str, cls: type, *, what_label: str) -> None:
         )
         for name, default in tunables.items():
             click.echo(f"  {name} ({default})")
-
-
-# ---------------------------------------------------------------------------
-# list-rules / list-samplers
-# ---------------------------------------------------------------------------
-
-
-@cli.command(name="list-rules")
-def list_rules() -> None:
-    """登録済みルールを rule_id / category / title の一覧で表示します。"""
-    from .core.rule import all_rules
-
-    _load_registries()
-    rules = all_rules()
-
-    by_cat: dict[str, list[str]] = {}
-    for rid, cls in rules.items():
-        cat = getattr(cls, "category", "other") or "other"
-        by_cat.setdefault(cat, []).append(rid)
-
-    for cat in sorted(by_cat):
-        click.echo(f"\n[{cat}]")
-        for rid in sorted(by_cat[cat]):
-            title = getattr(rules[rid], "title", "") or ""
-            click.echo(f"  {rid.ljust(22)} {title}")
-
-
-@cli.command(name="list-samplers")
-def list_samplers() -> None:
-    """登録済みサンプラーを Tier ごとに一覧表示します。"""
-    from .core.sampler import all_samplers
-
-    _load_registries()
-    samplers = all_samplers()
-
-    by_tier: dict[str, list[str]] = {}
-    for sname, cls in samplers.items():
-        tier = getattr(cls, "tier", "?") or "?"
-        by_tier.setdefault(tier, []).append(sname)
-
-    for tier in sorted(by_tier):
-        click.echo(f"\n[{tier}]")
-        for sname in sorted(by_tier[tier]):
-            cls = samplers[sname]
-            title = getattr(cls, "title", "") or ""
-            interval_key = getattr(cls, "interval_key", "") or ""
-            click.echo(f"  {sname.ljust(14)} {title.ljust(20)} ({interval_key})")
 
 
 # ---------------------------------------------------------------------------
