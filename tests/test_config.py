@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from click.testing import CliRunner
 
@@ -197,3 +199,19 @@ def test_cli_reports_a_broken_config_file_and_exits_4(
     assert isinstance(result.exception, SystemExit)
     assert message in result.output
     assert not (tmp_path / "q").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_cli_reports_an_unreadable_config_file_and_exits_4(tmp_path):
+    path = tmp_path / "config.py"
+    path.write_text(
+        "from procdiag.config import ProcdiagConfig\nconfig = ProcdiagConfig()\n",
+        encoding="utf-8",
+    )
+    path.chmod(0)
+    try:
+        result = CliRunner().invoke(cli, ["check", "--config", str(path)])
+    finally:
+        path.chmod(0o600)
+    assert result.exit_code == 4, result.output
+    assert "設定ファイルの読み込みに失敗しました" in result.output

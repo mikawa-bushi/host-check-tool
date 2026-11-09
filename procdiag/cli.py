@@ -62,8 +62,14 @@ def _config_option(
     help_text: str = "設定ファイルのパス (既定: ./config.py)。",
 ) -> Callable:
     """``--config PATH`` option."""
+    # readable=False: an unreadable file reaches _load_config and exits 4,
+    # not click's usage error, whose code 2 means "info only" for check.
     return click.option(
-        "--config", "config_path", default=None, type=click.Path(), help=help_text
+        "--config",
+        "config_path",
+        default=None,
+        type=click.Path(readable=False),
+        help=help_text,
     )
 
 
