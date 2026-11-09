@@ -351,10 +351,12 @@ def _assert_quick_finished(out_dir: Path, stdout: str, returncode: int) -> None:
 @pytest.mark.e2e
 def test_quick_runs_all_three_steps(tmp_path: Path) -> None:
     out_dir = tmp_path / "q"
+    config_path = tmp_path / "config.py"
+    _write_config(config_path, tmp_path / "unused.db")
     result = _run(
-        ["quick", "--duration", "2s", "--out", str(out_dir), "--no-color"],
+        ["quick", "--duration", "2s", "--out", str(out_dir), "--no-color"]
+        + ["--config", str(config_path)],
         timeout=60,
-        cwd=tmp_path,
     )
     _assert_quick_finished(out_dir, result.stdout, result.returncode)
     assert str(out_dir / "report.html") in result.stdout
@@ -364,12 +366,14 @@ def test_quick_runs_all_three_steps(tmp_path: Path) -> None:
 def test_quick_ctrl_c_during_recording_still_diagnoses(tmp_path: Path) -> None:
     """SIGINT while recording ends the recording early, not the command."""
     out_dir = tmp_path / "q"
+    config_path = tmp_path / "config.py"
+    _write_config(config_path, tmp_path / "unused.db")
     proc = subprocess.Popen(
-        [_PROCDIAG, "quick", "--duration", "10m", "--out", str(out_dir), "--no-color"],
+        [_PROCDIAG, "quick", "--duration", "10m", "--out", str(out_dir), "--no-color"]
+        + ["--config", str(config_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=str(tmp_path),
     )
     seen = []
     assert proc.stdout is not None
