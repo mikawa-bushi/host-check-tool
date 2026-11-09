@@ -830,18 +830,23 @@ class TestQuickRefusals:
         assert result.exit_code == 4, result.output
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
-    def test_out_dir_that_cannot_be_created_exits_4(self, runner, tmp_path):
-        parent = tmp_path / "ro"
-        parent.mkdir()
-        parent.chmod(0o500)
+    @pytest.mark.parametrize(
+        ("mode", "target"),
+        [(0o500, "q"), (0o000, "."), (0o000, "q")],
+        ids=["parent-not-writable", "dir-not-readable", "parent-not-searchable"],
+    )
+    def test_out_path_that_cannot_be_used_exits_4(self, runner, tmp_path, mode, target):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(mode)
         try:
             result = runner.invoke(
-                cli, ["quick", "--duration", "2s", "--out", str(parent / "q")]
+                cli, ["quick", "--duration", "2s", "--out", str(locked / target)]
             )
         finally:
-            parent.chmod(0o700)
+            locked.chmod(0o700)
         assert result.exit_code == 4, result.output
-        assert "出力先を作れません" in result.output
+        assert "出力先を使えません" in result.output
         assert "Traceback" not in result.output
         assert "[1/3]" not in result.output
 
@@ -849,6 +854,41 @@ class TestQuickRefusals:
         result = runner.invoke(cli, ["--help"])
         assert "初めての方は procdiag quick" in result.output
         assert "quick" in _listed_commands(result.output)
+
+
+class TestQuickRun:
+    def test_snapshot_warning_is_repeated_after_the_diagnosis(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag import snapshot
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            snapshot,
+            "run_snapshot",
+            lambda cfg: [
+                snapshot.SnapshotItem(
+                    "システム",
+                    "recording",
+                    "記録状況",
+                    snapshot.INFO,
+                    "未記録",
+                    "procdiag record で記録してください",
+                ),
+                snapshot.SnapshotItem(
+                    "プロセス", "zombies", "ゾンビプロセス", snapshot.WARNING, "55 個"
+                ),
+            ],
+        )
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 1, result.output
+        after_diagnosis = result.output.split("[3/3]", 1)[1]
+        assert "ゾンビプロセス: 55 個" in after_diagnosis
+        assert "procdiag record で記録してください" not in result.output
+        report = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
+        assert report.startswith("<!doctype html>")
 
 
 # ---------------------------------------------------------------------------

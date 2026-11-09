@@ -28,7 +28,8 @@ CPU・メモリ・ディスクの使用状況を一定期間低負荷で記録�
 pip install host-check-tool
 
 # これだけで診断: いまの状態の確認 → 1 時間の記録 → 診断
-# 結果は画面と ./procdiag-quick-<日時>/report.html に出る。Ctrl-C で記録を早めに終えても診断する
+# 結果は画面に出る。記録の診断は ./procdiag-quick-<日時>/report.html にも書き出す。
+# Ctrl-C で記録を早めに終えても診断する
 procdiag quick
 ```
 
@@ -156,7 +157,7 @@ procdiag compare before.db after.db --format json --output compare.json
 | `4` | 前提条件エラー (DB ファイルが無い等)。`1` の異常検出と区別される |
 
 `procdiag quick` も同じ番号を返す。診断のほか、最初の snapshot に warning / critical があるときも `1` になる。
-`--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を作れないときは `4`。
+`--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を使えないときは `4`。
 
 `procdiag compare` も同じ番号を使う (優先順位は 1 > 3 > 2 > 0):
 

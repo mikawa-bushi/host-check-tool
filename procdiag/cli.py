@@ -498,7 +498,9 @@ def check(
     "--out",
     "out_dir",
     default=None,
-    type=click.Path(),
+    # readable=False: an unusable path gets quick's own exit-4 message, not
+    # click's usage error, whose code 2 means "info only" for check.
+    type=click.Path(readable=False),
     help="記録 DB とレポートを置くディレクトリ (既定: ./procdiag-quick-<日時>)。"
     "空でないディレクトリは指定できません。",
 )
@@ -533,21 +535,23 @@ def quick(
             err=True,
         )
         sys.exit(_EXIT_USAGE)
+    cfg = _load_config(config_path)
     out = Path(out_dir or time.strftime("procdiag-quick-%Y%m%d-%H%M%S"))
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+    try:
+        occupied = out.exists() and (not out.is_dir() or any(out.iterdir()))
+        if not occupied:
+            out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
         click.echo(
-            f"エラー: 出力先が空のディレクトリではありません: {out}\n"
-            "まだ無いパスか、空のディレクトリを --out に指定してください。",
+            f"エラー: 出力先を使えません: {out} ({exc.strerror})\n"
+            "書き込めるディレクトリで実行するか、--out で書き込める場所を指定してください。",
             err=True,
         )
         sys.exit(_EXIT_USAGE)
-    cfg = _load_config(config_path)
-    try:
-        out.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
+    if occupied:
         click.echo(
-            f"エラー: 出力先を作れません: {out} ({exc.strerror})\n"
-            "書き込めるディレクトリで実行するか、--out で書き込める場所を指定してください。",
+            f"エラー: 出力先が空のディレクトリではありません: {out}\n"
+            "まだ無いパスか、空のディレクトリを --out に指定してください。",
             err=True,
         )
         sys.exit(_EXIT_USAGE)
@@ -555,31 +559,48 @@ def quick(
     color = should_use_color(no_color)
 
     click.echo("[1/3] いまの状態を確認します (snapshot)\n")
-    items = snapshot_mod.run_snapshot(cfg)
+    # The "recording" line would tell the user to run procdiag record, which
+    # is what step 2 does next.
+    items = [i for i in snapshot_mod.run_snapshot(cfg) if i.name != "recording"]
     click.echo(
         snapshot_mod.render_text(
-            items, hostname=_host_label(cfg), color=color, ascii_only=_use_ascii(False)
+            items,
+            hostname=_host_label(cfg),
+            color=color,
+            ascii_only=_use_ascii(False),
+            next_step="",
         )
     )
+    problems = [
+        i for i in items if i.status in (snapshot_mod.WARNING, snapshot_mod.CRITICAL)
+    ]
 
     end = time.strftime("%H:%M:%S", time.localtime(time.time() + seconds))
     click.echo(f"\n[2/3] {humanize_duration(seconds)} 記録します ({end} に終わります)")
     click.echo("Ctrl-C で早めに終えても、それまでの記録を診断します。")
     Recorder(cfg.model_copy(update={"db_path": str(db)}), duration=seconds).run()
 
-    click.echo("\n[3/3] 記録を診断します (check)\n")
     diag, charts, meta_hostname = _diagnose(cfg, str(db), with_charts=True)
-    click.echo(report_mod.render_terminal(diag, color=color).lstrip("\n"))
+    # Write the report before printing anything more: when an SSH drop ended
+    # the recording (SIGHUP), the terminal is gone and the next echo fails.
     report = out / "report.html"
     report.write_text(_render_html(cfg, diag, charts, meta_hostname), encoding="utf-8")
+    click.echo("\n[3/3] 記録を診断しました (check)\n")
+    click.echo(report_mod.render_terminal(diag, color=color).lstrip("\n"))
+    if problems:
+        click.echo(
+            f"\n[1/3] いまの状態の確認で、注意が必要な項目が {len(problems)} 件ありました:"
+        )
+        for item in problems:
+            click.echo(f"  {item.label}: {item.detail}")
 
     click.echo(f"\nHTML レポートを書き出しました: {report}")
     click.echo(f"記録 DB: {db}")
     click.echo(
-        "長期の傾向 (メモリリーク・ディスクの増加など) を見るには、"
+        "メモリリークや慢性的なメモリ不足を見るには、"
         "procdiag record --duration 24h で記録してから procdiag check を実行してください。"
     )
-    sys.exit(1 if snapshot_mod.exit_code(items) else _exit_code(diag))
+    sys.exit(1 if problems else _exit_code(diag))
 
 
 @cli.command()
