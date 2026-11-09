@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import TYPE_CHECKING
 
 import pytest
 from synth import (
@@ -31,9 +30,7 @@ from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Confidence, Finding, Rule, Severity
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.engine import fold
-
-if TYPE_CHECKING:
-    from procdiag.storage import Storage
+from procdiag.storage import TABLE_COLUMNS, Storage
 
 _MB = 1024 * 1024
 _GB = 1024**3
@@ -461,6 +458,44 @@ class TestFold:
 # Observation time guard
 # ---------------------------------------------------------------------------
 
+_LEAK_FITS = ("MEM-LEAK-01", "FD-LEAK-01", "THREAD-LEAK-01")
+
+
+def _row(table: str, **values: object) -> tuple:
+    return tuple(values.get(column, 0) for column in TABLE_COLUMNS[table])
+
+
+def _record(store: Storage, monkeypatch, *, start: float, seconds: float) -> None:
+    """Sample every 10 s from *start* for *seconds* a process whose RSS, threads
+    and FDs grow, then roll the samples up as the recorder does when it stops."""
+    leaky = store.proc_id_for("leaky", "hash_leaky", "/usr/bin/leaky", start)
+    for k in range(int(seconds // 10) + 1):
+        t = start + 10 * k
+        h = 10 * k / _HOUR
+        store.buffer(
+            "sys_samples",
+            [_row("sys_samples", ts=t, mem_used=2 * _GB, mem_available=6 * _GB)],
+        )
+        store.buffer(
+            "proc_samples",
+            [
+                _row(
+                    "proc_samples",
+                    ts=t,
+                    proc_id=leaky,
+                    pid=200,
+                    rss=int(200 * _MB + 50 * _MB * h),
+                    pss=None,
+                    num_threads=8 + int(10 * h),
+                    num_fds=40 + int(20 * h),
+                )
+            ],
+        )
+    store.flush(reason="test")
+    with monkeypatch.context() as m:
+        m.setattr("procdiag.storage.time.time", lambda: start + seconds + 0.3)
+        store.rollup_incremental()
+
 
 class TestObservationGuard:
     def test_healthy_when_insufficient_data(self, tmp_path):
@@ -557,6 +592,32 @@ class TestObservationGuard:
         found = [f for f in diag.findings if f.rule_id == "DISK-FULL-01"]
         assert [f.subject for f in found] == ["/var"]
         assert found[0].confidence == Confidence.MEDIUM
+
+    @pytest.mark.parametrize(
+        ("hours", "overrides"),
+        [
+            (6.0, {}),
+            (3.0, {rule: {"min_observation_hours": 3.0} for rule in _LEAK_FITS}),
+        ],
+        ids=["default-6h", "overridden-3h"],
+    )
+    def test_a_recording_90s_short_of_the_requirement_reports_the_leaks(
+        self, tmp_path, monkeypatch, hours, overrides
+    ):
+        # Starting 10 s into a minute and stopping 90 s short leaves the rules
+        # rollup rows spanning four minutes less than required: the shortest
+        # series a recording long enough to be evaluated can give them.
+        start = 60 * (int(time.time()) // 60) - 8 * _HOUR + 10
+        store = make_db(tmp_path, hours=hours)
+        _record(store, monkeypatch, start=start, seconds=hours * _HOUR - 90)
+
+        config = ProcdiagConfig(rules=RulesConfig(overrides=overrides))
+        diag = Engine(config).run(store, only=list(_LEAK_FITS))
+        store.close()
+
+        assert {(f.rule_id, f.subject, f.confidence) for f in diag.findings} == {
+            (rule, "leaky", Confidence.MEDIUM) for rule in _LEAK_FITS
+        }
 
     def test_instant_rule_runs_on_short_window(self, tmp_path):
         """min_observation_hours=0.0 rules fire even on short recordings.
