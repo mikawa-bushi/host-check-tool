@@ -33,6 +33,17 @@ from procdiag.storage import Storage
 # ---------------------------------------------------------------------------
 
 
+def _group_of(listing: str, name: str) -> str:
+    """The ``[group]`` header above the line listing *name* in ``explain``."""
+    group = ""
+    for line in listing.splitlines():
+        if line.startswith("["):
+            group = line
+        elif line.split()[:1] == [name]:
+            return group
+    raise AssertionError(f"{name} が一覧にありません")
+
+
 @pytest.fixture()
 def runner():
     """CliRunner instance."""
@@ -287,6 +298,35 @@ class TestExplain:
         """explain must not crash even when diagnosis is not yet importable."""
         result = runner.invoke(cli, ["explain"])
         assert result.exit_code == 0
+
+    def test_list_groups_rules_by_category_with_title(self, runner, fake_rule):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "FAKE-TEST-01") == "[test]"
+        assert _group_of(result.output, "MEM-LEAK-01") == "[memory]"
+        line = next(ln for ln in result.output.splitlines() if "FAKE-TEST-01" in ln)
+        assert "テスト用フェイクルール" in line
+        assert "procdiag explain <RULE-ID>" in result.output
+
+    def test_list_groups_samplers_by_tier_with_interval_key(self, runner, fake_sampler):
+        result = runner.invoke(cli, ["explain"])
+        assert _group_of(result.output, "fake_sampler") == "[T1]"
+        assert _group_of(result.output, "disk") == "[T3]"
+        line = next(ln for ln in result.output.splitlines() if "fake_sampler" in ln)
+        assert "フェイクサンプラー" in line
+        assert "system_interval" in line
+        assert "procdiag explain <name>" in result.output
+
+    def test_list_shows_every_registered_rule_and_sampler(self, runner):
+        """Every rule and sampler is listed (thermal used to be missing)."""
+        from procdiag import diagnosis, samplers  # noqa: F401
+        from procdiag.core.rule import all_rules
+        from procdiag.core.sampler import all_samplers
+
+        result = runner.invoke(cli, ["explain"])
+        assert result.exit_code == 0
+        names = {ln.split()[0] for ln in result.output.splitlines() if ln[:2] == "  "}
+        assert set(all_rules()) | set(all_samplers()) <= names
+        assert {"system", "cgroup", "process", "disk", "thermal"} <= names
 
 
 class TestListRules:

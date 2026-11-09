@@ -741,21 +741,21 @@ def explain(name: Optional[str]) -> None:
 
     if name is None:
         rules = all_rules()
+        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━")
+        for category, rule_ids in _group_by(rules, "category").items():
+            click.echo(f"\n[{category}]")
+            for rid in rule_ids:
+                click.echo(f"  {rid.ljust(22)} {rules[rid].title}")
+
         samplers = all_samplers()
-
-        click.echo("━━━ 登録済みルール (procdiag explain <RULE-ID> で詳細) ━━━\n")
-        for rid in sorted(rules):
-            what = getattr(rules[rid], "what", "") or ""
-            click.echo(f"  {rid.ljust(22)} {what[:60]}")
-
-        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━\n")
-        for sname in sorted(
-            samplers, key=lambda n: (getattr(samplers[n], "tier", ""), n)
-        ):
-            cls = samplers[sname]
-            tier = getattr(cls, "tier", "?")
-            what = getattr(cls, "what", "") or ""
-            click.echo(f"  {sname.ljust(14)} [{tier.ljust(3)}]  {what[:50]}")
+        click.echo("\n━━━ 登録済みサンプラー (procdiag explain <name> で詳細) ━━━")
+        for tier, names in _group_by(samplers, "tier").items():
+            click.echo(f"\n[{tier}]")
+            for sname in names:
+                cls = samplers[sname]
+                click.echo(
+                    f"  {sname.ljust(14)} {cls.interval_key.ljust(20)} {cls.title}"
+                )
         return
 
     # Look up by rule_id (uppercase convention) or sampler name (lowercase).
@@ -777,6 +777,14 @@ def explain(name: Optional[str]) -> None:
     else:
         click.echo(f"不明な名前です: {name}", err=True)
         sys.exit(1)
+
+
+def _group_by(registry: dict[str, type], attr: str) -> dict[str, list[str]]:
+    """Registry names grouped by a class attribute (``category`` / ``tier``), sorted."""
+    groups: dict[str, list[str]] = {}
+    for name in sorted(registry):
+        groups.setdefault(getattr(registry[name], attr) or "?", []).append(name)
+    return dict(sorted(groups.items()))
 
 
 def _print_detail(heading: str, cls: type, *, what_label: str) -> None:

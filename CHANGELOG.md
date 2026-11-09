@@ -6,6 +6,7 @@
 
 ### Changed
 - `procdiag check --output` が拡張子から出力形式を決めるようになった (`.html` / `.htm` → HTML、`.json` → JSON、それ以外は text)。これまでは `--format` を付け忘れると `check --output report.html` が端末向けのテキストを .html ファイルに書いていた。`--format` を指定すればそちらが優先する。`--output` の短縮形 `-o` を追加。
+- `procdiag explain` (引数なし) の一覧を、ルールはカテゴリ別にタイトルつきで、サンプラーは Tier 別に記録間隔の設定名とタイトルつきで表示するようにした (`list-rules` / `list-samplers` と同じ表示)。
 
 ### Fixed
 - `rules.overrides` で MEM-LEAK-01 / FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 の最低観測時間 (`min_observation_hours`) を 6.0 に上書きしても、全体設定 `rules.min_observation_hours` が 6.0 以外だと上書きが無視され、全体設定の時間が使われていた。
