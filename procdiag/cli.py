@@ -62,8 +62,14 @@ def _config_option(
     help_text: str = "設定ファイルのパス (既定: ./config.py)。",
 ) -> Callable:
     """``--config PATH`` option."""
+    # readable=False: an unreadable file reaches _load_config and exits 4,
+    # not click's usage error, whose code 2 means "info only" for check.
     return click.option(
-        "--config", "config_path", default=None, type=click.Path(), help=help_text
+        "--config",
+        "config_path",
+        default=None,
+        type=click.Path(readable=False),
+        help=help_text,
     )
 
 
@@ -78,10 +84,17 @@ _quiet_option = click.option(
 def _load_config(
     config_path: Optional[str], db_path: Optional[str] = None
 ) -> ProcdiagConfig:
-    """Load the config (``./config.py`` by default) with an optional DB override."""
+    """Load the config (``./config.py`` by default) with an optional DB override.
+
+    Exits with code 4 when the config file is missing or broken.
+    """
     from .config import load_config
 
-    cfg = load_config(Path(config_path) if config_path else None)
+    try:
+        cfg = load_config(Path(config_path) if config_path else None)
+    except ValueError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
     if db_path:
         cfg = cfg.model_copy(update={"db_path": db_path})
     if cfg.rules.overrides:
