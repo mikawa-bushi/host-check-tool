@@ -832,8 +832,13 @@ class TestQuickRefusals:
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
     @pytest.mark.parametrize(
         ("mode", "target"),
-        [(0o500, "q"), (0o000, "."), (0o000, "q")],
-        ids=["parent-not-writable", "dir-not-readable", "parent-not-searchable"],
+        [(0o500, "q"), (0o500, "."), (0o000, "."), (0o000, "q")],
+        ids=[
+            "parent-not-writable",
+            "empty-dir-not-writable",
+            "dir-not-readable",
+            "parent-not-searchable",
+        ],
     )
     def test_out_path_that_cannot_be_used_exits_4(self, runner, tmp_path, mode, target):
         locked = tmp_path / "locked"
@@ -876,7 +881,12 @@ class TestQuickRun:
                     "procdiag record で記録してください",
                 ),
                 snapshot.SnapshotItem(
-                    "プロセス", "zombies", "ゾンビプロセス", snapshot.WARNING, "55 個"
+                    "プロセス",
+                    "zombies",
+                    "ゾンビプロセス",
+                    snapshot.WARNING,
+                    "55 個",
+                    "親プロセスを確認してください",
                 ),
             ],
         )
@@ -885,10 +895,33 @@ class TestQuickRun:
         )
         assert result.exit_code == 1, result.output
         after_diagnosis = result.output.split("[3/3]", 1)[1]
-        assert "ゾンビプロセス: 55 個" in after_diagnosis
+        assert "[警告] ゾンビプロセス: 55 個" in after_diagnosis
+        assert "→ 親プロセスを確認してください" in after_diagnosis
         assert "procdiag record で記録してください" not in result.output
         report = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
         assert report.startswith("<!doctype html>")
+
+    def test_diagnosis_is_still_shown_when_the_report_cannot_be_written(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag.recorder import Recorder
+
+        monkeypatch.chdir(tmp_path)
+        record = Recorder.run
+
+        def record_then_block_the_report(self):
+            code = record(self)
+            (tmp_path / "q" / "report.html").mkdir()
+            return code
+
+        monkeypatch.setattr(Recorder, "run", record_then_block_the_report)
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 4, result.output
+        assert "[3/3]" in result.output
+        assert "HTML レポートを書けませんでした" in result.output
+        assert "Traceback" not in result.output
 
 
 # ---------------------------------------------------------------------------

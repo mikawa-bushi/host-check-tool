@@ -17,6 +17,7 @@ Design mirrors netdiag's ``cli.py`` where possible:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -541,6 +542,8 @@ def quick(
         occupied = out.exists() and (not out.is_dir() or any(out.iterdir()))
         if not occupied:
             out.mkdir(parents=True, exist_ok=True)
+            if not os.access(out, os.W_OK | os.X_OK):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
     except OSError as exc:
         click.echo(
             f"エラー: 出力先を使えません: {out} ({exc.strerror})\n"
@@ -584,22 +587,39 @@ def quick(
     # Write the report before printing anything more: when an SSH drop ended
     # the recording (SIGHUP), the terminal is gone and the next echo fails.
     report = out / "report.html"
-    report.write_text(_render_html(cfg, diag, charts, meta_hostname), encoding="utf-8")
+    try:
+        report.write_text(
+            _render_html(cfg, diag, charts, meta_hostname), encoding="utf-8"
+        )
+    except OSError as exc:
+        report_error = (
+            f"エラー: HTML レポートを書けませんでした: {report} ({exc.strerror})"
+        )
+    else:
+        report_error = ""
     click.echo("\n[3/3] 記録を診断しました (check)\n")
     click.echo(report_mod.render_terminal(diag, color=color).lstrip("\n"))
     if problems:
         click.echo(
             f"\n[1/3] いまの状態の確認で、注意が必要な項目が {len(problems)} 件ありました:"
         )
+        marks = {snapshot_mod.CRITICAL: "重大", snapshot_mod.WARNING: "警告"}
         for item in problems:
-            click.echo(f"  {item.label}: {item.detail}")
+            click.echo(f"  [{marks[item.status]}] {item.label}: {item.detail}")
+            if item.hint:
+                click.echo(f"      → {item.hint}")
 
-    click.echo(f"\nHTML レポートを書き出しました: {report}")
+    if report_error:
+        click.echo(f"\n{report_error}", err=True)
+    else:
+        click.echo(f"\nHTML レポートを書き出しました: {report}")
     click.echo(f"記録 DB: {db}")
     click.echo(
         "メモリリークや慢性的なメモリ不足を見るには、"
         "procdiag record --duration 24h で記録してから procdiag check を実行してください。"
     )
+    if report_error:
+        sys.exit(_EXIT_USAGE)
     sys.exit(1 if problems else _exit_code(diag))
 
 
