@@ -44,6 +44,7 @@ from ..core import (
     Window,
     all_rules,
     configure_rule,
+    covers,
 )
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
@@ -253,7 +254,7 @@ class Engine:
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
             eff_min = self._required_hours(rule)
-            if window.span_hours < eff_min:
+            if not covers(window.span_hours, eff_min):
                 reasoning.append(
                     f"{rule.rule_id}: 観測時間不足のためスキップ "
                     f"({window.span_hours:.1f}h < {eff_min:.1f}h)"
