@@ -11,10 +11,12 @@
 ### Removed
 - 重複していたコマンドを削除。削除した名前を実行すると、代わりのコマンドを示して終了コード 4 (前提条件エラー) で終わる。check の 2 (info のみ) と区別するため。
   - `procdiag report` → `procdiag check -o report.html` (JSON は `-o report.json`)
+    - `report` は所見があっても終了コード 0 で終わっていた。`check` は critical / warning があると 1、info だけなら 2 で終わる。cron などで常に 0 が必要なら `|| true` を付ける。
   - `procdiag list-rules` / `procdiag list-samplers` → `procdiag explain`
   - `procdiag advise` (`check` の隠し別名) → `procdiag check`
 
 ### Fixed
+- `procdiag --help` のコマンド一覧に `check` が出ていなかった。隠し別名 `advise` を隠す設定が、同じコマンドの `check` まで隠していた。
 - `rules.overrides` で MEM-LEAK-01 / FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 の最低観測時間 (`min_observation_hours`) を 6.0 に上書きしても、全体設定 `rules.min_observation_hours` が 6.0 以外だと上書きが無視され、全体設定の時間が使われていた。
 - `procdiag compare --at` で、区切り時刻の直前 1 ミリ秒以内に記録されたサンプルが、修正前と修正後のどちらの期間にも入っていなかった。
 
