@@ -65,12 +65,12 @@ class Period:
 
 # Rollup rows carry the start of their minute, the row stamped before the
 # window start is left out, and the minute in progress at stop is never rolled
-# up.  A rollup series inside a window the engine gate let through therefore
-# spans at least the requirement less four minutes (for a whole-minute
-# requirement).  On raw series such as disk rows or proc_counts this only adds
-# leniency.
+# up, so a rollup series spans less than three minutes short of its window.
+# The engine gate lets a window two minutes short through, so a series inside
+# it spans more than the requirement less five minutes.  On raw series such
+# as disk rows or proc_counts this only adds leniency.
 def _series_covers(span_hours: float, hours: float) -> bool:
-    return covers(span_hours + 2 / 60, hours)
+    return covers(span_hours + 3 / 60, hours)
 
 
 def fit_linear(
