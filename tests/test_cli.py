@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -792,6 +793,62 @@ class TestCheckOutputFormat:
         out = tmp_path / "r.html"
         self._check(runner, db_with_data, "--format", "json", "-o", str(out))
         assert json.loads(out.read_text(encoding="utf-8"))["no_data"] is False
+
+
+# ---------------------------------------------------------------------------
+# quick: precondition errors (the full run is in test_e2e.py)
+# ---------------------------------------------------------------------------
+
+
+class TestQuickRefusals:
+    @pytest.mark.parametrize("duration", ["0s", "0m", "abc", "10"])
+    def test_bad_duration_exits_4_before_doing_anything(
+        self, runner, tmp_path, duration
+    ):
+        out = tmp_path / "q"
+        result = runner.invoke(
+            cli, ["quick", "--duration", duration, "--out", str(out)]
+        )
+        assert result.exit_code == 4, result.output
+        assert "エラー" in result.output
+        assert "[1/3]" not in result.output
+        assert not out.exists()
+
+    def test_non_empty_out_dir_exits_4_and_is_left_alone(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.mkdir()
+        (out / "keep.txt").write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+        assert "空のディレクトリではありません" in result.output
+        assert [p.name for p in out.iterdir()] == ["keep.txt"]
+
+    def test_out_path_that_is_a_file_exits_4(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_out_dir_that_cannot_be_created_exits_4(self, runner, tmp_path):
+        parent = tmp_path / "ro"
+        parent.mkdir()
+        parent.chmod(0o500)
+        try:
+            result = runner.invoke(
+                cli, ["quick", "--duration", "2s", "--out", str(parent / "q")]
+            )
+        finally:
+            parent.chmod(0o700)
+        assert result.exit_code == 4, result.output
+        assert "出力先を作れません" in result.output
+        assert "Traceback" not in result.output
+        assert "[1/3]" not in result.output
+
+    def test_root_help_points_first_time_users_to_quick(self, runner):
+        result = runner.invoke(cli, ["--help"])
+        assert "初めての方は procdiag quick" in result.output
+        assert "quick" in _listed_commands(result.output)
 
 
 # ---------------------------------------------------------------------------

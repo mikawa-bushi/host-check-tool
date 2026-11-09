@@ -20,6 +20,12 @@ Test cases
 
 3. ``test_self_cpu_under_budget`` — after an 8-second record run the
    steady-state self_cpu (startup transient excluded) must be below 10 %.
+
+4. ``test_quick_runs_all_three_steps`` — ``quick --duration 2s`` prints the
+   three step headings and leaves procdiag.db and report.html in ``--out``.
+
+5. ``test_quick_ctrl_c_during_recording_still_diagnoses`` — SIGINT during the
+   recording ends it early; the diagnosis and report.html still follow.
 """
 
 from __future__ import annotations
@@ -324,3 +330,61 @@ def test_self_cpu_under_budget(tmp_path: Path) -> None:
         f"procdiag self-CPU overhead too high: avg={avg:.2f}% >= 10%.\n"
         "Check SelfMeter wiring and sampling intervals."
     )
+
+
+# ---------------------------------------------------------------------------
+# quick: snapshot, a short record and the diagnosis in one command
+# ---------------------------------------------------------------------------
+
+_QUICK_HEADINGS = ("[1/3]", "[2/3]", "[3/3]")
+
+
+def _assert_quick_finished(out_dir: Path, stdout: str, returncode: int) -> None:
+    assert returncode in (0, 1, 2), f"quick exited {returncode}:\n{stdout}"
+    positions = [stdout.find(h) for h in _QUICK_HEADINGS]
+    assert -1 not in positions and positions == sorted(positions), stdout
+    assert _count_rows(out_dir / "procdiag.db", "sys_samples") > 0
+    report = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert report.startswith("<!doctype html>")
+
+
+@pytest.mark.e2e
+def test_quick_runs_all_three_steps(tmp_path: Path) -> None:
+    out_dir = tmp_path / "q"
+    result = _run(
+        ["quick", "--duration", "2s", "--out", str(out_dir), "--no-color"],
+        timeout=60,
+        cwd=tmp_path,
+    )
+    _assert_quick_finished(out_dir, result.stdout, result.returncode)
+    assert str(out_dir / "report.html") in result.stdout
+
+
+@pytest.mark.e2e
+def test_quick_ctrl_c_during_recording_still_diagnoses(tmp_path: Path) -> None:
+    """SIGINT while recording ends the recording early, not the command."""
+    out_dir = tmp_path / "q"
+    proc = subprocess.Popen(
+        [_PROCDIAG, "quick", "--duration", "10m", "--out", str(out_dir), "--no-color"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    seen = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        seen.append(line)
+        if line.startswith("[2/3]"):
+            break
+    # The recorder installs its handler after setting up the samplers.
+    time.sleep(2.0)
+    proc.send_signal(signal.SIGINT)
+    try:
+        rest, _err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail("quick did not finish within 60 s after SIGINT")
+
+    _assert_quick_finished(out_dir, "".join(seen) + rest, proc.returncode)

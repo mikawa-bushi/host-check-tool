@@ -2,8 +2,9 @@
 
 Conclusion-first host-resource diagnosis: ``procdiag record`` collects
 metrics, ``procdiag check`` runs all rules and prints the root cause and
-next steps.  The remaining commands support that core workflow (status,
-export, explain, prune) or system integration (service).
+next steps.  ``procdiag quick`` runs snapshot, a short record and check in
+one go for a first-time user.  The remaining commands support that core
+workflow (status, export, explain, prune) or system integration (service).
 
 Design mirrors netdiag's ``cli.py`` where possible:
 
@@ -197,6 +198,30 @@ def _diagnose(
 _FORMAT_BY_SUFFIX = {".html": "html", ".htm": "html", ".json": "json"}
 
 
+def _render_html(
+    cfg: ProcdiagConfig,
+    diag: Diagnosis,
+    charts: Optional[ChartData],
+    meta_hostname: Optional[str],
+) -> str:
+    """The self-contained HTML report, as ``check`` and ``quick`` write it."""
+    from .report import render_html
+
+    return render_html(
+        diag,
+        charts,
+        hostname_label=cfg.report.hostname_label,
+        meta_hostname=meta_hostname,
+    )
+
+
+def _host_label(cfg: ProcdiagConfig) -> str:
+    """Host name shown by ``snapshot``: ``report.hostname_label`` or the real one."""
+    import socket
+
+    return cfg.report.hostname_label or socket.gethostname()
+
+
 def _exit_code(diag: Diagnosis, *, exit_zero_on_info: bool = False) -> int:
     """Map a diagnosis to the documented ``check`` exit code.
 
@@ -248,7 +273,10 @@ class _ProcdiagGroup(click.Group):
 @click.group(cls=_ProcdiagGroup)
 @click.version_option(version=__version__, prog_name="procdiag")
 def cli() -> None:
-    """procdiag — local-first Linux ホスト資源診断ツール。"""
+    """procdiag — local-first Linux ホスト資源診断ツール。
+
+    初めての方は procdiag quick を実行してください。いまの状態の確認・30 分の記録・診断を 1 回で行います。
+    """
     load_plugins()
 
 
@@ -318,14 +346,12 @@ def snapshot(
 
     終了コード: 0=警告なし / 1=warning・critical あり
     """
-    import socket
-
     from . import snapshot as snapshot_mod
     from .core.util import should_use_color
 
     cfg = _load_config(config_path)
     items = snapshot_mod.run_snapshot(cfg)
-    hostname = cfg.report.hostname_label or socket.gethostname()
+    hostname = _host_label(cfg)
     if fmt == "json":
         click.echo(snapshot_mod.render_json(items, hostname=hostname))
     else:
@@ -441,12 +467,7 @@ def check(
     if fmt == "json":
         text = report_mod.render_json(diag)
     elif fmt == "html":
-        text = report_mod.render_html(
-            diag,
-            charts,
-            hostname_label=cfg.report.hostname_label,
-            meta_hostname=meta_hostname,
-        )
+        text = _render_html(cfg, diag, charts, meta_hostname)
     else:
         color = should_use_color(no_color)
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
@@ -459,6 +480,106 @@ def check(
         click.echo(text)
 
     sys.exit(_exit_code(diag, exit_zero_on_info=exit_zero_on_info))
+
+
+# ---------------------------------------------------------------------------
+# quick
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--duration",
+    default="30m",
+    show_default=True,
+    help="記録する時間 (例: 10m, 1h)。",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    default=None,
+    type=click.Path(),
+    help="記録 DB とレポートを置くディレクトリ (既定: ./procdiag-quick-<日時>)。"
+    "空でないディレクトリは指定できません。",
+)
+@_config_option()
+@click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
+def quick(
+    duration: str, out_dir: Optional[str], config_path: Optional[str], no_color: bool
+) -> None:
+    """いまの状態の確認・短い記録・診断を 1 回で行います (初めての方向け)。
+
+    snapshot でいまの状態を確認し、--duration の間だけ記録してから check
+    と同じルールで診断します。記録中に Ctrl-C
+    を押すと記録を早めに終え、そこまでの記録を診断します。記録 DB と HTML
+    レポートは --out のディレクトリに置きます。
+
+    終了コード: 0=問題なし / 1=snapshot か診断に critical・warning あり /
+    2=info のみ / 3=観測データなし / 4=前提条件エラー
+    """
+    from . import report as report_mod
+    from . import snapshot as snapshot_mod
+    from .core.util import humanize_duration, parse_duration, should_use_color
+    from .recorder import Recorder
+
+    try:
+        seconds = parse_duration(duration)
+    except ValueError as exc:
+        click.echo(f"エラー: {exc}", err=True)
+        sys.exit(_EXIT_USAGE)
+    if seconds <= 0:
+        click.echo(
+            f"エラー: --duration には 0 より長い時間を指定してください: {duration}",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    out = Path(out_dir or time.strftime("procdiag-quick-%Y%m%d-%H%M%S"))
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        click.echo(
+            f"エラー: 出力先が空のディレクトリではありません: {out}\n"
+            "まだ無いパスか、空のディレクトリを --out に指定してください。",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    cfg = _load_config(config_path)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        click.echo(
+            f"エラー: 出力先を作れません: {out} ({exc.strerror})\n"
+            "書き込めるディレクトリで実行するか、--out で書き込める場所を指定してください。",
+            err=True,
+        )
+        sys.exit(_EXIT_USAGE)
+    db = out / "procdiag.db"
+    color = should_use_color(no_color)
+
+    click.echo("[1/3] いまの状態を確認します (snapshot)\n")
+    items = snapshot_mod.run_snapshot(cfg)
+    click.echo(
+        snapshot_mod.render_text(
+            items, hostname=_host_label(cfg), color=color, ascii_only=_use_ascii(False)
+        )
+    )
+
+    end = time.strftime("%H:%M:%S", time.localtime(time.time() + seconds))
+    click.echo(f"\n[2/3] {humanize_duration(seconds)} 記録します ({end} に終わります)")
+    click.echo("Ctrl-C で早めに終えても、それまでの記録を診断します。")
+    Recorder(cfg.model_copy(update={"db_path": str(db)}), duration=seconds).run()
+
+    click.echo("\n[3/3] 記録を診断します (check)\n")
+    diag, charts, meta_hostname = _diagnose(cfg, str(db), with_charts=True)
+    click.echo(report_mod.render_terminal(diag, color=color).lstrip("\n"))
+    report = out / "report.html"
+    report.write_text(_render_html(cfg, diag, charts, meta_hostname), encoding="utf-8")
+
+    click.echo(f"\nHTML レポートを書き出しました: {report}")
+    click.echo(f"記録 DB: {db}")
+    click.echo(
+        "長期の傾向 (メモリリーク・ディスクの増加など) を見るには、"
+        "procdiag record --duration 24h で記録してから procdiag check を実行してください。"
+    )
+    sys.exit(1 if snapshot_mod.exit_code(items) else _exit_code(diag))
 
 
 @cli.command()
