@@ -594,22 +594,28 @@ class TestObservationGuard:
         assert found[0].confidence == Confidence.MEDIUM
 
     @pytest.mark.parametrize(
-        ("hours", "overrides"),
+        ("hours", "short_by", "overrides"),
         [
-            (6.0, {}),
-            (3.0, {rule: {"min_observation_hours": 3.0} for rule in _LEAK_FITS}),
+            (6.0, 90, {}),
+            (3.0, 90, {rule: {"min_observation_hours": 3.0} for rule in _LEAK_FITS}),
+            (
+                2.99,
+                110,
+                {rule: {"min_observation_hours": 2.99} for rule in _LEAK_FITS},
+            ),
         ],
-        ids=["default-6h", "overridden-3h"],
+        ids=["default-6h", "overridden-3h", "overridden-2.99h"],
     )
-    def test_a_recording_90s_short_of_the_requirement_reports_the_leaks(
-        self, tmp_path, monkeypatch, hours, overrides
+    def test_a_recording_under_two_minutes_short_reports_the_leaks(
+        self, tmp_path, monkeypatch, hours, short_by, overrides
     ):
-        # Starting 10 s into a minute and stopping 90 s short leaves the rules
-        # rollup rows spanning four minutes less than required: the shortest
-        # series a recording long enough to be evaluated can give them.
+        # Starting 10 s into a minute leaves the rules rollup rows spanning
+        # several minutes less than required: four for a whole-minute
+        # requirement, 4.4 for 2.99 h stopped 110 s short.  These are the
+        # shortest series a recording long enough to be evaluated can give.
         start = 60 * (int(time.time()) // 60) - 8 * _HOUR + 10
         store = make_db(tmp_path, hours=hours)
-        _record(store, monkeypatch, start=start, seconds=hours * _HOUR - 90)
+        _record(store, monkeypatch, start=start, seconds=hours * _HOUR - short_by)
 
         config = ProcdiagConfig(rules=RulesConfig(overrides=overrides))
         diag = Engine(config).run(store, only=list(_LEAK_FITS))
