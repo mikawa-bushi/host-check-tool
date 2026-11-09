@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- **`procdiag quick`**: 初めての人がこれだけ実行すれば診断まで終わるコマンド。いまの状態の確認 (snapshot)、短い記録 (既定 1 時間、`--duration`)、その記録の診断 (check と同じルール) を続けて行い、記録 DB と HTML レポートを `--out` (既定 `./procdiag-quick-<日時>`) に置く。記録中の Ctrl-C は記録を早めに終えるだけで、それまでの記録を診断する。最後に、snapshot で warning / critical だった項目をもう一度表示する。終了コードは check と同じで、snapshot に warning / critical があるときも 1。出力先を使えないときと、レポートを書けなかったときは 4。`procdiag --help` の冒頭で案内する。
 - `procdiag check` に `--since` / `--until` を追加。診断する期間を選べる (`--until` の時刻は含まない)。1 分集計しか残っていない時間帯も診断でき、生データの無い時間帯があるときは、生データだけで評価したルールを観測品質の備考に示す。期間に記録が無いときは終了コード 3。
 
 ### Changed
@@ -23,6 +24,7 @@
 
 ### Fixed
 - `procdiag --help` のコマンド一覧に `check` が出ていなかった。隠し別名 `advise` を隠す設定が、同じコマンドの `check` まで隠していた。
+- 設定ファイルが無い・読めない・文法が誤っている・`config` 変数が無い・`config` の型が違うときに、各コマンドがエラーメッセージではなく Python のトレースバックを出して終了コード 1 で止まっていた。メッセージを表示して終了コード 4 で終わる。
 - `rules.overrides` で MEM-LEAK-01 / FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01 の最低観測時間 (`min_observation_hours`) を 6.0 に上書きしても、全体設定 `rules.min_observation_hours` が 6.0 以外だと上書きが無視され、全体設定の時間が使われていた。
 - `procdiag compare --at` で、区切り時刻の直前 1 ミリ秒以内に記録されたサンプルが、修正前と修正後のどちらの期間にも入っていなかった。
 

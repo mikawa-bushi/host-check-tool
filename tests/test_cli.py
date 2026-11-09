@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -792,6 +793,135 @@ class TestCheckOutputFormat:
         out = tmp_path / "r.html"
         self._check(runner, db_with_data, "--format", "json", "-o", str(out))
         assert json.loads(out.read_text(encoding="utf-8"))["no_data"] is False
+
+
+# ---------------------------------------------------------------------------
+# quick: precondition errors (the full run is in test_e2e.py)
+# ---------------------------------------------------------------------------
+
+
+class TestQuickRefusals:
+    @pytest.mark.parametrize("duration", ["0s", "0m", "abc", "10"])
+    def test_bad_duration_exits_4_before_doing_anything(
+        self, runner, tmp_path, duration
+    ):
+        out = tmp_path / "q"
+        result = runner.invoke(
+            cli, ["quick", "--duration", duration, "--out", str(out)]
+        )
+        assert result.exit_code == 4, result.output
+        assert "エラー" in result.output
+        assert "[1/3]" not in result.output
+        assert not out.exists()
+
+    def test_non_empty_out_dir_exits_4_and_is_left_alone(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.mkdir()
+        (out / "keep.txt").write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+        assert "空のディレクトリではありません" in result.output
+        assert [p.name for p in out.iterdir()] == ["keep.txt"]
+
+    def test_out_path_that_is_a_file_exits_4(self, runner, tmp_path):
+        out = tmp_path / "q"
+        out.write_text("x", encoding="utf-8")
+        result = runner.invoke(cli, ["quick", "--duration", "2s", "--out", str(out)])
+        assert result.exit_code == 4, result.output
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    @pytest.mark.parametrize(
+        ("mode", "target"),
+        [(0o500, "q"), (0o500, "."), (0o000, "."), (0o000, "q")],
+        ids=[
+            "parent-not-writable",
+            "empty-dir-not-writable",
+            "dir-not-readable",
+            "parent-not-searchable",
+        ],
+    )
+    def test_out_path_that_cannot_be_used_exits_4(self, runner, tmp_path, mode, target):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(mode)
+        try:
+            result = runner.invoke(
+                cli, ["quick", "--duration", "2s", "--out", str(locked / target)]
+            )
+        finally:
+            locked.chmod(0o700)
+        assert result.exit_code == 4, result.output
+        assert "出力先を使えません" in result.output
+        assert "Traceback" not in result.output
+        assert "[1/3]" not in result.output
+
+    def test_root_help_points_first_time_users_to_quick(self, runner):
+        result = runner.invoke(cli, ["--help"])
+        assert "初めての方は procdiag quick" in result.output
+        assert "quick" in _listed_commands(result.output)
+
+
+class TestQuickRun:
+    def test_snapshot_warning_is_repeated_after_the_diagnosis(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag import snapshot
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            snapshot,
+            "run_snapshot",
+            lambda cfg: [
+                snapshot.SnapshotItem(
+                    "システム",
+                    "recording",
+                    "記録状況",
+                    snapshot.INFO,
+                    "未記録",
+                    "procdiag record で記録してください",
+                ),
+                snapshot.SnapshotItem(
+                    "プロセス",
+                    "zombies",
+                    "ゾンビプロセス",
+                    snapshot.WARNING,
+                    "55 個",
+                    "親プロセスを確認してください",
+                ),
+            ],
+        )
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 1, result.output
+        after_diagnosis = result.output.split("[3/3]", 1)[1]
+        assert "[警告] ゾンビプロセス: 55 個" in after_diagnosis
+        assert "→ 親プロセスを確認してください" in after_diagnosis
+        assert "procdiag record で記録してください" not in result.output
+        report = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
+        assert report.startswith("<!doctype html>")
+
+    def test_diagnosis_is_still_shown_when_the_report_cannot_be_written(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag.recorder import Recorder
+
+        monkeypatch.chdir(tmp_path)
+        record = Recorder.run
+
+        def record_then_block_the_report(self):
+            code = record(self)
+            (tmp_path / "q" / "report.html").mkdir()
+            return code
+
+        monkeypatch.setattr(Recorder, "run", record_then_block_the_report)
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 4, result.output
+        assert "[3/3]" in result.output
+        assert "HTML レポートを書けませんでした" in result.output
+        assert "Traceback" not in result.output
 
 
 # ---------------------------------------------------------------------------
