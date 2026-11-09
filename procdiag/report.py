@@ -50,6 +50,7 @@ from procdiag.core import (
     ObservationQuality,
     Severity,
     SkippedRule,
+    Window,
     configure_rule,
 )
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
@@ -181,6 +182,7 @@ def build_charts(
     store: Storage,
     *,
     since: float | None = None,
+    until: float | None = None,
     config: "ProcdiagConfig | None" = None,
 ) -> ChartData:
     """Build a ChartData from a Storage instance.
@@ -201,8 +203,10 @@ def build_charts(
         charts.psi_cpu_threshold = psi_rule.psi_threshold
 
     try:
-        _fill_system_series(charts, store, since)
-        charts.mounts = _mount_series(store.rows("disk_samples", since=since))
+        _fill_system_series(charts, store, since, until)
+        charts.mounts = _mount_series(
+            store.rows("disk_samples", since=since, until=until)
+        )
         charts.spikes = [
             {
                 "ts": row["ts"],
@@ -210,7 +214,7 @@ def build_charts(
                 "psi_snapshot": row["psi_snapshot"],
                 "top_processes": culprits(row["top_processes"], store),
             }
-            for row in store.rows("spike_events")
+            for row in store.rows("spike_events", since=since, until=until)
         ]
     except (sqlite3.Error, OSError) as exc:
         # Expected DB/IO read error — return whatever was collected so far
@@ -221,7 +225,9 @@ def build_charts(
     return charts
 
 
-def _fill_system_series(charts: ChartData, store: Storage, since: float | None) -> None:
+def _fill_system_series(
+    charts: ChartData, store: Storage, since: float | None, until: float | None
+) -> None:
     """Fill the cpu / max-core / mem / PSI series in a single pass.
 
     Reads whichever sys table has data exactly once (rollup preferred) instead
@@ -229,10 +235,10 @@ def _fill_system_series(charts: ChartData, store: Storage, since: float | None) 
     rollup and raw tables, so they are looked up for the table actually read.
     """
     table = "sys_rollup_1m"
-    sys_rows = store.rows(table, since=since)
+    sys_rows = store.rows(table, since=since, until=until)
     if not sys_rows:
         table = "sys_samples"
-        sys_rows = store.rows(table, since=since)
+        sys_rows = store.rows(table, since=since, until=until)
     ts_key, cpu_key, core_key, mem_key, psi_keys = _SYS_CHART_COLUMNS[table]
 
     for row in sys_rows:
@@ -392,7 +398,9 @@ def render_terminal(
     q = diag.quality
     lines.append("")
     lines.append("--- 観測品質 ---")
-    lines.append(f"  観測期間      : {q.span_hours:.1f} 時間")
+    lines.append(
+        f"  観測期間      : {q.span_hours:.1f} 時間{_window_text(diag.window)}"
+    )
     lines.append(f"  欠測 gap 合計 : {q.gap_seconds:.0f} 秒")
     lines.append(
         f"  自己負荷      : 平均 {q.self_cpu_avg:.2f}%  最大 {q.self_cpu_max:.2f}%"
@@ -433,6 +441,11 @@ def render_json(diag: Diagnosis) -> str:
             "errored_rules": list(diag.errored_rules),
             "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
             "quality": diag.quality.to_dict(),
+            "window": (
+                {"start": _iso(diag.window.start_ts), "end": _iso(diag.window.end_ts)}
+                if diag.window
+                else None
+            ),
             "reasoning": list(diag.reasoning),
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "procdiag_version": procdiag.__version__,
@@ -786,7 +799,7 @@ def render_html(
 {_proposal_section(diag)}
 {_charts_section(charts)}
 {_spike_section(charts.spikes if charts else [])}
-{_quality_section(diag.quality)}
+{_quality_section(diag.quality, diag.window)}
 </body></html>"""
 
 
@@ -978,13 +991,13 @@ def _spike_section(spikes: List[dict]) -> str:
 """
 
 
-def _quality_section(q: ObservationQuality) -> str:
+def _quality_section(q: ObservationQuality, window: Window | None) -> str:
     """⑤ 観測品質: how much the findings above can be trusted."""
     return f"""
 <h2>⑤ 観測品質</h2>
 <div class="quality-block">
   <dl>
-    <dt>観測期間</dt><dd>{q.span_hours:.1f} 時間</dd>
+    <dt>観測期間</dt><dd>{q.span_hours:.1f} 時間{_window_text(window)}</dd>
     <dt>欠測 gap 合計</dt><dd>{q.gap_seconds:.0f} 秒</dd>
     <dt>自己負荷 (平均)</dt><dd>{q.self_cpu_avg:.2f}%</dd>
     <dt>自己負荷 (最大)</dt><dd>{q.self_cpu_max:.2f}%</dd>
@@ -1002,6 +1015,14 @@ def _local(ts: float) -> datetime:
 
 def _iso(ts: float | None) -> str | None:
     return None if ts is None else _local(ts).isoformat(timespec="seconds")
+
+
+def _window_text(window: Window | None) -> str:
+    if window is None:
+        return ""
+    start = _local(window.start_ts).strftime("%Y-%m-%d %H:%M")
+    end = _local(window.end_ts).strftime("%Y-%m-%d %H:%M")
+    return f" ({start} 〜 {end})"
 
 
 def _value_text(state: SideState, headline: Headline) -> str:

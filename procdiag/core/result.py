@@ -220,6 +220,7 @@ class Diagnosis:
     reasoning: list[str] = field(default_factory=list)  # verbose trace
     quality: ObservationQuality = field(default_factory=ObservationQuality)
     no_data: bool = False  # True when the DB held no samples at all (see engine)
+    window: Optional[Window] = None  # None when no_data
     # Rule coverage: a "healthy" verdict only speaks for the rules that ran.
     evaluated_rules: list[str] = field(default_factory=list)
     skipped_rules: list[SkippedRule] = field(default_factory=list)

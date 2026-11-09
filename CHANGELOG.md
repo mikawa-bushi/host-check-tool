@@ -6,8 +6,12 @@
 
 ### Added
 - **`procdiag quick`**: 初めての人がこれだけ実行すれば診断まで終わるコマンド。いまの状態の確認 (snapshot)、短い記録 (既定 1 時間、`--duration`)、その記録の診断 (check と同じルール) を続けて行い、記録 DB と HTML レポートを `--out` (既定 `./procdiag-quick-<日時>`) に置く。記録中の Ctrl-C は記録を早めに終えるだけで、それまでの記録を診断する。最後に、snapshot で warning / critical だった項目をもう一度表示する。終了コードは check と同じで、snapshot に warning / critical があるときも 1。出力先を使えないときと、レポートを書けなかったときは 4。`procdiag --help` の冒頭で案内する。
+- `procdiag check` に `--since` / `--until` を追加。診断する期間を選べる (`--until` の時刻は含まない)。1 分集計しか残っていない時間帯も診断でき、生データの無い時間帯があるときは、生データだけで評価したルールを観測品質の備考に示す。期間に記録が無いときは終了コード 3。
 
 ### Changed
+- `check` の観測期間に、診断した期間の開始と終了の時刻を表示する。JSON に `window` (`start` / `end`、データが無いときは `null`) を追加。既存のキーは変更なし。
+- 既定の期間 (生データの残っている期間) より前の記録があるときは、そのことと `--since` の使い方を観測品質の備考に出す。これまでは、1 分集計が何十日分あっても、診断したのが直近の生データの期間だけだと分からなかった。
+- `check -o report.html` (HTML) で期間を指定したときは、グラフもその期間だけを描く。
 - `procdiag check --output` が拡張子から出力形式を決めるようになった (`.html` / `.htm` → HTML、`.json` → JSON、それ以外は text)。これまでは `--format` を付け忘れると `check --output report.html` が端末向けのテキストを .html ファイルに書いていた。`--format` を指定すればそちらが優先する。`--output` の短縮形 `-o` を追加。
 - `procdiag explain` (引数なし) の一覧を、ルールはカテゴリ別にタイトルつきで、サンプラーは Tier 別に記録間隔の設定名とタイトルつきで表示するようにした (`list-rules` / `list-samplers` と同じ表示)。
 
