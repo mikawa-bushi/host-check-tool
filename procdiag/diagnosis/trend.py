@@ -63,6 +63,14 @@ class Period:
 # ---------------------------------------------------------------------------
 
 
+# The engine gate measures the window up to the last raw sample.  A process
+# series has only rollup rows, stamped with the start of their minute, and the
+# minute in progress at stop is never rolled up, so the series can run up to
+# two minutes shorter than a window the gate let through.
+def _series_covers(span_hours: float, hours: float) -> bool:
+    return covers(span_hours + 2 / 60, hours)
+
+
 def fit_linear(
     series: list[tuple[float, float]],
     *,
@@ -73,7 +81,7 @@ def fit_linear(
 
     Returns ``None`` when there are fewer than *min_points* samples or the
     observation span does not cover *min_span_hours* (see
-    :func:`procdiag.core.covers`).
+    :func:`_series_covers`).
 
     ``slope_per_hour`` is in value-units per hour.  ``r2`` is the coefficient
     of determination: 0 = flat / random, 1 = perfect line.
@@ -85,7 +93,7 @@ def fit_linear(
     ts_min = min(t for t, _ in pts)
     ts_max = max(t for t, _ in pts)
     span_hours = (ts_max - ts_min) / 3600.0
-    if not covers(span_hours, min_span_hours):
+    if not _series_covers(span_hours, min_span_hours):
         return None
 
     n = len(pts)
@@ -238,9 +246,9 @@ def confidence_from_fit(
     * ``MEDIUM`` — ``r2 >= medium_r2`` **and** the span covers ``min_observation_hours``
     * ``LOW``    — otherwise
     """
-    if fit.r2 >= high_r2 and covers(fit.span_hours, high_span_hours):
+    if fit.r2 >= high_r2 and _series_covers(fit.span_hours, high_span_hours):
         return Confidence.HIGH
-    if fit.r2 >= medium_r2 and covers(fit.span_hours, min_observation_hours):
+    if fit.r2 >= medium_r2 and _series_covers(fit.span_hours, min_observation_hours):
         return Confidence.MEDIUM
     return Confidence.LOW
 
@@ -484,9 +492,9 @@ def confidence_from_span(
     span/points policy lives next to ``confidence_from_fit`` (regression) instead
     of being re-inlined per rule (issue v0.3 §2-7).
     """
-    if covers(span_hours, high_hours) and n_points >= high_points:
+    if _series_covers(span_hours, high_hours) and n_points >= high_points:
         return Confidence.HIGH
-    if covers(span_hours, medium_hours):
+    if _series_covers(span_hours, medium_hours):
         return Confidence.MEDIUM
     return Confidence.LOW
 
