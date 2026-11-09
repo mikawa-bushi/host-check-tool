@@ -1,6 +1,6 @@
 """End-to-end integration tests for procdiag.
 
-Exercises the full ``init → record → check → report`` pipeline using the real
+Exercises the full ``init → record → check`` pipeline using the real
 ``procdiag`` entry point (subprocess) so that signal handling, process
 lifecycle, and DB I/O are all exercised in a realistic way.
 
@@ -10,7 +10,8 @@ environment, write to ``tmp_path``, and may take 10-15 seconds each because
 
 Test cases
 ----------
-1. ``test_full_pipeline`` — init → record 8 s → status → check → report.
+1. ``test_full_pipeline`` — init → record 8 s → status → check (terminal,
+   then ``-o report.html`` / ``-o report.json``).
    Assertions: sys_samples > 0, check exits 0-2, report.html/report.json
    generated with no external references.
 
@@ -23,6 +24,7 @@ Test cases
 
 from __future__ import annotations
 
+import json
 import re
 import signal
 import sqlite3
@@ -148,7 +150,7 @@ def _self_cpu_avg(db_path: Path, skip_first_sec: float = 2.0) -> Optional[float]
 
 @pytest.mark.e2e
 def test_full_pipeline(tmp_path: Path) -> None:
-    """init → record 8 s → status → check → report.
+    """init → record 8 s → status → check → check -o report.html / report.json.
 
     Verifies:
     - sys_samples has rows after recording
@@ -204,26 +206,18 @@ def test_full_pipeline(tmp_path: Path) -> None:
         2,
     ), f"check returned unexpected code {ck.returncode}:\n{ck.stderr}"
 
-    # --- report ---------------------------------------------------------------
+    # --- check -o report.html / report.json -----------------------------------
     html_out = tmp_path / "report.html"
     json_out = tmp_path / "report.json"
-    rp = _run(
-        [
-            "report",
-            "--db",
-            str(db_path),
-            "--config",
-            str(config_path),
-            "--out",
-            str(html_out),
-            "--json",
-            str(json_out),
-        ],
-        timeout=30,
-    )
-    assert rp.returncode == 0, f"report failed: {rp.stderr}"
-    assert html_out.exists(), "report.html was not created"
-    assert json_out.exists(), "report.json was not created"
+    for out in (html_out, json_out):
+        rp = _run(
+            ["check", "--db", str(db_path), "--config", str(config_path)]
+            + ["-o", str(out)],
+            timeout=30,
+        )
+        assert rp.returncode in (0, 1, 2), f"check -o {out.name} failed: {rp.stderr}"
+    assert html_out.read_text(encoding="utf-8").startswith("<!doctype html>")
+    assert "findings" in json.loads(json_out.read_text(encoding="utf-8"))
 
     # report.html must contain no external URL references (no CDN, no http://)
     html_text = html_out.read_text(encoding="utf-8")

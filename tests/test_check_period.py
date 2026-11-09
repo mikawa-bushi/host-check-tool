@@ -77,28 +77,14 @@ class TestChosenPeriod:
         report = _check_json(db, "--since", _iso(start), "--until", _iso(until))
         assert _ts(report["window"]["end"]) < until
 
-    def test_report_takes_the_same_period(self, recording, tmp_path):
+    def test_the_html_report_covers_the_same_period(self, recording, tmp_path):
         db, start = recording
-        out = tmp_path / "r.json"
+        out = tmp_path / "r.html"
         result = CliRunner().invoke(
-            cli,
-            [
-                "report",
-                "--db",
-                str(db),
-                "--since",
-                _iso(start),
-                "--out",
-                str(tmp_path / "r.html"),
-                "--json",
-                str(out),
-            ],
+            cli, ["check", "--db", str(db), "--since", _iso(start), "-o", str(out)]
         )
-        assert result.exit_code == 0, result.output
-        window = json.loads(out.read_text(encoding="utf-8"))["window"]
-        assert _ts(window["end"]) - _ts(window["start"]) == pytest.approx(
-            30 * _HOUR, abs=120
-        )
+        assert result.exit_code in (0, 1, 2), result.output
+        assert "<dt>観測期間</dt><dd>30.0 時間" in out.read_text(encoding="utf-8")
 
     def test_a_period_without_records_exits_3(self, recording):
         db, _ = recording
