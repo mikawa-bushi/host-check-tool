@@ -23,6 +23,7 @@ from synth import (
     add_proc_series,
     add_spike_events,
     add_sys_baseline,
+    add_zombie_series,
     make_db,
 )
 
@@ -497,6 +498,36 @@ def _record(store: Storage, monkeypatch, *, start: float, seconds: float) -> Non
         store.rollup_incremental()
 
 
+_GLOBAL_KNOB_LEAKS = {
+    "MEM-LEAK-01": ("leaky", Confidence.MEDIUM),
+    "FD-LEAK-01": ("leaky", Confidence.MEDIUM),
+    "THREAD-LEAK-01": ("leaky", Confidence.MEDIUM),
+    "ZOMBIE-01": ("zombie_processes", Confidence.LOW),
+}
+
+
+def _leaking_db(tmp_path, hours: float) -> Storage:
+    """A recording of *hours* in which one process's RSS, FDs and threads grow
+    and the zombie count rises, each fast enough for its leak rule to report."""
+    start = time.time() - hours * _HOUR
+    store = make_db(tmp_path, hours=hours)
+    add_sys_baseline(store, hours=hours, start_ts=start)
+    add_proc_series(
+        store,
+        "leaky",
+        rss_start=200 * _MB,
+        rss_slope_per_h=50 * _MB,
+        fds_slope=10.0,
+        threads_slope=10.0,
+        hours=hours,
+        start_ts=start,
+    )
+    add_zombie_series(
+        store, hours=hours, zombie_slope_per_h=5.0, base_zombie_count=1, start_ts=start
+    )
+    return store
+
+
 class TestObservationGuard:
     def test_healthy_when_insufficient_data(self, tmp_path):
         """Less than min_observation_hours of data → healthy=True, no findings."""
@@ -624,6 +655,30 @@ class TestObservationGuard:
         assert {(f.rule_id, f.subject, f.confidence) for f in diag.findings} == {
             (rule, "leaky", Confidence.MEDIUM) for rule in _LEAK_FITS
         }
+
+    @pytest.mark.parametrize(
+        ("knob", "hours"), [(3.0, 4.0), (0.0, 2.0)], ids=["knob-3h", "knob-off"]
+    )
+    @pytest.mark.parametrize("rule_id", list(_GLOBAL_KNOB_LEAKS))
+    def test_a_lowered_global_minimum_reports_leaks_on_recordings_that_meet_it(
+        self, tmp_path, rule_id, knob, hours
+    ):
+        store = _leaking_db(tmp_path, hours)
+        diag = Engine(_cfg(min_obs_hours=knob)).run(store, only=[rule_id])
+        store.close()
+
+        assert rule_id in diag.evaluated_rules
+        assert [(f.subject, f.confidence) for f in diag.findings] == [
+            _GLOBAL_KNOB_LEAKS[rule_id]
+        ]
+
+    def test_a_lowered_global_minimum_still_skips_shorter_recordings(self, tmp_path):
+        store = _leaking_db(tmp_path, 2.5)
+        diag = Engine(_cfg(min_obs_hours=3.0)).run(store, only=list(_GLOBAL_KNOB_LEAKS))
+        store.close()
+
+        assert {s.rule_id for s in diag.skipped_rules} == set(_GLOBAL_KNOB_LEAKS)
+        assert diag.findings == []
 
     def test_instant_rule_runs_on_short_window(self, tmp_path):
         """min_observation_hours=0.0 rules fire even on short recordings.
