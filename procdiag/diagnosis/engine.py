@@ -173,7 +173,7 @@ class Engine:
         self._load_extra_rules([])
         return max(
             (
-                self._required_hours(configure_rule(cls, self.config)[0])
+                configure_rule(cls, self.config)[0].min_observation_hours
                 for cls in self.select(only=only, skip=skip)
             ),
             default=0.0,
@@ -199,12 +199,9 @@ class Engine:
            in ``reasoning`` and never abort the diagnosis).
         1. Determine the observation window from the DB.
         2. Run each rule (with try/except firewall). A rule is skipped while
-           the window is shorter than its minimum observation time: rules that
-           keep the class default follow ``config.rules.min_observation_hours``
-           (one knob for the regression rules, per design §6.3/§8), while rules
-           that override it (e.g. 0.0 for instantaneous checks like
-           SWAP-THRASH-01) use their own value, and so does a rule given
-           ``min_observation_hours`` in ``config.rules.overrides``.  A rule
+           the window is shorter than its configured ``min_observation_hours``
+           (``Rule.configure`` applies ``config.rules.min_observation_hours``,
+           the one knob for the regression rules per design §6.3/§8).  A rule
            whose declared inputs (``requires_schema`` / ``requires_rows``)
            are missing for the window is not run and is listed in
            ``uncovered_rules``.
@@ -253,7 +250,7 @@ class Engine:
                 reasoning.append(
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
-            eff_min = self._required_hours(rule)
+            eff_min = rule.min_observation_hours
             if not covers(window.span_hours, eff_min):
                 reasoning.append(
                     f"{rule.rule_id}: 観測時間不足のためスキップ "
@@ -346,13 +343,6 @@ class Engine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _required_hours(self, rule: Rule) -> float:
-        overridden = "min_observation_hours" in vars(rule)
-        uses_global = type(rule).min_observation_hours == Rule.min_observation_hours
-        if uses_global and not overridden:
-            return self.config.rules.min_observation_hours
-        return rule.min_observation_hours
 
     @staticmethod
     def _coverage_gap(
