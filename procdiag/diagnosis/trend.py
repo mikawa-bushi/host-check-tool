@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Hashable, Iterable, Iterator, Mapping, Optional
 
-from ..core import Confidence, Observation
+from ..core import Confidence, Observation, covers
 
 # ---------------------------------------------------------------------------
 # TrendFit — result of linear regression
@@ -63,6 +63,16 @@ class Period:
 # ---------------------------------------------------------------------------
 
 
+# Rollup rows carry the start of their minute, the row stamped before the
+# window start is left out, and the minute in progress at stop is never rolled
+# up, so a rollup series spans less than three minutes short of its window.
+# The engine gate lets a window two minutes short through, so a series inside
+# it spans more than the requirement less five minutes.  On raw series such
+# as disk rows or proc_counts this only adds leniency.
+def _series_covers(span_hours: float, hours: float) -> bool:
+    return covers(span_hours + 3 / 60, hours)
+
+
 def fit_linear(
     series: list[tuple[float, float]],
     *,
@@ -72,7 +82,8 @@ def fit_linear(
     """Fit a least-squares line to *(timestamp, value)* pairs.
 
     Returns ``None`` when there are fewer than *min_points* samples or the
-    observation span is shorter than *min_span_hours*.
+    observation span does not cover *min_span_hours* (see
+    :func:`_series_covers`).
 
     ``slope_per_hour`` is in value-units per hour.  ``r2`` is the coefficient
     of determination: 0 = flat / random, 1 = perfect line.
@@ -84,7 +95,7 @@ def fit_linear(
     ts_min = min(t for t, _ in pts)
     ts_max = max(t for t, _ in pts)
     span_hours = (ts_max - ts_min) / 3600.0
-    if span_hours < min_span_hours:
+    if not _series_covers(span_hours, min_span_hours):
         return None
 
     n = len(pts)
@@ -233,13 +244,13 @@ def confidence_from_fit(
     Shared by the regression-based leak rules (MEM-LEAK / FD-LEAK /
     THREAD-LEAK) so the R²×observation-span ladder lives in one place:
 
-    * ``HIGH``   — ``r2 >= high_r2`` **and** ``span_hours >= high_span_hours``
-    * ``MEDIUM`` — ``r2 >= medium_r2`` **and** ``span_hours >= min_observation_hours``
+    * ``HIGH``   — ``r2 >= high_r2`` **and** the span covers ``high_span_hours``
+    * ``MEDIUM`` — ``r2 >= medium_r2`` **and** the span covers ``min_observation_hours``
     * ``LOW``    — otherwise
     """
-    if fit.r2 >= high_r2 and fit.span_hours >= high_span_hours:
+    if fit.r2 >= high_r2 and _series_covers(fit.span_hours, high_span_hours):
         return Confidence.HIGH
-    if fit.r2 >= medium_r2 and fit.span_hours >= min_observation_hours:
+    if fit.r2 >= medium_r2 and _series_covers(fit.span_hours, min_observation_hours):
         return Confidence.MEDIUM
     return Confidence.LOW
 
@@ -483,9 +494,9 @@ def confidence_from_span(
     span/points policy lives next to ``confidence_from_fit`` (regression) instead
     of being re-inlined per rule (issue v0.3 §2-7).
     """
-    if span_hours >= high_hours and n_points >= high_points:
+    if _series_covers(span_hours, high_hours) and n_points >= high_points:
         return Confidence.HIGH
-    if span_hours >= medium_hours:
+    if _series_covers(span_hours, medium_hours):
         return Confidence.MEDIUM
     return Confidence.LOW
 

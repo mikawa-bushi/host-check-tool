@@ -56,6 +56,20 @@ class Window:
         return (self.end_ts - self.start_ts) / 3600.0
 
 
+# The span from the first row to the last falls short of the time recorded:
+# a period [X, X+6h) holds rows up to one step before X+6h, rollup rows carry
+# the start of their minute, and the minute in progress at stop is never
+# rolled up.  Together that stays under two minutes.
+_SPAN_ALLOWANCE_HOURS = 2 / 60
+
+
+def covers(span_hours: float, hours: float) -> bool:
+    """Whether an observed span is long enough for a requirement of *hours*."""
+    # Spans between minute-stamped rows land exactly on the allowance, where
+    # float error in hours would decide the tie, so compare in microseconds.
+    return round((span_hours + _SPAN_ALLOWANCE_HOURS - hours) * 3600, 6) >= 0
+
+
 @dataclass
 class Finding:
     """One diagnosed problem, as defined in design doc §6.1.

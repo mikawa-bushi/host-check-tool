@@ -6,11 +6,13 @@ from datetime import datetime, timezone
 
 import pytest
 from click.testing import CliRunner
-from synth import add_sys_baseline, make_db
+from synth import add_proc_series, add_sys_baseline, make_db
 
 from procdiag.cli import cli
 
 _HOUR = 3600.0
+_MB = 1024 * 1024
+_LEAK_RULES = {"MEM-LEAK-01", "FD-LEAK-01", "THREAD-LEAK-01", "ZOMBIE-01"}
 
 
 def _iso(ts: float) -> str:
@@ -98,6 +100,55 @@ class TestChosenPeriod:
         db, _ = recording
         result = CliRunner().invoke(cli, ["check", "--db", str(db), "--since", "昨日"])
         assert result.exit_code == 4, result.output
+
+
+@pytest.fixture()
+def leaking_recording(tmp_path):
+    start = time.time() - 30 * _HOUR
+    store = make_db(tmp_path, hours=30)
+    add_sys_baseline(store, hours=30, start_ts=start)
+    add_proc_series(
+        store,
+        "leaky",
+        rss_start=200 * _MB,
+        rss_slope_per_h=50 * _MB,
+        hours=30,
+        start_ts=start,
+    )
+    store.close()
+    return store.path, start
+
+
+def _skipped(report):
+    return {r["rule_id"] for r in report["skipped_rules"]}
+
+
+class TestPeriodLength:
+    def test_a_period_as_long_as_the_leak_rules_need_evaluates_them(
+        self, leaking_recording
+    ):
+        db, start = leaking_recording
+        report = _check_json(
+            db, "--since", _iso(start), "--until", _iso(start + 6 * _HOUR)
+        )
+        assert not _LEAK_RULES & _skipped(report)
+        leaks = [
+            f["subject"] for f in report["findings"] if f["rule_id"] == "MEM-LEAK-01"
+        ]
+        assert leaks == ["leaky"]
+
+    def test_a_day_long_period_evaluates_memory_pressure(self, leaking_recording):
+        db, start = leaking_recording
+        report = _check_json(
+            db, "--since", _iso(start), "--until", _iso(start + 24 * _HOUR)
+        )
+        assert "MEM-PRESSURE-01" in report["evaluated_rules"]
+
+    def test_a_period_minutes_short_still_skips_the_leak_rules(self, leaking_recording):
+        db, start = leaking_recording
+        until = start + 6 * _HOUR - 3 * 60
+        report = _check_json(db, "--since", _iso(start), "--until", _iso(until))
+        assert "MEM-LEAK-01" in _skipped(report)
 
 
 def test_an_empty_db_has_no_window(tmp_path):

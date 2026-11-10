@@ -19,6 +19,7 @@ from .result import (
     SkippedRule,
     UncoveredRule,
     Window,
+    covers,
 )
 from .rule import (
     MeasuredRule,
@@ -65,6 +66,7 @@ __all__ = [
     "Headline",
     "Observation",
     "Measurement",
+    "covers",
     # rule
     "Rule",
     "MeasuredRule",
