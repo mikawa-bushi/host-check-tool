@@ -81,7 +81,8 @@ class Rule:
 
         The engine calls this once per run on every instantiated rule.  The
         base implementation copies ``config.rules.min_observation_hours`` onto
-        a rule whose class keeps ``Rule.min_observation_hours``, then applies
+        a rule whose class keeps ``Rule.min_observation_hours`` and that has not
+        set its own on the instance, then applies
         ``config.rules.overrides[self.rule_id]``; a rule with a dedicated
         setting in ``config.rules`` overrides this to copy that value first and
         then calls ``super()``, so an explicit override still wins.  Raises
@@ -90,7 +91,8 @@ class Rule:
         """
         overrides = config.rules.overrides.get(self.rule_id, {})
         resolved = resolve_overrides(type(self), overrides)
-        if type(self).min_observation_hours == Rule.min_observation_hours:
+        keeps_default = type(self).min_observation_hours == Rule.min_observation_hours
+        if keeps_default and "min_observation_hours" not in vars(self):
             self.min_observation_hours = config.rules.min_observation_hours
         for name, value in resolved.items():
             setattr(self, name, value)
