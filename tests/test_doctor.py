@@ -23,6 +23,7 @@ import psutil
 import pytest
 from click.testing import CliRunner
 
+from procdiag.bundle import create_bundle
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig
 from procdiag.doctor import (
@@ -38,6 +39,7 @@ from procdiag.doctor import (
     _check_smaps,
     run_doctor,
 )
+from procdiag.storage import Storage
 
 # ---------------------------------------------------------------------------
 # Paths to fixture trees
@@ -81,6 +83,27 @@ def runner():
 def default_config():
     """ProcdiagConfig with all defaults."""
     return ProcdiagConfig()
+
+
+def _fake_command(tmp_path, monkeypatch, name: str, script: str) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    path = bindir / name
+    path.write_text("#!/bin/sh\n" + script)
+    path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+
+def _doctor(tmp_path, monkeypatch, *args: str) -> dict:
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["doctor", "--format", "json", *args])
+    assert result.exit_code in (0, 2), result.output
+    return {c["name"]: c for c in json.loads(result.output)}
+
+
+skip_if_root = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores file permissions"
+)
 
 
 # ===========================================================================
@@ -205,6 +228,14 @@ class TestCheckIoCounters:
         # With 1 success out of 2 total: 50% → degraded.
         assert result.status in ("ok", "degraded")  # depends on impl choice
 
+    def test_miss_rate_counts_every_process(self, tmp_path, monkeypatch):
+        procs = [self._make_proc(io_ok=False) for _ in range(80)]
+        procs += [self._make_proc(io_ok=True) for _ in range(20)]
+        with patch("procdiag.doctor.psutil.process_iter", return_value=iter(procs)):
+            check = _doctor(tmp_path, monkeypatch)["io_counters"]
+        assert check["status"] == "degraded"
+        assert "約 80%" in check["detail"]
+
     def test_process_iter_exception_returns_degraded(self):
         with patch(
             "procdiag.doctor.psutil.process_iter",
@@ -294,6 +325,26 @@ class TestCheckJournal:
         assert result.status == "degraded"
         assert "journal 読取不可" in result.detail
 
+    def test_degraded_when_kernel_log_is_unreadable(self, tmp_path, monkeypatch):
+        # A user outside systemd-journal/adm who has a user journal gets no output, exit 0.
+        _fake_command(tmp_path, monkeypatch, "journalctl", "exit 0\n")
+        check = _doctor(tmp_path, monkeypatch)["journal"]
+        assert check["status"] == "degraded"
+        assert "KERNEL-ERROR-01" in check["detail"]
+        assert "DISK-JOURNAL-01" not in check["detail"]
+
+    def test_ok_when_kernel_log_is_readable(self, tmp_path, monkeypatch):
+        _fake_command(
+            tmp_path,
+            monkeypatch,
+            "journalctl",
+            'echo "Nov 13 09:00:00 host kernel: Linux version 6.8.0"\n',
+        )
+        check = _doctor(tmp_path, monkeypatch)["journal"]
+        assert check["status"] == "ok"
+        assert "KERNEL-ERROR-01" in check["detail"]
+        assert "DISK-JOURNAL-01" not in check["detail"]
+
     def test_journal_exception_returns_degraded(self):
         with patch("procdiag.doctor.os.access", side_effect=RuntimeError("boom")):
             result = _check_journal()
@@ -371,6 +422,81 @@ class TestCheckDbDisk:
             result = _check_db_disk(cfg)
         assert result.status == "ok"
         assert "MB" in result.detail
+
+    @skip_if_root
+    def test_degraded_when_folder_is_not_writable(self, tmp_path, monkeypatch):
+        folder = tmp_path / "ro"
+        folder.mkdir()
+        folder.chmod(0o555)
+        try:
+            check = _doctor(tmp_path, monkeypatch, "--db", str(folder / "p.db"))
+            monkeypatch.chdir(tmp_path)
+            text = CliRunner().invoke(
+                cli, ["doctor", "--ascii", "--db", str(folder / "p.db")]
+            )
+        finally:
+            folder.chmod(0o755)
+        assert check["db_disk"]["status"] == "degraded"
+        assert "書き込めません" in check["db_disk"]["detail"]
+        assert "記録は可能" not in text.output
+
+    @skip_if_root
+    def test_degraded_when_db_file_is_read_only(self, tmp_path, monkeypatch):
+        db = tmp_path / "p.db"
+        with Storage(db) as store:
+            store.set_meta("hostname", "x")
+        db.chmod(0o444)
+        check = _doctor(tmp_path, monkeypatch, "--db", str(db))["db_disk"]
+        assert check["status"] == "degraded"
+        assert "書き込めません" in check["detail"]
+
+    @skip_if_root
+    def test_missing_folder_judged_by_nearest_existing_parent(
+        self, tmp_path, monkeypatch
+    ):
+        folder = tmp_path / "ro"
+        folder.mkdir()
+        folder.chmod(0o555)
+        try:
+            db = folder / "new" / "p.db"
+            check = _doctor(tmp_path, monkeypatch, "--db", str(db))["db_disk"]
+        finally:
+            folder.chmod(0o755)
+        assert check["status"] == "degraded"
+        assert "書き込めません" in check["detail"]
+        assert not (folder / "new").exists()
+
+    def test_does_not_create_the_db_folder(self, tmp_path, monkeypatch):
+        db = tmp_path / "typo" / "nested" / "p.db"
+        check = _doctor(tmp_path, monkeypatch, "--db", str(db))["db_disk"]
+        assert check["status"] == "ok"
+        assert not (tmp_path / "typo").exists()
+
+    def test_bundle_does_not_create_the_db_folder(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        create_bundle(
+            ProcdiagConfig(db_path=str(tmp_path / "missing" / "p.db")),
+            out=tmp_path / "b.tar.gz",
+            snapshot_sample_sec=0.0,
+        )
+        assert not (tmp_path / "missing").exists()
+
+    def test_degraded_below_configured_min_free_disk(self, tmp_path, monkeypatch):
+        (tmp_path / "config.py").write_text(
+            "from procdiag.config import ProcdiagConfig, RetentionConfig\n"
+            f"config = ProcdiagConfig(db_path={str(tmp_path / 'p.db')!r},"
+            " retention=RetentionConfig(min_free_disk_mb=1e9))\n"
+        )
+        check = _doctor(tmp_path, monkeypatch)["db_disk"]
+        assert check["status"] == "degraded"
+        assert "1000000000 MB" in check["detail"]
+
+    def test_ok_above_default_min_free_disk(self, tmp_path, monkeypatch):
+        fake_usage = MagicMock(free=800 * 1024**2)
+        with patch("procdiag.doctor.shutil.disk_usage", return_value=fake_usage):
+            check = _doctor(tmp_path, monkeypatch, "--db", str(tmp_path / "p.db"))
+        assert check["db_disk"]["status"] == "ok"
+        assert "512 MB" in check["db_disk"]["detail"]
 
     def test_exception_returns_degraded(self, tmp_path):
         cfg = ProcdiagConfig(db_path=str(tmp_path / "data.db"))
