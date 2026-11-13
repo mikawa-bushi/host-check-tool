@@ -79,7 +79,7 @@ procdiag check -o report.html
 | `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する。`-o report.html` / `-o report.json` でファイルに書き出す |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag status` | 記録期間・サンプル数・自己負荷の概況を表示する |
-| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/journal/センサ/DB空き) を診断する。降格ありで exit 2 |
+| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/カーネルログの読取/センサ/DB の置き場の書き込み権限と空き容量) を診断する。空き容量は `retention.min_free_disk_mb` と比べる。降格ありで exit 2 |
 | `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する。引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示する |
 | `procdiag export` | 記録データを CSV または JSON でエクスポートする |
 | `procdiag prune` | 保持ポリシーを手動実行する |

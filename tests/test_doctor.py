@@ -278,53 +278,6 @@ class TestCheckSmaps:
 
 
 class TestCheckJournal:
-    def test_journal_ok_when_readable(self, tmp_path, monkeypatch):
-        journal = tmp_path / "journal"
-        journal.mkdir()
-        monkeypatch.setattr(
-            "procdiag.doctor.Path",
-            lambda p: journal if p == "/var/log/journal" else Path(p),
-        )
-        # Use a simpler approach: patch os.access and Path.exists.
-        with (
-            patch("procdiag.doctor.os.access", return_value=True),
-            patch.object(
-                type(journal),
-                "exists",
-                return_value=True,
-            ),
-        ):
-            # Rebuild: just test with a real readable dir.
-            pass
-
-        # Simpler: call with a known-good structure.
-        # We'll test the real /var/log/journal existence on this machine.
-        result = _check_journal()
-        assert result.name == "journal"
-        assert result.status in ("ok", "degraded")
-
-    def test_journal_degraded_when_missing(self, tmp_path):
-        # Patch Path("/var/log/journal") to point to a non-existent path.
-
-        original_path = __builtins__  # noqa: F841 — we'll use patch
-
-        with patch("procdiag.doctor.Path") as mock_path_cls:
-            # When called with "/var/log/journal", return a mock that says
-            # the path does not exist.
-            fake_journal = MagicMock()
-            fake_journal.exists.return_value = False
-
-            def side_effect(p):
-                if str(p) == "/var/log/journal":
-                    return fake_journal
-                return Path(p)
-
-            mock_path_cls.side_effect = side_effect
-            result = _check_journal()
-
-        assert result.status == "degraded"
-        assert "journal 読取不可" in result.detail
-
     def test_degraded_when_kernel_log_is_unreadable(self, tmp_path, monkeypatch):
         # A user outside systemd-journal/adm who has a user journal gets no output, exit 0.
         _fake_command(tmp_path, monkeypatch, "journalctl", "exit 0\n")
@@ -346,10 +299,13 @@ class TestCheckJournal:
         assert "DISK-JOURNAL-01" not in check["detail"]
 
     def test_journal_exception_returns_degraded(self):
-        with patch("procdiag.doctor.os.access", side_effect=RuntimeError("boom")):
+        with patch(
+            "procdiag.doctor.kernlog.journal_readable",
+            side_effect=RuntimeError("boom"),
+        ):
             result = _check_journal()
-        # If Path.exists returns True but os.access throws, we get degraded.
-        assert result.status in ("ok", "degraded")
+        assert result.status == "degraded"
+        assert "予期しない例外" in result.detail
 
 
 # ===========================================================================
@@ -404,9 +360,8 @@ class TestCheckDbDisk:
 
     def test_degraded_when_low_space(self, tmp_path):
         cfg = ProcdiagConfig(db_path=str(tmp_path / "data.db"))
-        # Fake disk_usage: 0.5 GB free (< 1 GB).
         fake_usage = MagicMock()
-        fake_usage.free = int(0.5 * 1024**3)
+        fake_usage.free = int(cfg.retention.min_free_disk_mb * 1024**2) - 1
         with patch("procdiag.doctor.shutil.disk_usage", return_value=fake_usage):
             result = _check_db_disk(cfg)
         assert result.status == "degraded"
