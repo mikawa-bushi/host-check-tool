@@ -428,6 +428,116 @@ class TestKernelError:
         assert found["usb_disconnect"].severity == Severity.WARNING
         store.close()
 
+    @pytest.mark.parametrize(
+        "line, kind",
+        [
+            (
+                "XFS (sda1): Metadata corruption detected at "
+                "xfs_dir3_block_read_verify+0x9e/0xc0 [xfs], "
+                "xfs_dir3_block block 0x1f4c0 ",
+                "fs_error",
+            ),
+            (
+                "XFS (sdb1): Metadata CRC error detected at "
+                "xfs_agf_read_verify+0x70/0x120 [xfs], xfs_agf block 0x1 ",
+                "fs_error",
+            ),
+            (
+                "XFS (sda1): Metadata corruption detected at "
+                "xfs_dinode_verify+0x1a2/0x7a0 [xfs], inode 0x2a0 dinode",
+                "fs_error",
+            ),
+            (
+                "BTRFS: error (device sda2) in btrfs_run_delayed_refs:2150: "
+                "errno=-5 IO failure",
+                "fs_error",
+            ),
+            (
+                "BTRFS: error (device sda2 state A) in __btrfs_free_extent:3072: "
+                "errno=-28 No space left",
+                "fs_error",
+            ),
+            (
+                "critical target error, dev sdb, sector 2048 op 0x1:(WRITE) "
+                "flags 0x800 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "timeout error, dev sdb, sector 4096 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "recoverable transport error, dev sdc, sector 8 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "critical nexus error, dev sdc, sector 8 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "device offline error, dev sdd, sector 0 op 0x1:(WRITE) "
+                "flags 0x800 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "protection error, dev sdb, sector 2048 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "sd 2:0:0:0: [sdb] tag#0 FAILED Result: hostbyte=DID_OK "
+                "driverbyte=DRIVER_OK cmd_age=0s",
+                "io_error",
+            ),
+            (
+                "nvme nvme0: I/O tag 123 (007b) QID 4 timeout, aborting "
+                "req_op:WRITE(1) size:4096",
+                "io_error",
+            ),
+            ("nvme nvme0: I/O 123 QID 4 timeout, reset controller", "io_error"),
+            ("nvme nvme0: Device not ready; aborting reset, CSTS=0x1", "io_error"),
+            (
+                "operation not supported error, dev sda, sector 0 "
+                "op 0x9:(WRITE_ZEROES) flags 0x800 phys_seg 0 prio class 2",
+                None,
+            ),
+            ("nvme nvme0: I/O 5 QID 0 timeout, completion polled", None),
+            (
+                "sd 2:0:0:0: [sdb] Synchronize Cache(10) failed: Result: "
+                "hostbyte=DID_BAD_TARGET driverbyte=DRIVER_OK",
+                None,
+            ),
+            (
+                "BTRFS info (device sda2): bdev /dev/sda2 errs: wr 1, rd 0, "
+                "flush 0, corrupt 0, gen 0",
+                None,
+            ),
+            (
+                "BTRFS: device fsid 0f5a0d3c devid 1 transid 42 /dev/sda2 "
+                "scanned by mount (512)",
+                None,
+            ),
+            ("XFS (sda1): Mounting V5 Filesystem 0f5a0d3c", None),
+        ],
+    )
+    def test_reports_the_kernels_disk_and_filesystem_error_lines(
+        self, tmp_path, line, kind
+    ):
+        from procdiag.kernlog import parse_short_unix
+
+        store = make_db(tmp_path)
+        add_sys_baseline(store, hours=1.0)
+        events, _ = parse_short_unix(f"{time.time() - 600:.6f} edge kernel: {line}\n")
+        store.buffer("kernel_events", [tuple(e) for e in events])
+        store.flush()
+        diag = Engine(ProcdiagConfig()).run(store, only=["KERNEL-ERROR-01"])
+        found = [(f.evidence["kind"], f.severity) for f in diag.findings]
+        assert found == ([(kind, Severity.CRITICAL)] if kind else [])
+        store.close()
+
 
 class TestKernelLogSampler:
     def test_resumes_from_cursor(self, monkeypatch):
