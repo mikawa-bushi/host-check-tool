@@ -3,9 +3,9 @@
 Currently implements:
 
 - **CPU-PERIODIC-01**: Detect periodically recurring CPU spikes using
-  ``trend.detect_periodicity`` on ``spike_events`` timestamps.  Fires INFO
-  when a daily or hourly pattern is found, escalating to WARNING when the
-  event count is high.
+  ``trend.detect_periodicity`` on ``spike_events`` timestamps, in host local
+  time.  Fires INFO when a daily or hourly schedule is found, escalating to
+  WARNING when it recurred in many days (hours).
 
 - **CPU-SINGLECORE-01**: Detect single-core saturation — episodes where
   ``cpu_max_core_max`` ≥ 95% while ``cpu_avg`` < 50% for ≥ 15 consecutive
@@ -69,8 +69,9 @@ class CpuPeriodicRule(Rule):
     min_observation_hours = 0.0  # periodicity detection needs calendar span
     requires_schema = ("spike_events",)
     what = (
-        "spike_events の発火時刻に周期性検出アルゴリズムをかけ、"
-        "日次・時次の反復パターンを探す"
+        "spike_events を負荷のまとまりごとに始まりの時刻 (ホストのローカル時刻) にまとめ、"
+        "記録した日 (時間) の半分以上で同じ時刻 (既定 ±2分) に始まり、"
+        "でたらめな時刻なら 1% 未満でしか起きない揃い方のときに日次・時次の周期とする"
     )
     why = (
         "定時タスク(cron/systemd timer)の競合は周期的なスパイクとして現れる。"
@@ -99,11 +100,20 @@ class CpuPeriodicRule(Rule):
 
         timestamps = [float(row["ts"]) for row in rows]
         trigger_type = rows[0]["trigger_type"] if rows else "cpu"
+        recorded = [
+            row["ts_min"]
+            for row in store.rows(
+                "sys_rollup_1m", since=window.start_ts, until=window.end_ts
+            )
+        ] or [
+            window.start_ts + 60.0 * i for i in range(int(window.span_hours * 60) + 1)
+        ]
 
         period = detect_periodicity(
             timestamps,
             tol_sec=self.tol_sec,
             min_events=self.min_events,
+            recorded_minutes=recorded,
         )
         if period is None:
             return []
@@ -116,6 +126,8 @@ class CpuPeriodicRule(Rule):
             "period_kind": period.kind,
             "anchor": period.anchor,
             "count": period.count,
+            "cycles": period.cycles,
+            "chance": period.chance,
             "event_count": len(timestamps),
             "tol_minutes": self.tol_sec / 60.0,
             "trigger_type": trigger_type,
