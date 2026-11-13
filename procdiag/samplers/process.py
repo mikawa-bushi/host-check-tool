@@ -160,6 +160,10 @@ class ProcessSampler(Sampler):
                 reading = self._read_process(
                     pid, proc, read_fds=read_fds, need_identity=identity is None
                 )
+                if identity is None:
+                    proc_id = self._register(pid, proc, reading, ts, ctx)
+                else:
+                    _, proc_id = identity
             except psutil.NoSuchProcess:
                 # Process died between the pid listing and oneshot.
                 self._forget(pid)
@@ -169,10 +173,6 @@ class ProcessSampler(Sampler):
                 # other unexpected error — skip it for this tick.
                 continue
 
-            if identity is None:
-                proc_id = self._register(pid, proc, reading, ts, ctx)
-            else:
-                _, proc_id = identity
             if reading.status == psutil.STATUS_ZOMBIE:
                 zombies += 1
 
