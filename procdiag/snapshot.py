@@ -478,7 +478,7 @@ def _check_temperature(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem
 
     temp = ThermalSampler._read_temp()
     if temp is None:
-        return [item(INFO, "温度センサがありません")]
+        return [item(INFO, "CPU の温度センサがありません")]
     status = _level(temp, _threshold(config, ThermalThrottleRule, "temp_hot_c"))
     cur, mx = ThermalSampler._read_freq()
     detail = f"{temp:.0f}°C"
