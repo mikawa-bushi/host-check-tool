@@ -240,7 +240,6 @@ class TestExtraRules:
             + ["--only", "DISK-FULL-01", "--no-color"],
             capture_output=True,
             text=True,
-            cwd=tmp_path,
             env={**os.environ, "PYTHONPATH": f"{source_root}{os.pathsep}{tmp_path}"},
         )
         assert result.returncode == 1, result.stderr
