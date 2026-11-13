@@ -224,6 +224,11 @@ rules=RulesConfig(
 ),
 ```
 
+`rules.disabled` も同じで、存在しないルール ID を書くと起動時にエラーになる。
+`check` / `compare` の `--only` / `--skip` では、ルール ID を `procdiag explain` の一覧どおり
+大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に
+書いたとき、実行するルールが 1 つも残らないときは、診断せずに終了コード 4 で終わる。
+
 ## 依存関係
 
 - Python 3.10+

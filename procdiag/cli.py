@@ -111,23 +111,34 @@ def _load_config(
         sys.exit(_EXIT_USAGE)
     if db_path:
         cfg = cfg.model_copy(update={"db_path": db_path})
-    if cfg.rules.overrides:
-        _validate_overrides(cfg)
+    if cfg.rules.overrides or cfg.rules.disabled:
+        _validate_rules(cfg)
     return cfg
 
 
-def _validate_overrides(cfg: ProcdiagConfig) -> None:
-    """Exit (code 4) when ``rules.overrides`` names an unknown rule/threshold.
+def _validate_rules(
+    cfg: ProcdiagConfig,
+    only: Optional[list[str]] = None,
+    skip: Optional[list[str]] = None,
+) -> None:
+    """Exit (code 4) when the rule settings or ``--only`` / ``--skip`` are wrong.
 
-    A typo there would otherwise silently keep the default threshold, so it is
-    treated like any other config error: reported at start-up.
+    That is an unknown rule or threshold in ``rules.overrides`` /
+    ``rules.disabled`` / *only* / *skip*, or a selection that leaves no rule to
+    run.  A typo there would otherwise silently keep a default or change which
+    rules run, so it is treated like any other config error: reported at
+    start-up.
     """
     from .core import validate_rule_overrides
+    from .diagnosis import Engine
     from .plugins import load_extra_rules
 
-    _load_registries()
     load_extra_rules(cfg.rules.extra_rules)
     problems = validate_rule_overrides(cfg.rules.overrides)
+    try:
+        Engine(cfg).select(only=only, skip=skip)
+    except ValueError as exc:
+        problems.extend(str(exc).splitlines())
     if problems:
         for msg in problems:
             click.echo(f"エラー: {msg}", err=True)
@@ -183,8 +194,8 @@ def _use_ascii(flag: bool) -> bool:
 
 
 def _split_ids(value: Optional[str]) -> Optional[list[str]]:
-    """``"A, B"`` -> ``["A", "B"]`` for the ``--only`` / ``--skip`` options."""
-    return [s.strip() for s in value.split(",")] if value else None
+    """``"A, B,"`` -> ``["A", "B"]`` for the ``--only`` / ``--skip`` options."""
+    return [s.strip() for s in value.split(",") if s.strip()] if value else None
 
 
 def _load_registries() -> None:
@@ -576,11 +587,13 @@ def check(
     start, end = _parse_period(since, until)
     fmt = fmt or _FORMAT_BY_SUFFIX.get(Path(output or "").suffix.lower(), "text")
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
+    only_ids, skip_ids = _split_ids(only), _split_ids(skip)
+    _validate_rules(cfg, only_ids, skip_ids)
     diag, charts, meta_hostname = _diagnose(
         cfg,
         resolved_db,
-        only=_split_ids(only),
-        skip=_split_ids(skip),
+        only=only_ids,
+        skip=skip_ids,
         since=start,
         until=end,
         verbose=verbose,
@@ -820,6 +833,8 @@ def compare(
         click.echo("エラー: --db と DB の位置引数は同時に指定できません", err=True)
         sys.exit(_EXIT_USAGE)
     cfg = _load_config(config_path, db_path)
+    only_ids, skip_ids = _split_ids(only), _split_ids(skip)
+    _validate_rules(cfg, only_ids, skip_ids)
     try:
         request = plan_request(
             dbs=dbs, default_db=cfg.db_path, at=at, before=before_spec, after=after_spec
@@ -834,7 +849,7 @@ def compare(
                 click.echo(_DB_MISSING_MSG.format(db=path), err=True)
                 sys.exit(_EXIT_USAGE)
         result = run_compare(
-            cfg, request, only=_split_ids(only), skip=_split_ids(skip), verbose=verbose
+            cfg, request, only=only_ids, skip=skip_ids, verbose=verbose
         )
     except CompareError as exc:
         click.echo(f"エラー: {exc}", err=True)

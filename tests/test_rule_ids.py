@@ -8,14 +8,18 @@ report "no problem".
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 from synth import add_disk_series, add_sys_baseline, make_db
 
+import procdiag
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core.rule import _REGISTRY
@@ -106,6 +110,11 @@ def plugin(tmp_path, monkeypatch, restore_registry):
 class TestOnlyAndSkip:
     def test_known_id_finds_the_critical_disk(self, disk_db, tmp_path):
         result = _check(disk_db, _config(tmp_path), "--only", "DISK-FULL-01")
+        assert result.exit_code == 1
+        assert "[DISK-FULL-01]" in result.output
+
+    def test_trailing_comma_is_not_an_id(self, disk_db, tmp_path):
+        result = _check(disk_db, _config(tmp_path), "--only", "DISK-FULL-01,")
         assert result.exit_code == 1
         assert "[DISK-FULL-01]" in result.output
 
@@ -212,3 +221,27 @@ class TestExtraRules:
             Engine(ProcdiagConfig(rules=RulesConfig(extra_rules=[plugin]))).run(store)
             diag = Engine(ProcdiagConfig()).run(store, only=["DISK-FULL-01"])
         assert [f.rule_id for f in diag.findings] == ["DISK-FULL-01"]
+
+    def test_installed_plugin_cannot_replace_a_builtin_rule(
+        self, disk_db, tmp_path, plugin
+    ):
+        dist = tmp_path / "siteplug-0.1.dist-info"
+        dist.mkdir()
+        (dist / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: siteplug\nVersion: 0.1\n", encoding="utf-8"
+        )
+        (dist / "entry_points.txt").write_text(
+            f"[procdiag.rules]\nsite = {plugin}\n", encoding="utf-8"
+        )
+        source_root = str(Path(procdiag.__file__).parents[1])
+        result = subprocess.run(
+            [sys.executable, "-c", "from procdiag.cli import cli; cli()", "check"]
+            + ["--db", str(disk_db), "--config", str(_config(tmp_path))]
+            + ["--only", "DISK-FULL-01", "--no-color"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": f"{source_root}{os.pathsep}{tmp_path}"},
+        )
+        assert result.returncode == 1, result.stderr
+        assert "[DISK-FULL-01]" in result.stdout
