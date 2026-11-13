@@ -30,16 +30,26 @@ KINDS: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = (
         "ファイルシステムエラー",
         re.compile(
             r"EXT4-fs error|EXT4-fs \(.*\): Remounting filesystem read-only"
-            r"|XFS \(.*\): (?:Corruption|metadata I/O error|Filesystem has been shut down)"
-            r"|BTRFS (?:error|critical)|Remounting filesystem read-only",
+            r"|XFS \(.*\): (?:Corruption|metadata I/O error"
+            r"|Metadata (?:corruption|CRC error) detected|Filesystem has been shut down)"
+            r"|BTRFS (?:error|critical)|BTRFS: error \(device"
+            r"|Remounting filesystem read-only",
             re.I,
         ),
     ),
     (
         "io_error",
         "ディスク I/O エラー",
+        # Block-layer statuses that mean the device failed the request.
+        # "operation not supported", the resource and the retry statuses are
+        # not disk faults and stay unmatched.
         re.compile(
             r"I/O error|blk_update_request|Buffer I/O error|critical medium error"
+            r"|(?:critical (?:target|nexus)|timeout|recoverable transport"
+            r"|device offline|protection) error, dev "
+            r"|FAILED Result: hostbyte"
+            r"|QID \d+ timeout, (?:aborting|reset controller|disable controller)"
+            r"|Device not ready; aborting"
             r"|ata\d+(?:\.\d+)?: (?:failed command|exception Emask)",
             re.I,
         ),
