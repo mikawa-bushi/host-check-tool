@@ -13,7 +13,7 @@ from synth import (
 
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RulesConfig
-from procdiag.core import configure_rule, validate_rule_overrides
+from procdiag.core import Rule, configure_rule, validate_rule_overrides
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.cpu import CpuSaturationRule
 from procdiag.diagnosis.io_disk import DiskJournalRule
@@ -78,6 +78,23 @@ class TestTunables:
             CpuSaturationRule, _cfg({"CPU-SATURATION-01": {"psi_threshold": 35}})
         )
         assert error is None and rule.psi_threshold == 35.0
+
+    @pytest.mark.parametrize("where", ["init", "configure"])
+    def test_a_rule_that_sets_its_own_min_hours_keeps_it(self, where):
+        class OwnHoursRule(Rule):
+            rule_id = "X-OWN-HOURS-01"
+
+            def __init__(self):
+                if where == "init":
+                    self.min_observation_hours = 2.0
+
+            def configure(self, config):
+                if where == "configure":
+                    self.min_observation_hours = 2.0
+                super().configure(config)
+
+        rule, error = configure_rule(OwnHoursRule, ProcdiagConfig())
+        assert error is None and rule.min_observation_hours == 2.0
 
     def test_validate_reports_every_problem(self):
         import procdiag.diagnosis  # noqa: F401  (fills the registry)

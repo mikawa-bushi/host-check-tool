@@ -80,14 +80,20 @@ class Rule:
         """Apply operator settings from ``config`` before ``evaluate`` runs.
 
         The engine calls this once per run on every instantiated rule.  The
-        base implementation applies ``config.rules.overrides[self.rule_id]``
-        onto the instance; a rule with a dedicated setting in ``config.rules``
-        overrides this to copy that value first and then calls ``super()``, so
-        an explicit override still wins.  Raises :class:`ValueError` for an
-        unknown or ill-typed override (nothing is applied in that case).
+        base implementation copies ``config.rules.min_observation_hours`` onto
+        a rule whose class keeps ``Rule.min_observation_hours`` and that has not
+        set its own on the instance, then applies
+        ``config.rules.overrides[self.rule_id]``; a rule with a dedicated
+        setting in ``config.rules`` overrides this to copy that value first and
+        then calls ``super()``, so an explicit override still wins.  Raises
+        :class:`ValueError` for an unknown or ill-typed override (nothing is
+        applied in that case).
         """
         overrides = config.rules.overrides.get(self.rule_id, {})
         resolved = resolve_overrides(type(self), overrides)
+        keeps_default = type(self).min_observation_hours == Rule.min_observation_hours
+        if keeps_default and "min_observation_hours" not in vars(self):
+            self.min_observation_hours = config.rules.min_observation_hours
         for name, value in resolved.items():
             setattr(self, name, value)
 
