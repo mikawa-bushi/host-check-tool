@@ -215,8 +215,8 @@ class TestSwapThrash:
         assert f.severity == Severity.CRITICAL
         assert f.confidence == Confidence.HIGH
         assert f.evidence["thrash_event_count"] == 5
-        assert f.evidence["swap_in_total_pages"] > 0
-        assert f.evidence["swap_out_total_pages"] > 0
+        assert f.evidence["swap_in_total_bytes"] > 0
+        assert f.evidence["swap_out_total_bytes"] > 0
         store.close()
 
     def test_no_thrash_when_psi_full_zero(self, tmp_path):

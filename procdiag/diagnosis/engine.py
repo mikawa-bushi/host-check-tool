@@ -47,6 +47,7 @@ from ..core import (
     covers,
     rule_id_problems,
 )
+from ..core.util import humanize_bytes
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
@@ -85,11 +86,13 @@ _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 def _make_jinja_env() -> Environment:
     """Return a Jinja2 environment backed by the templates/ directory."""
-    return Environment(
+    env = Environment(
         loader=FileSystemLoader(str(_TEMPLATE_DIR)),
         autoescape=False,
         keep_trailing_newline=True,
     )
+    env.filters["humanize_bytes"] = humanize_bytes
+    return env
 
 
 # Leading "<delay>s" token in a gap event's detail (see recorder._on_gap).
@@ -297,6 +300,21 @@ class Engine:
                 uncovered.append(gap)
                 continue
             try:
+                shortfall = rule.recording_shortfall_hours(store, window)
+                if shortfall > 0:
+                    reasoning.append(
+                        f"{rule.rule_id}: 判定に必要な観測が足りないためスキップ "
+                        f"(あと {shortfall:.1f}h)"
+                    )
+                    skipped.append(
+                        SkippedRule(
+                            rule_id=rule.rule_id,
+                            title=rule.title,
+                            required_hours=window.span_hours + shortfall,
+                            remaining_hours=shortfall,
+                        )
+                    )
+                    continue
                 if isinstance(rule, MeasuredRule):
                     measured = rule.assess(store, window)
                     found = [m.finding for m in measured if m.finding]

@@ -99,6 +99,16 @@ class Rule:
         for name, value in resolved.items():
             setattr(self, name, value)
 
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        """Hours of further recording the rule needs beyond ``min_observation_hours``.
+
+        0.0 when the recording is enough.  A rule whose input is not just
+        long enough but also has to hold something specific (days observed
+        long enough) overrides this, so a recording that cannot be judged is
+        reported as not evaluable instead of healthy.
+        """
+        return 0.0
+
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run the rule against *store* over *window*.
 

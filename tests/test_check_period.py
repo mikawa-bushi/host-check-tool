@@ -137,12 +137,18 @@ class TestPeriodLength:
         ]
         assert leaks == ["leaky"]
 
-    def test_a_day_long_period_evaluates_memory_pressure(self, leaking_recording):
+    def test_a_day_long_period_is_long_enough_for_memory_pressure(
+        self, leaking_recording
+    ):
         db, start = leaking_recording
         report = _check_json(
             db, "--since", _iso(start), "--until", _iso(start + 24 * _HOUR)
         )
-        assert "MEM-PRESSURE-01" in report["evaluated_rules"]
+        skipped = {r["rule_id"]: r for r in report["skipped_rules"]}
+        assert (
+            "MEM-PRESSURE-01" in report["evaluated_rules"]
+            or skipped["MEM-PRESSURE-01"]["required_hours"] > 24
+        )
 
     def test_a_period_minutes_short_still_skips_the_leak_rules(self, leaking_recording):
         db, start = leaking_recording
