@@ -18,7 +18,6 @@ to ``info`` instead of failing the snapshot.
 from __future__ import annotations
 
 import functools
-import json
 import os
 import time
 from collections import Counter
@@ -31,7 +30,15 @@ import psutil
 from . import kernlog, systemd
 from .config import ProcdiagConfig
 from .core import Severity, configure_rule
-from .core.util import GiB, humanize_bytes, humanize_duration
+from .core.util import (
+    GiB,
+    dumps_json,
+    humanize_bytes,
+    humanize_duration,
+    neutralized_lines,
+    shell_quote,
+    storable_text,
+)
 
 OK, WARNING, CRITICAL, INFO = "ok", "warning", "critical", "info"
 STATUSES = (CRITICAL, WARNING, INFO, OK)  # worst first
@@ -284,14 +291,16 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
     for part in psutil.disk_partitions(all=False):
         if not part.fstype or part.fstype.lower() in _PSEUDO_FS_TYPES:
             continue
-        mp = part.mountpoint
+        path = part.mountpoint
+        mp = storable_text(path)
         try:
-            usage = psutil.disk_usage(mp)
+            usage = psutil.disk_usage(path)
         except OSError:
             continue
         status = _level(usage.percent, _DISK_WARN_PCT, _DISK_CRIT_PCT)
         hint = (
-            f"`du -sh {mp}/* | sort -rh | head` で大きいディレクトリを確認してください"
+            f"`du -sh {shell_quote(mp)}/* | sort -rh | head`"
+            " で大きいディレクトリを確認してください"
         )
         items.append(
             item(
@@ -303,13 +312,14 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
             )
         )
 
-        total, used = _inode_usage(mp)
+        total, used = _inode_usage(path)
         if total:
             pct = used / total * 100.0
             status = _level(pct, inode_warn, inode_crit)
             hint = (
                 "小さなファイルが大量にあります。`df -i` と "
-                f"`sudo du --inodes -x {mp} | sort -n | tail` で確認してください"
+                f"`sudo du --inodes -x {shell_quote(mp)} | sort -n | tail`"
+                " で確認してください"
             )
             items.append(
                 item(
@@ -534,7 +544,7 @@ def _sample_processes(sample_sec: float) -> tuple[List[float], List[Dict[str, An
         out.append(
             {
                 "pid": p.info["pid"],
-                "name": p.info.get("name") or "?",
+                "name": storable_text(p.info.get("name") or "?"),
                 "status": p.info.get("status"),
                 "cpu": cpu,
                 "rss": mem.rss if mem else 0,
@@ -584,6 +594,7 @@ _SYMBOLS = {
     True: {OK: "[OK]", WARNING: "[WARN]", CRITICAL: "[CRIT]", INFO: "[INFO]"},
 }
 _COLORS = {WARNING: "\033[33m", CRITICAL: "\033[31m"}
+_RESET = "\033[0m"
 
 
 def _summary(items: List[SnapshotItem]) -> Dict[str, int]:
@@ -604,14 +615,14 @@ def render_text(
     *next_step* is shown in parentheses after the summary; empty omits it.
     """
     symbols = _SYMBOLS[ascii_only]
-    reset = "\033[0m" if color else ""
+    reset = _RESET if color else ""
     now = time.strftime("%Y-%m-%d %H:%M")
     lines = [f"procdiag snapshot — {hostname} ({now})"]
     category = None
     for item in items:
         if item.category != category:
             category = item.category
-            lines.append(f"\n[{category}]")
+            lines += ["", f"[{category}]"]
         col = _COLORS.get(item.status, "") if color else ""
         lines.append(
             f"  {col}{symbols[item.status]}{reset} {item.label}: {item.detail}"
@@ -619,22 +630,23 @@ def render_text(
         if item.hint:
             lines.append(f"      → {item.hint}")
     n = _summary(items)
+    lines.append("")
     lines.append(
-        f"\n結果: 重大 {n[CRITICAL]} 件 / 警告 {n[WARNING]} 件 / 正常 {n[OK]} 件"
+        f"結果: 重大 {n[CRITICAL]} 件 / 警告 {n[WARNING]} 件 / 正常 {n[OK]} 件"
         + (f" ({next_step})" if next_step else "")
     )
-    return "\n".join(lines)
+    # Host text (process names, mount points, unit and kernel lines) is shown
+    # as escapes, so it cannot clear the screen or forge a line.
+    return neutralized_lines(lines, allow=(*_COLORS.values(), _RESET) if color else ())
 
 
 def render_json(items: List[SnapshotItem], *, hostname: str) -> str:
     """Machine-readable output (stable keys)."""
-    return json.dumps(
+    return dumps_json(
         {
             "hostname": hostname,
             "generated_at": time.time(),
             "items": [i.to_dict() for i in items],
             "summary": _summary(items),
-        },
-        ensure_ascii=False,
-        indent=2,
+        }
     )
