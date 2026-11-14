@@ -433,6 +433,40 @@ class TestSinglecoreEpisodes:
         assert f.evidence["top_processes"][0] == "pinned"
         store.close()
 
+    def test_one_busy_process_outranks_a_pool_of_lighter_workers(self, tmp_path):
+        store = make_db(tmp_path)
+        store.write_meta({"cpu_count": "8"})
+        _register(store, "pool", "pinned")
+        busy = {(1, 201): 30.0, (1, 202): 30.0, (1, 203): 30.0, (1, 204): 30.0}
+        busy[(2, 300)] = 99.0
+        procs = [
+            make_row(
+                "proc_samples",
+                ts=_T0 + i,
+                proc_id=proc_id,
+                pid=pid,
+                cpu_pct=cpu,
+                rss=100 * _MiB,
+                pss=None,
+                num_fds=4,
+                num_threads=2,
+                io_read_delta=0,
+                io_write_delta=0,
+            )
+            for i in range(0, 1800, 10)
+            for (proc_id, pid), cpu in busy.items()
+        ]
+        store.buffer("sys_samples", [_core_rows(_T0 + i, 8, True) for i in range(1800)])
+        store.buffer("proc_samples", procs)
+        store.flush(reason="synth")
+        store.rollup_incremental()
+
+        (f,) = _run(store, "CPU-SINGLECORE-01")
+
+        assert f.subject == "pinned"
+        assert f.evidence["top_processes"][0] == "pinned"
+        store.close()
+
     def test_a_recording_gap_ends_the_episode(self, tmp_path):
         store = make_db(tmp_path)
         rows = [_core_rows(_T0 + i, 4, True) for i in range(600)]
