@@ -234,11 +234,12 @@ def _disk_delta(ctx: RunContext, disks: _Disks, monkeypatch, **bump) -> tuple[in
 
 
 def _ctx(*, sys_root: Path, cgroup_root: Path = Path("/sys/fs/cgroup")) -> RunContext:
-    ctx = RunContext(
-        ProcdiagConfig(), proc_root=_FIXTURES / "proc_tree", cgroup_root=cgroup_root
+    return RunContext(
+        ProcdiagConfig(),
+        proc_root=_FIXTURES / "proc_tree",
+        cgroup_root=cgroup_root,
+        sys_root=sys_root,
     )
-    ctx.sys_root = sys_root
-    return ctx
 
 
 class TestDiskIoIsCountedOnce:

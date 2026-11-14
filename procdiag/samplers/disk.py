@@ -9,14 +9,21 @@ drive them at different intervals (``disk_interval`` for partition snapshots,
   plus ``os.statvfs`` for inode usage and the mount options for a read-only
   flag — "space left but cannot write" (inode exhaustion, or a filesystem
   error that remounted it read-only) is invisible in byte counts alone.
+  A mount whose mount point is a file (a bind-mounted ``/etc/hosts`` in a
+  container) is not a filesystem to watch and is skipped.
   Produces ``disk_samples`` rows.
 
 * ``collect_dirs`` — slow path (1 h default).  Walks each ``WatchDir`` in
   ``config.sampling.watch_dirs`` with ``os.scandir`` and a monotonic time
   budget.  If the budget is exhausted before the walk completes, the
   accumulated size is stored with ``is_estimate=1``.  Symbolic links are
-  never followed.  ``PermissionError`` on any entry is silenced and
-  traversal continues.  Produces ``dir_samples`` rows.
+  never followed, and the walk stays on the filesystem the directory is on
+  (``du -x``): ``/proc``, ``/sys`` and other disks mounted below it are not
+  counted.  ``PermissionError`` on an entry below the directory is silenced
+  and traversal continues.  A directory that cannot be read at all (missing,
+  permission denied, not mounted yet) is stored with ``size_bytes`` NULL, not
+  as an empty directory, and named in ``ctx.notes``.  Produces ``dir_samples``
+  rows.
 
 The sampler is registered under the name ``"disk"`` so the recorder can look
 it up via ``get_sampler("disk")``.
@@ -84,6 +91,7 @@ class DiskSampler(Sampler):
         "df -h",
         "du -sh /var/log/*",
     ]
+    _unreadable_note: Optional[str] = None
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
         """Collect disk_usage for all non-pseudo-fs mount points."""
@@ -100,6 +108,8 @@ class DiskSampler(Sampler):
                 continue
             # Some virtual mounts report an empty fstype — skip those too.
             if not part.fstype:
+                continue
+            if not os.path.isdir(part.mountpoint):
                 continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
@@ -132,8 +142,11 @@ class DiskSampler(Sampler):
         rows: list[tuple] = []
 
         watch_dirs = ctx.config.sampling.watch_dirs
+        unreadable: list[str] = []
         for wd in watch_dirs:
             size_bytes, is_estimate = _scan_dir(wd.path, wd.time_budget_sec)
+            if size_bytes is None:
+                unreadable.append(wd.path)
             rows.append(
                 make_row(
                     "dir_samples",
@@ -144,7 +157,20 @@ class DiskSampler(Sampler):
                 )
             )
 
+        self._note_unreadable(ctx, unreadable)
         return [SampleBatch(table="dir_samples", rows=rows)]
+
+    def _note_unreadable(self, ctx: RunContext, unreadable: list[str]) -> None:
+        """Name the watch dirs that could not be read, once per change."""
+        note = (
+            "disk_dirs: 監視ディレクトリを読めないため、サイズを記録できません"
+            f" (存在しない・権限がないなど): {', '.join(unreadable)}"
+            if unreadable
+            else None
+        )
+        if note is not None and note != self._unreadable_note:
+            ctx.notes.append(note)
+        self._unreadable_note = note
 
 
 def is_read_only(mount_opts: str) -> bool:
@@ -167,14 +193,21 @@ def _inode_usage(mountpoint: str) -> Tuple[Optional[int], Optional[int]]:
     return st.f_files, st.f_files - st.f_ffree
 
 
-def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:
+def _scan_dir(root: str, time_budget_sec: float) -> tuple[Optional[int], bool]:
     """Recursively sum file sizes under *root* within a time budget.
 
     Returns ``(total_bytes, is_estimate)`` where ``is_estimate`` is ``True``
-    when the walk was aborted before completion.  Symbolic links are not
-    followed.  ``PermissionError`` on any individual entry is silenced.
+    when the walk was aborted before completion.  ``total_bytes`` is ``None``
+    when *root* itself cannot be read (missing, not a directory, permission
+    denied): that is unknown, not an empty directory.  Symbolic links are not
+    followed and the walk does not leave the filesystem *root* is on.
+    ``PermissionError`` on an individual entry below *root* is silenced.
     """
     deadline = time.monotonic() + time_budget_sec
+    try:
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        return None, False
     total = 0
     is_estimate = False
 
@@ -195,6 +228,8 @@ def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:
                         stat = entry.stat(follow_symlinks=False)
                     except OSError:  # incl. PermissionError
                         continue
+                    if stat.st_dev != root_dev:
+                        continue
                     if entry.is_symlink():
                         # Count the symlink itself but do not follow it.
                         total += stat.st_size
@@ -203,6 +238,8 @@ def _scan_dir(root: str, time_budget_sec: float) -> tuple[int, bool]:
                     else:
                         total += stat.st_size
         except OSError:  # incl. PermissionError
+            if current == root:
+                return None, False
             continue
 
     return total, is_estimate

@@ -5,7 +5,8 @@ This is the highest-frequency sampler (default 1 s).  It reads:
 * ``psutil.cpu_percent(percpu=True)`` — overall average and per-core maximum
 * ``psutil.virtual_memory()`` and ``psutil.swap_memory()`` — memory and swap;
   swap_in / swap_out are recorded as *deltas* (bytes since the last collect)
-* ``psutil.disk_io_counters()`` — aggregate read/write bytes as deltas
+* ``psutil.disk_io_counters()`` — read/write bytes of the physical disks as
+  deltas; LVM, dm-crypt, md and loop devices are not added to the disk below
 * ``/proc/loadavg`` — load average (direct read, not psutil)
 * ``/proc/pressure/cpu|memory|io`` — PSI stall values (direct read)
 
@@ -35,6 +36,7 @@ from ..core.sampler import (
 )
 from ..core.util import CounterDelta
 from ..storage import make_row
+from .blockdev import is_stacked
 
 # ---------------------------------------------------------------------------
 # PSI parser — pure function, tested directly
@@ -109,6 +111,27 @@ def parse_psi(text: str, *, keys: "frozenset[str] | None" = None) -> Dict[str, f
 # ---------------------------------------------------------------------------
 # SystemSampler
 # ---------------------------------------------------------------------------
+
+
+def _disk_io_totals(sys_root: Path) -> Optional[Tuple[int, int]]:
+    """Cumulative ``(read_bytes, write_bytes)`` of the disks no other device sits on.
+
+    A logical volume, dm-crypt or md device and the disk below it both report
+    the same I/O, and so does a loop device and the disk under its file.  Only
+    whole devices that are not stacked on others are summed.  Without the
+    block-device tree the stacking is unknown and psutil's own total is used.
+    """
+    block = sys_root / "block"
+    if not block.is_dir():
+        total = psutil.disk_io_counters()
+        return None if total is None else (total.read_bytes, total.write_bytes)
+    per_disk = psutil.disk_io_counters(perdisk=True) or {}
+    disks = [
+        c
+        for name, c in per_disk.items()
+        if (block / name).is_dir() and not is_stacked(block / name)
+    ]
+    return sum(c.read_bytes for c in disks), sum(c.write_bytes for c in disks)
 
 
 @register_sampler
@@ -197,7 +220,7 @@ class SystemSampler(Sampler):
         swap_out_delta = self._delta("swap_out", swap.sout)
 
         # --- Disk I/O ---
-        disk_read_delta, disk_write_delta = self._disk_io_deltas()
+        disk_read_delta, disk_write_delta = self._disk_io_deltas(ctx.sys_root)
 
         # --- PSI (direct /proc read) ---
         psi: Optional[Dict[str, Optional[float]]] = None
@@ -254,19 +277,18 @@ class SystemSampler(Sampler):
         delta = self._deltas.update(key, value)
         return 0 if delta is None else delta
 
-    def _disk_io_deltas(self) -> Tuple[int, int]:
+    def _disk_io_deltas(self, sys_root: Path) -> Tuple[int, int]:
         """Return ``(read_bytes_delta, write_bytes_delta)`` since the last call.
 
         Returns ``(0, 0)`` on the first call or if counters are unavailable.
         """
         try:
-            counters = psutil.disk_io_counters()
-            if counters is None:
-                return 0, 0
-            raw_read: int = counters.read_bytes
-            raw_write: int = counters.write_bytes
+            totals = _disk_io_totals(sys_root)
         except (AttributeError, OSError):
             return 0, 0
+        if totals is None:
+            return 0, 0
+        raw_read, raw_write = totals
         return self._delta("disk_read", raw_read), self._delta("disk_write", raw_write)
 
     @classmethod

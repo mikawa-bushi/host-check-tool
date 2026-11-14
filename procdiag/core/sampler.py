@@ -65,9 +65,10 @@ class RunContext:
     recorder attaches the SelfMeter instance that T1 then uses to record
     self-CPU overhead).
 
-    ``proc_root`` and ``cgroup_root`` default to the real paths but can be
-    replaced with a fixture directory in tests — the same injection pattern
-    as netdiag's ``Context.config`` carrying the target list.
+    ``proc_root``, ``cgroup_root`` and ``sys_root`` default to the real paths
+    but can be replaced with a fixture directory in tests — the same
+    injection pattern as netdiag's ``Context.config`` carrying the target
+    list.
     """
 
     def __init__(
@@ -76,10 +77,12 @@ class RunContext:
         *,
         proc_root: Path = Path("/proc"),
         cgroup_root: Path = Path("/sys/fs/cgroup"),
+        sys_root: Path = Path("/sys"),
     ) -> None:
         self.config = config
         self.proc_root = proc_root
         self.cgroup_root = cgroup_root
+        self.sys_root = sys_root
         # Capability flags filled in by each sampler's setup() (Capability values).
         self.capabilities: Dict[str, bool] = {}
         # What this session cannot observe and why; the recorder keeps it in
