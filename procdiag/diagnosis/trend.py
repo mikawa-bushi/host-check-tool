@@ -18,7 +18,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import accumulate
-from typing import Any, Hashable, Iterable, Iterator, Mapping, Optional
+from typing import Any, Hashable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from ..core import Confidence, Observation, covers
 
@@ -33,7 +33,8 @@ class TrendFit:
 
     ``slope_per_hour`` is the rate of change in the same unit as the series
     values (e.g. bytes/hour for RSS).  ``r2`` quantifies how well a straight
-    line explains the variance (0–1; 1 is perfect).
+    line explains the variance (0–1; 1 is perfect).  ``span_hours`` is the
+    time the points cover, holes in the recording left out.
     """
 
     slope_per_hour: float
@@ -77,9 +78,10 @@ class Period:
 # up, so a rollup series spans less than three minutes short of its window.
 # The engine gate lets a window two minutes short through, so a series inside
 # it spans more than the requirement less five minutes.  On raw series such
-# as disk rows or proc_counts this only adds leniency.
-def _series_covers(span_hours: float, hours: float) -> bool:
-    return covers(span_hours + 3 / 60, hours)
+# as disk rows or proc_counts this only adds leniency.  Each segment between
+# holes in the recording loses that much at its edges.
+def _series_covers(span_hours: float, hours: float, segments: int = 1) -> bool:
+    return covers(span_hours + segments * 3 / 60, hours)
 
 
 def fit_linear(
@@ -87,8 +89,15 @@ def fit_linear(
     *,
     min_points: int = 12,
     min_span_hours: float = 6.0,
+    holes: Sequence[tuple[float, float]] = (),
 ) -> Optional[TrendFit]:
     """Fit a least-squares line to *(timestamp, value)* pairs.
+
+    *holes* are the stretches with nothing recorded (``Window.holes``).  They
+    cut the series into segments, and the slope is fitted within them: each
+    segment keeps its own level, so a process that settles at another level
+    after the PC was off overnight is not read as growing, and one that grows
+    again every day is.  ``span_hours`` adds up the segments.
 
     Returns ``None`` when there are fewer than *min_points* samples or the
     observation span does not cover *min_span_hours* (see
@@ -101,34 +110,47 @@ def fit_linear(
     if len(pts) < min_points:
         return None
 
-    ts_min = min(t for t, _ in pts)
-    ts_max = max(t for t, _ in pts)
-    span_hours = (ts_max - ts_min) / 3600.0
-    if not _series_covers(span_hours, min_span_hours):
+    hole_starts = [start for start, _ in holes]
+    seg_of = [bisect_left(hole_starts, t) for t, _ in pts]
+    segments: dict[int, list[int]] = {}
+    for i, k in enumerate(seg_of):
+        segments.setdefault(k, []).append(i)
+
+    span_hours = (
+        sum(
+            max(pts[i][0] for i in members) - min(pts[i][0] for i in members)
+            for members in segments.values()
+        )
+        / 3600.0
+    )
+    if not _series_covers(span_hours, min_span_hours, len(segments)):
         return None
 
     n = len(pts)
+    ts_min = min(t for t, _ in pts)
     # Convert timestamps to hours relative to the earliest point so the
     # slope is already in (value / hour) without needing large-number arithmetic.
     xs = [(t - ts_min) / 3600.0 for t, _ in pts]
     ys = [v for _, v in pts]
 
-    x_mean = statistics.fmean(xs)
-    y_mean = statistics.fmean(ys)
+    x_mean = {k: statistics.fmean([xs[i] for i in m]) for k, m in segments.items()}
+    y_mean = {k: statistics.fmean([ys[i] for i in m]) for k, m in segments.items()}
 
-    ss_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-    ss_xx = sum((x - x_mean) ** 2 for x in xs)
+    ss_xy = sum((x - x_mean[k]) * (y - y_mean[k]) for k, x, y in zip(seg_of, xs, ys))
+    ss_xx = sum((x - x_mean[k]) ** 2 for k, x in zip(seg_of, xs))
 
     if ss_xx == 0.0:
-        # All timestamps identical — degenerate; cannot fit a line.
+        # Each segment is a single instant — degenerate; cannot fit a line.
         return None
 
     slope = ss_xy / ss_xx
-    intercept = y_mean - slope * x_mean
+    intercept = {k: y_mean[k] - slope * x_mean[k] for k in segments}
 
-    # R² = 1 - SS_res / SS_tot
-    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
-    ss_tot = sum((y - y_mean) ** 2 for y in ys)
+    # R² = 1 - SS_res / SS_tot, both around each segment's own level
+    ss_res = sum(
+        (y - (slope * x + intercept[k])) ** 2 for k, x, y in zip(seg_of, xs, ys)
+    )
+    ss_tot = sum((y - y_mean[k]) ** 2 for k, y in zip(seg_of, ys))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
 
     return TrendFit(slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours)
@@ -164,9 +186,15 @@ def fit_all(
     *,
     min_points: int,
     min_span_hours: float,
+    holes: Sequence[tuple[float, float]] = (),
 ) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
     for key, series in series_by_key.items():
-        fit = fit_linear(series, min_points=min_points, min_span_hours=min_span_hours)
+        fit = fit_linear(
+            series,
+            min_points=min_points,
+            min_span_hours=min_span_hours,
+            holes=holes,
+        )
         if fit is not None:
             yield key, series, fit
 
@@ -192,12 +220,14 @@ def proc_trend_observations(
     *,
     min_span_hours: float,
     unit: float = 1.0,
+    holes: Sequence[tuple[float, float]] = (),
 ) -> list[Observation]:
     observations = []
     for proc_id, series, fit in fit_all(
         group_series(rows, key="proc_id", value=column),
         min_points=12,
         min_span_hours=min_span_hours,
+        holes=holes,
     ):
         name, cmdline_hash = identities.get(proc_id, (f"proc_{proc_id}", None))
         observations.append(
