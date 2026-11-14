@@ -20,7 +20,7 @@ from .core import (
     configure_rule,
     get_rule,
 )
-from .core.result import CoverageGap
+from .core.result import CoverageGap, covers
 from .diagnosis import Engine
 from .storage import RAW_TABLES, Storage, StorageVersionError
 
@@ -146,6 +146,7 @@ class Why(str, Enum):
 
     FINDING_CLEARED = "finding_cleared"
     BELOW_THRESHOLD = "below_threshold"
+    ABOVE_THRESHOLD = "above_threshold"
     SEVERITY_LOWER = "severity_lower"
     VALUE_BETTER = "value_better"
     WITHIN_TOLERANCE = "within_tolerance"
@@ -159,6 +160,7 @@ class Why(str, Enum):
     SCHEMA_MISSING = "schema_missing"
     RULE_ERRORED = "rule_errored"
     SUBJECT_NOT_OBSERVED = "subject_not_observed"
+    PAIRED_BY_NAME = "paired_by_name"
 
     @property
     def label(self) -> str:
@@ -168,6 +170,7 @@ class Why(str, Enum):
 _WHY_JA = {
     Why.FINDING_CLEARED: "検出が消え、値もしきい値の半分以下",
     Why.BELOW_THRESHOLD: "しきい値未満",
+    Why.ABOVE_THRESHOLD: "しきい値以上",
     Why.SEVERITY_LOWER: "重大度が下がった",
     Why.VALUE_BETTER: f"値が {MATERIAL_CHANGE:.0%} 以上改善",
     Why.WITHIN_TOLERANCE: f"値の変化が {MATERIAL_CHANGE:.0%} 未満",
@@ -181,6 +184,7 @@ _WHY_JA = {
     Why.SCHEMA_MISSING: "DB の版が古い",
     Why.RULE_ERRORED: "ルールの実行エラー",
     Why.SUBJECT_NOT_OBSERVED: "対象を測定できなかった",
+    Why.PAIRED_BY_NAME: "名前だけで突き合わせた",
 }
 
 
@@ -258,11 +262,13 @@ def classify(
             if before.value is not None
             else None
         )
-        if change is Why.VALUE_BETTER:
-            return Verdict.IMPROVED, Why.BELOW_THRESHOLD
         if change is Why.VALUE_WORSE:
             return Verdict.WORSE, Why.VALUE_WORSE
-        return Verdict.UNCHANGED, Why.WITHIN_TOLERANCE
+        if change is None:
+            return Verdict.UNCHANGED, Why.WITHIN_TOLERANCE
+        if after.value < threshold:
+            return Verdict.IMPROVED, Why.BELOW_THRESHOLD
+        return Verdict.IMPROVED, Why.ABOVE_THRESHOLD
     if isinstance(before, Detected) and isinstance(after, Detected):
         rank = _SEVERITY_RANK[after.severity] - _SEVERITY_RANK[before.severity]
         if rank > 0:
@@ -290,24 +296,48 @@ class ComparisonRow:
     threshold: Optional[float]
     before: SideState
     after: SideState
+    paired_by_name: bool = False
 
     def __post_init__(self) -> None:
         if not (isinstance(self.before, Detected) or isinstance(self.after, Detected)):
             raise ValueError("比較行には少なくとも一方の検出が必要です")
 
+    def _classified(self) -> tuple[Verdict, Why]:
+        # The same name with another command line may be another program.
+        if self.paired_by_name:
+            return Verdict.NOT_EVALUABLE, Why.PAIRED_BY_NAME
+        return classify(self.before, self.after, self.threshold)
+
     @property
     def verdict(self) -> Verdict:
-        return classify(self.before, self.after, self.threshold)[0]
+        return self._classified()[0]
 
     @property
     def why(self) -> Why:
-        return classify(self.before, self.after, self.threshold)[1]
+        return self._classified()[1]
 
     @property
     def label(self) -> str:
-        if self.why is Why.BELOW_THRESHOLD:
+        if self.why in (Why.BELOW_THRESHOLD, Why.ABOVE_THRESHOLD):
             return f"{self.verdict.label} ({self.why.label})"
         return self.verdict.label
+
+    @property
+    def remaining(self) -> Optional[Severity]:
+        """The severity of the problem that the after period still shows.
+
+        None when the problem is gone or cannot be judged.  A measured value
+        that did not fall, or that stays at or above the threshold while the
+        rule declines to fire (low R²), still counts as the before problem.
+        """
+        if isinstance(self.after, Detected):
+            return self.after.severity
+        if isinstance(self.before, Detected) and (
+            self.verdict in (Verdict.UNCHANGED, Verdict.WORSE)
+            or self.why is Why.ABOVE_THRESHOLD
+        ):
+            return self.before.severity
+        return None
 
 
 class SideName(str, Enum):
@@ -478,6 +508,9 @@ def _measured_rows(
                 threshold=threshold,
                 before=_measured_state(gaps[0], b),
                 after=_measured_state(gaps[1], a),
+                paired_by_name=bool(
+                    b and a and b.observation.identity != a.observation.identity
+                ),
             )
         )
     return rows
@@ -490,17 +523,36 @@ def _side_findings(side: Side) -> list[Finding]:
     return diag.findings + diag.folded
 
 
-def _plain_state(side: Side, rule_id: str, subject: str) -> SideState:
+def _span_hours(side: Side) -> float:
+    return side.result.window.span_hours if side.result else 0.0
+
+
+def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
     gap = _rule_gap(side, rule_id)
     if gap is not None:
         return gap
     hits = [
         f for f in _side_findings(side) if f.rule_id == rule_id and f.subject == subject
     ]
-    if not hits:
+    if hits:
+        worst = max(hits, key=lambda f: _SEVERITY_RANK[f.severity])
+        return Detected(worst.severity, len(hits), None, worst)
+    # A problem that comes a few times a day can miss a shorter period by
+    # chance, so no finding there says nothing against the other period's.
+    mine, theirs = _span_hours(side), _span_hours(other)
+    if covers(mine, theirs):
         return Clear(None)
-    worst = max(hits, key=lambda f: _SEVERITY_RANK[f.severity])
-    return Detected(worst.severity, len(hits), None, worst)
+    if side.name is SideName.AFTER:
+        return Unknown(
+            Why.TOO_SHORT,
+            f"修正後の期間 {mine:.1f} 時間は修正前の {theirs:.1f} 時間より短いため、"
+            f"検出が無くても直ったとは言えません (あと {max(theirs - mine, 0.1):.1f} 時間)",
+        )
+    return Unknown(
+        Why.TOO_SHORT,
+        f"修正前の期間 {mine:.1f} 時間は修正後の {theirs:.1f} 時間より短いため、"
+        "修正前に無かったとは言えません",
+    )
 
 
 def _note_list(before: Side, after: Side) -> list[Note]:
@@ -566,8 +618,8 @@ def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Com
                 identity=None,
                 headline=None,
                 threshold=None,
-                before=_plain_state(before, rule_id, subject),
-                after=_plain_state(after, rule_id, subject),
+                before=_plain_state(before, after, rule_id, subject),
+                after=_plain_state(after, before, rule_id, subject),
             )
         )
     order = list(Verdict)
@@ -578,13 +630,14 @@ def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Com
 def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
     """The documented code (priority 1 > 3 > 2 > 0).
 
-    1: a warning/critical finding remains or appeared after the fix.
+    1: a warning/critical problem remains or appeared after the fix
+       (see :attr:`ComparisonRow.remaining`).
     3: a side has no data, or a warning/critical before finding cannot be
        judged after (record longer, or within raw retention).
-    2: only info findings remain after (0 with ``exit_zero_on_info``).
+    2: only info problems remain after (0 with ``exit_zero_on_info``).
     """
-    after_hits = [r.after for r in cmp.rows if isinstance(r.after, Detected)]
-    if any(h.severity is not Severity.INFO for h in after_hits):
+    remaining = [r.remaining for r in cmp.rows if r.remaining is not None]
+    if any(s is not Severity.INFO for s in remaining):
         return 1
     if cmp.before.result is None or cmp.after.result is None:
         return 3
@@ -595,7 +648,7 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
         for r in cmp.rows
     ):
         return 3
-    if after_hits and not exit_zero_on_info:
+    if remaining and not exit_zero_on_info:
         return 2
     return 0
 

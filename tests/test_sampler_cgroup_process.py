@@ -85,6 +85,23 @@ def _make_ctx(
     return RunContext(cfg, **kwargs)
 
 
+def _mock_proc(
+    pid: int, *, name: str = "worker", status: str = "sleeping"
+) -> MagicMock:
+    m = MagicMock(spec=psutil.Process)
+    m.pid = pid
+    m.name.return_value = name
+    m.cmdline.return_value = [name]
+    m.status.return_value = status
+    m.cpu_percent.return_value = 0.0
+    m.memory_info.return_value = MagicMock(rss=0)
+    m.num_threads.return_value = 1
+    m.num_fds.return_value = 3
+    m.io_counters.return_value = MagicMock(read_bytes=0, write_bytes=0)
+    m.rlimit.return_value = (1024, 524288)
+    return m
+
+
 FIXTURES = Path(__file__).parent / "fixtures"
 CGROUP_TREE = FIXTURES / "cgroup_tree"
 CGROUP_TREE_V1 = FIXTURES / "cgroup_tree_v1"
@@ -344,22 +361,10 @@ class TestProcessSampler:
             resolve_proc=stub, record_fd_limits=lambda *a: recorded.append(a)
         )
         ctx = _make_ctx()
-
-        def _proc(pid: int, status: str) -> MagicMock:
-            m = MagicMock(spec=psutil.Process)
-            m.pid = pid
-            m.name.return_value = "worker"
-            m.cmdline.return_value = ["worker"]
-            m.status.return_value = status
-            m.cpu_percent.return_value = 0.0
-            m.memory_info.return_value = MagicMock(rss=0)
-            m.num_threads.return_value = 1
-            m.num_fds.return_value = 3
-            m.io_counters.return_value = MagicMock(read_bytes=0, write_bytes=0)
-            m.rlimit.return_value = (1024, 524288)
-            return m
-
-        procs = {10: _proc(10, psutil.STATUS_ZOMBIE), 11: _proc(11, "sleeping")}
+        procs = {
+            10: _mock_proc(10, status=psutil.STATUS_ZOMBIE),
+            11: _mock_proc(11),
+        }
         with (
             patch("psutil.pids", return_value=list(procs)),
             patch("psutil.Process", side_effect=lambda pid: procs[pid]),
@@ -369,6 +374,23 @@ class TestProcessSampler:
         assert batches[1].rows[0][1:] == (2, 1)  # total, zombies
         # Both PIDs share one identity ("worker"), so the limit is recorded once.
         assert len(recorded) == 1 and recorded[0][1:] == (1024, 524288)
+
+    def test_a_process_whose_identity_cannot_be_registered_costs_only_its_row(self):
+        def resolve(name: str, hash12: str, sample: str, ts: float) -> int:
+            if name == "broken":
+                raise RuntimeError("registry write failed")
+            return 1
+
+        sampler = ProcessSampler(resolve_proc=resolve)
+        procs = {10: _mock_proc(10, name="broken"), 11: _mock_proc(11)}
+        with (
+            patch("psutil.pids", return_value=list(procs)),
+            patch("psutil.Process", side_effect=lambda pid: procs[pid]),
+        ):
+            batches = sampler.collect(_make_ctx())
+
+        assert [row[2] for row in batches[0].rows] == [11]
+        assert batches[1].rows[0][1] == 1
 
     def test_row_column_count(self):
         sampler, _ = self._sampler()

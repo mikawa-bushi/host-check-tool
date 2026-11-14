@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -164,6 +165,219 @@ class TestNotEvaluable:
         result = _run("--db", db, "--at", _iso(time.time() + 3600))
         assert result.exit_code == 3
         assert "修正後: 期間内に記録がありません" in result.stdout
+
+
+def _rows_section(stdout: str) -> str:
+    return stdout.split("結果:")[0]
+
+
+def _intermittent_faults(directory, *, hours: float, start: float, at: float):
+    """A recording with 3 service restarts and 2 disk I/O errors in the day before *at*."""
+    store = make_db(directory, hours=hours)
+    add_sys_baseline(store, hours=hours, start_ts=start)
+    store.buffer(
+        "service_events",
+        [
+            (at - h * _HOUR, "plc-gateway.service", "restart", 1, "exit-code")
+            for h in (22, 14, 6)
+            if at - h * _HOUR >= start
+        ],
+    )
+    store.buffer(
+        "kernel_events",
+        [
+            (at - h * _HOUR, "io_error", "blk_update_request: I/O error, dev sda")
+            for h in (20, 8)
+            if at - h * _HOUR >= start
+        ],
+    )
+    store.flush(reason="synth")
+    path = store.path
+    store.close()
+    return path
+
+
+class TestShortAfterPeriod:
+    @pytest.fixture
+    def one_db(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 1 * _HOUR
+        return (
+            _intermittent_faults(tmp_path, hours=25, start=at - 24 * _HOUR, at=at),
+            at,
+        )
+
+    @pytest.mark.parametrize("mode", ["--at", "--before/--after"])
+    def test_no_fault_in_one_hour_is_not_resolved_after_a_day_with_three(
+        self, one_db, mode
+    ):
+        db, at = one_db
+        split = {
+            "--at": ["--at", _iso(at)],
+            "--before/--after": [
+                "--before",
+                f"{_iso(at - 24 * _HOUR)}..{_iso(at)}",
+                "--after",
+                f"{_iso(at)}..",
+            ],
+        }[mode]
+        result = _run("--db", db, *split)
+        assert result.exit_code == 3, result.output
+        rows = _rows_section(result.stdout)
+        assert "解消" not in rows
+        assert "？ 判定不能" in rows and "[SERVICE-RESTART-01]" in rows
+        assert "修正後の期間 1.0 時間は修正前の 24.0 時間より短い" in rows
+        data = json.loads(_run("--db", db, *split, "--format", "json").stdout)
+        verdicts = {r["rule_id"]: (r["verdict"], r["why"]) for r in data["rows"]}
+        assert verdicts == {
+            "SERVICE-RESTART-01": ("not_evaluable", "too_short"),
+            "KERNEL-ERROR-01": ("not_evaluable", "too_short"),
+        }
+
+    def test_two_dbs_with_a_one_hour_after_db_are_not_resolved(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 1 * _HOUR
+        before = _intermittent_faults(
+            tmp_path / "a", hours=24, start=at - 24 * _HOUR, at=at
+        )
+        after_store = make_db(tmp_path / "b", hours=1)
+        add_sys_baseline(after_store, hours=1, start_ts=at)
+        after = after_store.path
+        after_store.close()
+        result = _run(before, after)
+        assert result.exit_code == 3, result.output
+        assert "解消" not in _rows_section(result.stdout)
+
+    def test_a_fault_free_after_period_as_long_as_before_resolves(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 24 * _HOUR
+        db = _intermittent_faults(tmp_path, hours=48, start=at - 24 * _HOUR, at=at)
+        result = _run("--db", db, "--at", _iso(at))
+        assert result.exit_code == 0, result.output
+        assert "✔ 解消  [SERVICE-RESTART-01]" in result.stdout
+        assert "修正前に検出された問題はすべて解消しました" in result.stdout
+
+    def test_a_fault_after_a_shorter_before_period_is_not_called_new(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 24 * _HOUR
+        before_store = make_db(tmp_path / "a", hours=2)
+        add_sys_baseline(before_store, hours=2, start_ts=at - 2 * _HOUR)
+        before = before_store.path
+        before_store.close()
+        after = _intermittent_faults(tmp_path / "b", hours=24, start=at, at=now)
+        result = _run(before, after)
+        assert result.exit_code == 1, result.output
+        rows = _rows_section(result.stdout)
+        assert "新規" not in rows
+        assert "修正前の期間 2.0 時間は修正後の 24.0 時間より短い" in rows
+
+
+def _python3_procs(directory, procs):
+    """One DB, 48 h; *procs* maps a cmdline to (slope before, slope after) in MB/h.
+
+    A ``None`` slope means the process is not running in that half.
+    """
+    now = time.time() // 60 * 60
+    at = now - 24 * _HOUR
+    start = at - 24 * _HOUR
+    store = make_db(directory, hours=48)
+    add_sys_baseline(store, hours=48, start_ts=start)
+    rows = []
+    for cmdline, slopes in procs.items():
+        pid = store.proc_id_for(
+            name="python3", cmdline_hash=cmdline, cmdline_sample=cmdline, ts=start
+        )
+        for i in range(48 * 60):
+            ts = start + i * 60
+            slope, t0 = (slopes[0], start) if ts < at else (slopes[1], at)
+            if slope is not None:
+                rss = int((200 + slope * (ts - t0) / _HOUR) * _MB)
+                rows.append((ts, pid, 5.0, 6.0, rss, rss, 30, 8))
+    store.buffer("proc_rollup_1m", rows)
+    store.flush(reason="synth")
+    path = store.path
+    store.close()
+    return path, at
+
+
+class TestNameOnlyPairing:
+    def test_a_stranger_with_the_same_name_does_not_resolve_a_gone_leaker(
+        self, tmp_path
+    ):
+        db, at = _python3_procs(
+            tmp_path,
+            {
+                "python3 /opt/collector.py": (20.0, None),
+                "python3 /opt/report_tool.py": (None, 0.0),
+            },
+        )
+        args = ["--db", db, "--at", _iso(at), "--only", "MEM-LEAK-01"]
+        result = _run(*args)
+        assert result.exit_code == 3, result.output
+        rows = _rows_section(result.stdout)
+        assert "解消" not in rows
+        assert "？ 判定不能" in rows
+        assert "RSS 増加率 20.0 → 0.0 MB/h" in rows
+        assert "名前だけで突き合わせ" in rows
+        (row,) = json.loads(_run(*args, "--format", "json").stdout)["rows"]
+        assert (row["verdict"], row["why"]) == ("not_evaluable", "paired_by_name")
+        assert row["identity"] == "python3 /opt/collector.py"
+        assert row["after"]["state"] == "clear"
+
+    def test_the_same_command_line_still_resolves(self, tmp_path):
+        db, at = _python3_procs(tmp_path, {"python3 /opt/collector.py": (20.0, 0.0)})
+        result = _run("--db", db, "--at", _iso(at), "--only", "MEM-LEAK-01")
+        assert result.exit_code == 0, result.output
+        assert "✔ 解消" in result.stdout and "名前だけ" not in result.stdout
+
+
+def _noisy_leak(directory, *, after_slope: float, after_wobble: float):
+    """MEM-LEAK-01 fires before (10 MB/h, R² ~1); after, a 2 h wave keeps R² < 0.9."""
+    now = time.time() // 60 * 60
+    at = now - 24 * _HOUR
+    start = at - 24 * _HOUR
+    store = make_db(directory, hours=48)
+    add_sys_baseline(store, hours=48, start_ts=start)
+    pid = store.proc_id_for(
+        name="myapp", cmdline_hash="h1", cmdline_sample="/opt/myapp", ts=start
+    )
+    rows = []
+    for i in range(48 * 60):
+        ts = start + i * 60
+        slope, wobble = (10.0, 10.0) if ts < at else (after_slope, after_wobble)
+        t_h = (ts - (start if ts < at else at)) / _HOUR
+        rss = int((300 + slope * t_h + wobble * math.sin(math.pi * t_h)) * _MB)
+        rows.append((ts, pid, 5.0, 6.0, rss, rss, 50, 8))
+    store.buffer("proc_rollup_1m", rows)
+    store.flush(reason="synth")
+    path = store.path
+    store.close()
+    return path, at
+
+
+class TestRowsAgreeWithTheResult:
+    @pytest.mark.parametrize(
+        "after_slope, wobble, row_text",
+        [
+            (10.0, 45.0, "＝ 変化なし"),
+            (14.0, 60.0, "↗ 悪化"),
+            (6.0, 30.0, "↘ 改善 (しきい値以上)"),
+        ],
+    )
+    def test_a_leak_still_far_above_the_threshold_remains_a_problem(
+        self, tmp_path, after_slope, wobble, row_text
+    ):
+        db, at = _noisy_leak(tmp_path, after_slope=after_slope, after_wobble=wobble)
+        args = ["--db", db, "--at", _iso(at), "--only", "MEM-LEAK-01"]
+        result = _run(*args)
+        assert result.exit_code == 1, result.output
+        assert row_text in result.stdout
+        assert "しきい値未満" not in result.stdout
+        assert "修正後もまだ問題があります" in result.stdout.split("結果:")[1]
+        (row,) = json.loads(_run(*args, "--format", "json").stdout)["rows"]
+        assert row["after"]["state"] == "clear"
+        assert row["after"]["evidence"]["r2"] < 0.9
+        assert row["after"]["value"] > 5 * row["headline"]["threshold"]
 
 
 class TestUsageErrors:
