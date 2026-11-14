@@ -5,8 +5,9 @@ This is the highest-frequency sampler (default 1 s).  It reads:
 * ``psutil.cpu_percent(percpu=True)`` — overall average and per-core maximum
 * ``psutil.virtual_memory()`` and ``psutil.swap_memory()`` — memory and swap;
   swap_in / swap_out are recorded as *deltas* (bytes since the last collect)
-* ``psutil.disk_io_counters()`` — read/write bytes of the physical disks as
-  deltas; LVM, dm-crypt, md and loop devices are not added to the disk below
+* ``psutil.disk_io_counters(perdisk=True)`` — read/write bytes as deltas, per
+  device and then added up; partitions and LVM, dm-crypt, md and loop devices
+  are not added to the disk they sit on
 * ``/proc/loadavg`` — load average (direct read, not psutil)
 * ``/proc/pressure/cpu|memory|io`` — PSI stall values (direct read)
 
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Container, Dict, List, Optional, Tuple
 
 import psutil
 
@@ -36,7 +37,7 @@ from ..core.sampler import (
 )
 from ..core.util import CounterDelta
 from ..storage import make_row
-from .blockdev import is_stacked
+from .blockdev import is_partition, is_stacked
 
 # ---------------------------------------------------------------------------
 # PSI parser — pure function, tested directly
@@ -113,25 +114,17 @@ def parse_psi(text: str, *, keys: "frozenset[str] | None" = None) -> Dict[str, f
 # ---------------------------------------------------------------------------
 
 
-def _disk_io_totals(sys_root: Path) -> Optional[Tuple[int, int]]:
-    """Cumulative ``(read_bytes, write_bytes)`` of the disks no other device sits on.
+def _counts_disk_io(name: str, per_disk: Container[str], sys_root: Path) -> bool:
+    """Whether the device *name* of psutil's per-disk listing adds to the host's I/O.
 
-    A logical volume, dm-crypt or md device and the disk below it both report
-    the same I/O, and so does a loop device and the disk under its file.  Only
-    whole devices that are not stacked on others are summed.  Without the
-    block-device tree the stacking is unknown and psutil's own total is used.
+    A disk's counters include its partitions, and a logical volume, dm-crypt or
+    md device, or a loop device, repeats the I/O of the device below it.  A
+    device that /sys/block does not describe counts as not stacked: a disk is
+    not dropped because its sysfs entry is missing or unreadable.
     """
-    block = sys_root / "block"
-    if not block.is_dir():
-        total = psutil.disk_io_counters()
-        return None if total is None else (total.read_bytes, total.write_bytes)
-    per_disk = psutil.disk_io_counters(perdisk=True) or {}
-    disks = [
-        c
-        for name, c in per_disk.items()
-        if (block / name).is_dir() and not is_stacked(block / name)
-    ]
-    return sum(c.read_bytes for c in disks), sum(c.write_bytes for c in disks)
+    return not is_partition(name, per_disk) and not is_stacked(
+        sys_root / "block" / name
+    )
 
 
 @register_sampler
@@ -280,16 +273,34 @@ class SystemSampler(Sampler):
     def _disk_io_deltas(self, sys_root: Path) -> Tuple[int, int]:
         """Return ``(read_bytes_delta, write_bytes_delta)`` since the last call.
 
-        Returns ``(0, 0)`` on the first call or if counters are unavailable.
+        Each device is differenced on its own and only then added up, so a
+        device that starts or stops counting (a loop device attached or
+        detached, a sysfs entry unreadable for a moment) is not I/O.  Returns
+        ``(0, 0)`` on the first call or if counters are unavailable.  An empty
+        listing is no counters: it leaves the baselines in place, so the disks
+        that come back are not counted from 0.
         """
         try:
-            totals = _disk_io_totals(sys_root)
+            per_disk = psutil.disk_io_counters(perdisk=True)
         except (AttributeError, OSError):
             return 0, 0
-        if totals is None:
+        if not per_disk:
             return 0, 0
-        raw_read, raw_write = totals
-        return self._delta("disk_read", raw_read), self._delta("disk_write", raw_write)
+        read = self._deltas.update_each(
+            "disk_read", {n: c.read_bytes for n, c in per_disk.items()}
+        )
+        write = self._deltas.update_each(
+            "disk_write", {n: c.write_bytes for n, c in per_disk.items()}
+        )
+        if read is None or write is None:
+            return 0, 0
+        # Only a device that did I/O is worth a look at sysfs.
+        counted = [
+            n
+            for n in per_disk
+            if (read[n] or write[n]) and _counts_disk_io(n, per_disk, sys_root)
+        ]
+        return sum(read[n] for n in counted), sum(write[n] for n in counted)
 
     @classmethod
     def _read_pressure(cls, pressure_dir: Path) -> Dict[str, Optional[float]]:

@@ -19,7 +19,9 @@ Design choices:
   first collect after start (or after a new unit appears) skips those columns
   (``None``) because there is no baseline to diff against.
 * ``io.stat`` lists the disk and every LVM / dm-crypt / md device on it, each
-  with the same I/O; only devices no other device sits on are summed.
+  with the same I/O.  Each device is differenced on its own and the deltas are
+  summed, leaving out a stacked device only when the device below it is in the
+  same ``io.stat``.
 * Any single file read failure (permission error, missing file) degrades only
   that column to ``None`` — the rest of the row is still emitted.  This is the
   "partial demotion" strategy described in design §2.1.
@@ -39,7 +41,7 @@ from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..core.util import CounterDelta
 from ..storage import make_row
-from .blockdev import is_stacked
+from .blockdev import counted_devices
 
 # How long to cache the unit enumeration result (seconds).
 _ENUM_CACHE_TTL = 300.0
@@ -65,39 +67,33 @@ def _parse_cpu_stat(path: Path) -> Optional[int]:
         return None
 
 
-def _parse_io_stat(
-    path: Path, counted: Callable[[str], bool]
-) -> tuple[Optional[int], Optional[int]]:
-    """Return ``(rbytes_total, wbytes_total)`` aggregated across the counted devices.
+def _parse_io_stat(path: Path) -> Optional[dict[str, tuple[int, int]]]:
+    """Return ``{major:minor: (rbytes, wbytes)}`` of every device in an ``io.stat``.
 
     Each line of ``io.stat`` has the form::
 
         8:0 rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N
 
-    A device for which ``counted("8:0")`` is false (LVM and the like, whose I/O
-    the disk below reports again) is left out.
-
-    Returns ``(None, None)`` if the file is absent or unreadable.
+    Returns ``None`` if the file is absent or unreadable.
     """
     try:
         text = path.read_text()
-        rbytes = 0
-        wbytes = 0
+        devices: dict[str, tuple[int, int]] = {}
         for line in text.splitlines():
             parts = line.split()
             if len(parts) < 2:
                 continue
             # parts[0] is the device major:minor; the rest are key=value pairs.
-            if not counted(parts[0]):
-                continue
+            rbytes = wbytes = 0
             for kv in parts[1:]:
                 if kv.startswith("rbytes="):
                     rbytes += int(kv[7:])
                 elif kv.startswith("wbytes="):
                     wbytes += int(kv[7:])
-        return rbytes, wbytes
+            devices[parts[0]] = (rbytes, wbytes)
+        return devices
     except Exception:
-        return None, None
+        return None
 
 
 @register_sampler
@@ -189,16 +185,12 @@ class CgroupSampler(Sampler):
 
         ts = time.time()
         rows: list[tuple] = []
-        stacked: dict[str, bool] = {}
-
-        def counted(device: str) -> bool:
-            if device not in stacked:
-                stacked[device] = is_stacked(ctx.sys_root / "dev" / "block" / device)
-            return not stacked[device]
 
         for unit_path in self._units:
             unit_dir = ctx.cgroup_root / unit_path
-            rb_raw, wb_raw = _parse_io_stat(unit_dir / "io.stat", counted)
+            io_rbytes_delta, io_wbytes_delta = self._io_deltas(
+                unit_path, _parse_io_stat(unit_dir / "io.stat"), ctx.sys_root
+            )
 
             # Rows are emitted even when the delta columns are still None (first
             # tick for a unit) so that memory/pids are captured from the start.
@@ -212,13 +204,39 @@ class CgroupSampler(Sampler):
                     ),
                     mem_current=_read_int(unit_dir / "memory.current"),
                     mem_swap=_read_int(unit_dir / "memory.swap.current"),
-                    io_rbytes_delta=self._delta(unit_path, "io_r", rb_raw),
-                    io_wbytes_delta=self._delta(unit_path, "io_w", wb_raw),
+                    io_rbytes_delta=io_rbytes_delta,
+                    io_wbytes_delta=io_wbytes_delta,
                     pids=_read_int(unit_dir / "pids.current"),
                 )
             )
 
         return [SampleBatch(table="cg_samples", rows=rows)]
+
+    def _io_deltas(
+        self,
+        unit_path: str,
+        devices: Optional[dict[str, tuple[int, int]]],
+        sys_root: Path,
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Bytes read and written since the last tick, over the devices that count.
+
+        Each device is differenced on its own and only then added up, so a
+        device that starts or stops counting (a loop device detached) is not
+        I/O.  ``(None, None)`` when ``io.stat`` is unreadable or on the unit's
+        first tick; an unreadable tick leaves the baseline in place.
+        """
+        if devices is None:
+            return None, None
+        read = self._deltas.update_each(
+            (unit_path, "io_r"), {dev: r for dev, (r, _) in devices.items()}
+        )
+        write = self._deltas.update_each(
+            (unit_path, "io_w"), {dev: w for dev, (_, w) in devices.items()}
+        )
+        if read is None or write is None:
+            return None, None
+        counted = counted_devices(devices, sys_root)
+        return sum(read[d] for d in counted), sum(write[d] for d in counted)
 
     def _delta(self, unit_path: str, counter: str, raw: Optional[int]) -> Optional[int]:
         """Per-tick delta of one cumulative counter; None when unreadable/first.

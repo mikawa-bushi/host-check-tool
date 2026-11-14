@@ -160,8 +160,8 @@ def test_sampler_run_catches_exception_and_returns_empty():
     ctx = _make_ctx()
     result = sampler.run(ctx)
     assert result == []
-    assert any("_broken_test_sampler" in note for note in ctx.notes)
-    assert any("collect失敗" in note for note in ctx.notes)
+    assert any("_broken_test_sampler" in note.text for note in ctx.notes)
+    assert any("collect失敗" in note.text for note in ctx.notes)
 
 
 def test_sampler_run_returns_batches_on_success():
@@ -397,3 +397,28 @@ def test_counter_delta_clamps_counter_reset_to_zero():
     d.update(("unit", "cpu"), 10_000)
     assert d.update(("unit", "cpu"), 20) == 0  # unit restarted: counter reset
     assert d.update(("unit", "cpu"), 50) == 30  # resumes from the new baseline
+
+
+def test_counter_delta_each_name_is_differenced_against_its_own_value():
+    from procdiag.core.util import CounterDelta
+
+    d = CounterDelta()
+    assert d.update_each("disks", {"sda": 100, "loop0": 7}) is None
+    assert d.update_each("disks", {"sda": 150, "loop0": 7}) == {"sda": 50, "loop0": 0}
+    assert d.update_each("other", {"sda": 1}) is None  # keys are independent
+
+
+def test_counter_delta_each_a_name_that_comes_and_goes_does_not_move_the_others():
+    from procdiag.core.util import CounterDelta
+
+    d = CounterDelta()
+    d.update_each("disks", {"sda": 100, "loop0": 7_000})
+    assert d.update_each("disks", {"sda": 110}) == {"sda": 10}  # loop0 went away
+    assert d.update_each("disks", {"sda": 120, "loop0": 7_050}) == {
+        "sda": 10,
+        "loop0": 7_050,  # a new device's counter starts from 0
+    }
+    assert d.update_each("disks", {"sda": 5, "loop0": 7_060}) == {
+        "sda": 0,  # counter reset
+        "loop0": 10,
+    }

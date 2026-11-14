@@ -547,10 +547,10 @@ class TestUnmeasuredQuality:
 
 SJIS_NAME = "測定_tool".encode("shift_jis").decode("utf-8", "surrogateescape")
 SJIS_ESCAPED = "".join(rf"\x{b:02x}" for b in "測定".encode("shift_jis"))
-SJIS_MOUNT = "/mnt/" + "共有".encode("shift_jis").decode("utf-8", "surrogateescape")
+SJIS_DIR = "共有".encode("shift_jis").decode("utf-8", "surrogateescape")
 
 
-def _fake_hosts(monkeypatch) -> None:
+def _fake_hosts(monkeypatch, tmp_path) -> None:
     class _Proc:
         def __init__(self, pid, name, cpu):
             self.info = {
@@ -569,8 +569,10 @@ def _fake_hosts(monkeypatch) -> None:
         "process_iter",
         lambda attrs=None: [_Proc(1, SJIS_NAME, 90.0), _Proc(2, "ok", 1.0)],
     )
+    mount = tmp_path / SJIS_DIR
+    mount.mkdir()
     part = SimpleNamespace(
-        device="/dev/sdb1", mountpoint=SJIS_MOUNT, fstype="ext4", opts="rw"
+        device="/dev/sdb1", mountpoint=str(mount), fstype="ext4", opts="rw"
     )
     monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: [part])
     monkeypatch.setattr(
@@ -584,8 +586,8 @@ def _fake_hosts(monkeypatch) -> None:
 
 
 class TestSnapshotNonUtf8:
-    def test_items_hold_text_that_can_be_encoded(self, monkeypatch):
-        _fake_hosts(monkeypatch)
+    def test_items_hold_text_that_can_be_encoded(self, monkeypatch, tmp_path):
+        _fake_hosts(monkeypatch, tmp_path)
         items = snap.run_snapshot(ProcdiagConfig(), sample_sec=0)
         text = snap.render_text(items, hostname="h", color=False, ascii_only=False)
         text.encode("utf-8")
@@ -609,7 +611,7 @@ class TestSnapshotNonUtf8:
     @pytest.mark.parametrize("args", [[], ["--format", "json"]])
     def test_snapshot_command_does_not_crash(self, monkeypatch, tmp_path, args):
         monkeypatch.chdir(tmp_path)
-        _fake_hosts(monkeypatch)
+        _fake_hosts(monkeypatch, tmp_path)
         result = _invoke("snapshot", *args)
         assert result.exit_code == 1, result.output
         assert not isinstance(result.exception, UnicodeError)
