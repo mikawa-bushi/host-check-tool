@@ -534,6 +534,12 @@ class Engine:
                 f"io_counters 欠損率 {missing_io_pct:.0%} — "
                 "非 root 実行のため他ユーザープロセスの I/O が読めません"
             )
+        notes.extend(
+            r["detail"]
+            for r in store.rows(
+                "ops_events", since=since, until=until, where="kind = 'data_lost'"
+            )
+        )
 
         return ObservationQuality(
             span_hours=span_hours,

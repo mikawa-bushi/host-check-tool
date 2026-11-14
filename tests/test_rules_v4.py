@@ -935,7 +935,7 @@ class TestExactZombiesAndFdLimits:
             fds_slope=10,
         )
         store.set_proc_fd_limits(proc_id, 400, 800)
-        store.conn.commit()
+        store.flush()
         diag = Engine(ProcdiagConfig(rules=RulesConfig(min_observation_hours=6))).run(
             store, only=["FD-LEAK-01"]
         )
