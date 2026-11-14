@@ -13,14 +13,17 @@ process accumulation.
 - **ZOMBIE-01**: Detect zombie process accumulation by fitting a trend to the
   per-scan zombie count in ``proc_counts`` (schema v4, from the real process
   state).  DBs recorded before v4 fall back to approximating zombies as
-  ``proc_samples`` rows with ``cpu_pct=0``, ``rss=0`` and ``num_threads=0``,
-  reported at ``confidence=LOW``.
+  ``proc_samples`` rows with ``cpu_pct=0``, ``rss=0`` and at most one thread
+  (what a zombie reads as; kernel threads read the same), reported at
+  ``confidence=LOW``.
 
 Design doc reference: §6.2 FD-LEAK-01 / THREAD-LEAK-01 / ZOMBIE-01.
 """
 
 from __future__ import annotations
 
+import socket
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from ..core import (
@@ -64,9 +67,13 @@ _THREAD_LEAK_MIN_R2: float = 0.9
 _FD_SOFT_LIMIT_DEFAULT: int = 1024
 _FD_HARD_LIMIT_DEFAULT: int = 4096
 
-# Approximate system threads-max used when /proc/sys/kernel/threads-max
-# is unavailable.
-_THREADS_MAX_DEFAULT: int = 32768
+# System-wide thread limit.  It is not recorded, so it is only read when the
+# check runs on the host that made the recording.
+_THREADS_MAX_PATH = Path("/proc/sys/kernel/threads-max")
+
+# ZOMBIE-01 fires only on a real accumulation: a clear upward line, not a blip.
+_ZOMBIE_SLOPE_WARNING_H: float = 0.5
+_ZOMBIE_MIN_R2: float = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +179,20 @@ class FdLeakRule(MeasuredRule):
 # ---------------------------------------------------------------------------
 
 
+def _host_threads_max(store: "Storage") -> Optional[int]:
+    """This host's ``threads-max``, or None when it is not known.
+
+    The limit is not part of the recording, so it is read at check time and
+    only when the recording was made on this host (``meta.hostname``).
+    """
+    if store.meta().get("hostname") != socket.gethostname():
+        return None
+    try:
+        return int(_THREADS_MAX_PATH.read_text().strip()) or None
+    except (OSError, ValueError):
+        return None
+
+
 @register
 class ThreadLeakRule(MeasuredRule):
     """Detect per-process thread leaks via linear regression on threads_max rollups.
@@ -224,7 +245,10 @@ class ThreadLeakRule(MeasuredRule):
         )
 
         current_threads = obs.evidence["last_value"]
-        days_to_thread_max = days_until(current_threads, _THREADS_MAX_DEFAULT, slope_h)
+        thread_max = _host_threads_max(store)
+        days_to_thread_max = (
+            days_until(current_threads, thread_max, slope_h) if thread_max else None
+        )
 
         evidence = {
             "proc_id": obs.evidence["proc_id"],
@@ -235,7 +259,8 @@ class ThreadLeakRule(MeasuredRule):
             "span_hours": fit.span_hours,
             "current_threads": current_threads,
             "days_to_thread_max": days_to_thread_max,
-            "thread_max_estimate": _THREADS_MAX_DEFAULT,
+            "thread_max_estimate": thread_max,
+            "thread_max_source": "this_host" if thread_max else "unknown",
         }
 
         summary = (
@@ -264,11 +289,14 @@ class ZombieRule(MeasuredRule):
     """Detect accumulating zombie processes from the per-scan zombie count.
 
     The process sampler records the number of processes in the zombie state on
-    every scan (``proc_counts``); a linear trend is fitted to that series and a
-    positive slope fires INFO (confidence MEDIUM — the counts are exact, the
-    trend is a regression).  For DBs recorded before schema v4 the count is
-    approximated as rows with ``cpu_pct=0``, ``rss=0`` and ``num_threads=0``,
-    and the finding is marked ``confidence=LOW`` / ``method="approx"``.
+    every scan (``proc_counts``); a linear trend is fitted to that series and
+    INFO fires when the line rises by ``slope_warning_h`` per hour with
+    ``R² >= min_r2`` and zombies are still present at the end of the window
+    (confidence MEDIUM — the counts are exact, the trend is a regression).  A
+    blip of one or two zombies in one scan is not a trend.  For DBs recorded
+    before schema v4 the count is approximated as rows with ``cpu_pct=0``,
+    ``rss=0`` and at most one thread, and the finding is marked
+    ``confidence=LOW`` / ``method="approx"``.
     """
 
     rule_id = "ZOMBIE-01"
@@ -280,19 +308,21 @@ class ZombieRule(MeasuredRule):
     headline = Headline("ゾンビ増加率", "/h", threshold="slope_warning_h", digits=2)
     what = (
         "プロセス走査ごとのゾンビ数 (proc_counts) を時系列化し、"
-        "増加傾向を線形回帰で検出する"
+        "増加傾向を線形回帰で検出する。傾きと R² が足りない一瞬のゾンビや、"
+        "すでに回収されたゾンビは増加とみなさない"
     )
     why = (
         "ゾンビプロセスは親が wait() を呼ばないことで蓄積し、PID の枠を占有する。"
-        "旧形式の DB では cpu_pct/rss/num_threads=0 の組み合わせで近似する"
+        "旧形式の DB では cpu_pct=0・rss=0・スレッド数 1 以下の組み合わせで近似する"
     )
     manual_commands = [
         "ps aux | grep ' Z '",
         "ps -o ppid= -p <ZOMBIE_PID>",
     ]
 
-    # Minimum slope (zombies/h) to emit INFO.
-    slope_warning_h: float = 0.0
+    # Minimum slope (zombies/h) and R² to emit INFO.
+    slope_warning_h: float = _ZOMBIE_SLOPE_WARNING_H
+    min_r2: float = _ZOMBIE_MIN_R2
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         series = self._counted_series(store, window)
@@ -326,11 +356,13 @@ class ZombieRule(MeasuredRule):
     ) -> Optional[Finding]:
         fit = observed_fit(obs)
         slope_h = obs.value
-        if slope_h <= self.slope_warning_h:
+        if fit.r2 < self.min_r2 or slope_h < self.slope_warning_h:
             return None
 
         exact = obs.evidence["method"] == "status"
         current = obs.evidence["last_value"]
+        if exact and current < 1:
+            return None
         if exact:
             summary = (
                 f"ゾンビプロセス数が +{slope_h:.2f}/h の傾向で増加中"
@@ -374,9 +406,11 @@ class ZombieRule(MeasuredRule):
     @staticmethod
     def _approx_series(store: "Storage", window: Window) -> list[tuple[float, float]]:
         """Pre-v4 fallback: count rows that look like zombies per scan."""
-        # Query proc_samples for zombie approximation:
-        # rows with cpu_pct=0 (or NULL), rss=0 (or NULL), num_threads=0 (or NULL).
-        # We aggregate per distinct timestamp.
+        # Query proc_samples for zombie approximation: psutil reads a zombie as
+        # cpu_pct=0, rss=0 and one thread, so rows with cpu_pct=0 (or NULL),
+        # rss=0 (or NULL) and num_threads<=1 (or NULL).  Kernel threads read the
+        # same, which only shifts the level, not the trend.  Aggregated per
+        # distinct timestamp.
         try:
             rows = store.conn.execute(
                 """
@@ -386,7 +420,7 @@ class ZombieRule(MeasuredRule):
                 WHERE ts >= ? AND ts <= ?
                   AND (cpu_pct = 0 OR cpu_pct IS NULL)
                   AND (rss = 0 OR rss IS NULL)
-                  AND (num_threads = 0 OR num_threads IS NULL)
+                  AND (num_threads <= 1 OR num_threads IS NULL)
                 GROUP BY ts
                 ORDER BY ts
                 """,

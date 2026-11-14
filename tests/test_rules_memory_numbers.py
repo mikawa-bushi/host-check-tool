@@ -335,8 +335,11 @@ class TestSwapThrashNumbers:
         assert f.evidence["swap_in_total_bytes"] == 4 * _PAGE
         assert f.evidence["swap_out_total_bytes"] == 4 * _PAGE
         assert "swap_in_total_pages" not in f.evidence
-        assert "ページ" not in f.proposal
-        assert humanize_bytes(4 * _PAGE) in f.proposal
+        (basis,) = [
+            line for line in f.proposal.splitlines() if line.startswith("[根拠]")
+        ]
+        assert "ページ" not in basis
+        assert humanize_bytes(4 * _PAGE) in basis
         store.close()
 
     def test_isolated_events_far_apart_are_separate_episodes(self, tmp_path):

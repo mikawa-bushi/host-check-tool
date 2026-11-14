@@ -8,21 +8,22 @@ Currently implements:
   exceeds the critical threshold.  Confidence is derived from R² and
   observation time.
 
-- **MEM-PRESSURE-01**: Detect chronic memory pressure by checking whether
-  ``psi_mem_max`` in ``sys_rollup_1m`` exceeds a threshold on multiple days
-  (using ``trend.detect_recurrence``) and swap-out activity is present.
-  Fires WARNING.
+- **MEM-PRESSURE-01**: Detect chronic memory pressure: ``psi_mem_max`` in
+  ``sys_rollup_1m`` stays above a threshold for a sustained time, with swap-out
+  at the same time, on most local days that were observed long enough
+  (using ``trend.detect_recurrence``).  Fires WARNING.
 
 - **SWAP-THRASH-01**: Detect simultaneous swap-in and swap-out in the same
   time window combined with ``psi_mem_full10 > 0``, indicating that the kernel
-  is thrashing pages.  Fires CRITICAL.
+  is thrashing pages.  Isolated events far apart are separate episodes.
+  Fires CRITICAL.
 
 Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 from ..core import (
@@ -37,10 +38,10 @@ from ..core import (
     Window,
     register,
 )
+from ..core.util import humanize_bytes
 from .trend import (
     baseline_deviation,
     confidence_from_fit,
-    days_until,
     detect_recurrence,
     fit_each,
     fit_linear,
@@ -181,15 +182,13 @@ class MemLeakRule(MeasuredRule):
             fit, min_observation_hours=self.min_observation_hours
         )
 
-        # Total memory for the (very rough) days-to-OOM extrapolation, from the
-        # last sys_sample of the window.
-        total_mem = None
+        # Days until this process alone eats the memory that is still available
+        # at the end of the window (MemAvailable of the last sys_sample).
         sys_rows = store.rows("sys_samples", since=window.start_ts, until=window.end_ts)
-        if sys_rows and sys_rows[-1]["mem_available"] is not None:
-            total_mem = sys_rows[-1]["mem_used"] + sys_rows[-1]["mem_available"]
+        mem_available = sys_rows[-1]["mem_available"] if sys_rows else None
         days_to_oom = (
-            days_until(obs.evidence["last_value"], total_mem, MiB * slope_mb_h)
-            if total_mem
+            max(mem_available, 0) / (MiB * slope_mb_h * 24.0)
+            if mem_available is not None and slope_mb_h > 0
             else None
         )
 
@@ -202,6 +201,9 @@ class MemLeakRule(MeasuredRule):
             "span_hours": fit.span_hours,
             "is_python": _is_python_process(process_name),
             "days_to_oom": days_to_oom,
+            "mem_available_mb": (
+                None if mem_available is None else round(mem_available / MiB, 1)
+            ),
         }
 
         confidence = self._apply_pss_evidence(
@@ -279,18 +281,32 @@ class MemLeakRule(MeasuredRule):
 # Thresholds for MEM-PRESSURE-01
 # ---------------------------------------------------------------------------
 
-_MEM_PRESSURE_PSI_THRESHOLD: float = 5.0  # psi_mem_max > this value triggers
-_MEM_PRESSURE_MIN_RECURRENCE: float = 0.5  # fraction of days with pressure
+_MEM_PRESSURE_PSI_THRESHOLD: float = (
+    5.0  # psi_mem_max > this value is a pressure minute
+)
+# A local day counts as observed only when it has this many hours of PSI rows,
+# so the slivers at the edges of a recording are not days.
+_MEM_PRESSURE_MIN_DAY_HOURS: float = 6.0
+# Pressure minutes on one day for it to be a pressure day (a blip is not).
+_MEM_PRESSURE_MIN_MINUTES: int = 10
+# Swap-out within a minute of those pressure minutes (a stray page is not).
+_MEM_PRESSURE_MIN_SWAP_OUT: int = MiB
+# Pressure days needed, and the share of the observed days they must be.
+_MEM_PRESSURE_MIN_DAYS: int = 2
+_MEM_PRESSURE_MIN_RECURRENCE: float = 0.6
 
 
 @register
 class MemPressureRule(Rule):
     """Detect chronically recurring memory pressure with swap activity.
 
-    Queries ``sys_rollup_1m`` for rows where ``psi_mem_max`` exceeds the
-    threshold, groups them by calendar day to compute a recurrence fraction
-    via ``trend.detect_recurrence``, and fires WARNING when pressure recurs on
-    at least half the observed days *and* total swap-out is positive.
+    Queries ``sys_rollup_1m`` and groups the rows by the host's local calendar
+    day.  A day is *observed* with at least ``min_day_observed_hours`` of PSI
+    rows, and a *pressure day* when ``psi_mem_max`` exceeds the threshold for at
+    least ``min_pressure_minutes`` minutes and ``min_swap_out_bytes`` were
+    swapped out within a minute of those minutes.  Fires WARNING when at least
+    ``min_pressure_days`` days are pressure days and they are at least
+    ``min_recurrence_fraction`` of the observed days.
 
     PSI columns absent from the DB (all None) → silent (no finding).
     """
@@ -302,12 +318,14 @@ class MemPressureRule(Rule):
     min_observation_hours = 24.0
     requires_rows = ("sys_rollup_1m",)
     what = (
-        "sys_rollup_1m の psi_mem_max が閾値超の時間帯が日次で反復するかを"
-        "detect_recurrence で確認し、swap_out_sum > 0 も合わせて判定する"
+        "sys_rollup_1m の psi_mem_max が閾値超の分が 1 日に一定時間以上続き、"
+        "その前後の swap_out_sum も一定量以上ある日が、観測が十分なローカル日の"
+        "過半数で反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
-        "顕在化する。swap_out の存在がページアウト圧力の物的証拠となる"
+        "顕在化する。圧迫中の swap_out がページアウト圧力の物的証拠となる。"
+        "一瞬の圧迫や無関係なスワップでは判定しない"
     )
     manual_commands = [
         "free -h",
@@ -318,6 +336,10 @@ class MemPressureRule(Rule):
 
     psi_threshold: float = _MEM_PRESSURE_PSI_THRESHOLD
     min_recurrence_fraction: float = _MEM_PRESSURE_MIN_RECURRENCE
+    min_day_observed_hours: float = _MEM_PRESSURE_MIN_DAY_HOURS
+    min_pressure_minutes: int = _MEM_PRESSURE_MIN_MINUTES
+    min_swap_out_bytes: int = _MEM_PRESSURE_MIN_SWAP_OUT
+    min_pressure_days: int = _MEM_PRESSURE_MIN_DAYS
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run MEM-PRESSURE-01 against the observation window."""
@@ -334,36 +356,50 @@ class MemPressureRule(Rule):
         if all_psi_none:
             return []
 
-        # Build per-day boolean map: did this day have any psi_mem_max > threshold?
-        events_by_day: dict[str, bool] = {}
-        pressure_timestamps: list[float] = []
-        total_swap_out: int = 0
-
+        observed_minutes: dict[str, int] = {}
+        pressure_buckets: dict[str, set[int]] = {}
+        swap_out_by_bucket: dict[int, int] = {}
         for row in rollup_rows:
             ts = row["ts_min"]
+            bucket = int(ts // 60)
+            swap_out_by_bucket[bucket] = swap_out_by_bucket.get(bucket, 0) + (
+                row["swap_out_sum"] or 0
+            )
             psi = row["psi_mem_max"]
-            swap_out = row["swap_out_sum"] or 0
-            total_swap_out += swap_out
+            if psi is None:
+                continue
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            observed_minutes[day] = observed_minutes.get(day, 0) + 1
+            if psi > self.psi_threshold:
+                pressure_buckets.setdefault(day, set()).add(bucket)
 
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            day_key = dt.strftime("%Y-%m-%d")
-            # Mark day as having had pressure if not already True.
-            if psi is not None and psi > self.psi_threshold:
-                events_by_day[day_key] = True
-                pressure_timestamps.append(ts)
-            else:
-                events_by_day.setdefault(day_key, False)
+        pressure_minutes: dict[str, int] = {}
+        pressure_swap_out: dict[str, int] = {}
+        events_by_day: dict[str, bool] = {}
+        for day, minutes in observed_minutes.items():
+            if minutes < self.min_day_observed_hours * 60:
+                continue
+            buckets = pressure_buckets.get(day, set())
+            near = {b + d for b in buckets for d in (-1, 0, 1)}
+            swap_out = sum(swap_out_by_bucket.get(b, 0) for b in near)
+            events_by_day[day] = (
+                len(buckets) >= self.min_pressure_minutes
+                and swap_out >= self.min_swap_out_bytes
+            )
+            pressure_minutes[day] = len(buckets)
+            pressure_swap_out[day] = swap_out
 
-        # Need swap activity alongside pressure.
-        if total_swap_out <= 0:
-            return []
-
-        recurrence = detect_recurrence(events_by_day)
         n_days = len(events_by_day)
-        n_pressure_days = sum(1 for v in events_by_day.values() if v)
-
+        pressure_days = sorted(d for d, hit in events_by_day.items() if hit)
+        n_pressure_days = len(pressure_days)
+        if n_days < self.min_pressure_days or n_pressure_days < self.min_pressure_days:
+            return []
+        recurrence = detect_recurrence(events_by_day)
         if recurrence < self.min_recurrence_fraction:
             return []
+
+        total_swap_out = sum(pressure_swap_out[d] for d in pressure_days)
+        total_pressure_minutes = sum(pressure_minutes[d] for d in pressure_days)
 
         # Compute representative peak PSI for the summary.
         peak_psi = max(
@@ -377,8 +413,12 @@ class MemPressureRule(Rule):
             "recurrence_fraction": round(recurrence, 2),
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
+            "pressure_days": pressure_days,
             "swap_out_total_bytes": total_swap_out,
-            "pressure_event_count": len(pressure_timestamps),
+            "pressure_event_count": total_pressure_minutes,
+            "min_pressure_minutes": self.min_pressure_minutes,
+            "min_swap_out_bytes": self.min_swap_out_bytes,
+            "min_day_observed_hours": self.min_day_observed_hours,
         }
 
         # Annotate the peak against this host's own usual level for the same
@@ -399,8 +439,8 @@ class MemPressureRule(Rule):
 
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"
-            f"{n_pressure_days}/{n_days} 日で反復"
-            f" (swap_out={total_swap_out // MiB} MB)"
+            f" {self.min_pressure_minutes}分以上続く日が {n_pressure_days}/{n_days} 日で反復"
+            f" (圧迫中のスワップアウト {humanize_bytes(total_swap_out)})"
         )
 
         confidence = (
@@ -426,6 +466,8 @@ class MemPressureRule(Rule):
 
 _SWAP_THRASH_MIN_SWAP_IN: int = 1  # any swap-in activity
 _SWAP_THRASH_MIN_SWAP_OUT: int = 1  # any swap-out activity
+# Thrash samples further apart than this belong to different episodes.
+_SWAP_THRASH_EPISODE_GAP_SECONDS: float = 300.0
 
 
 @register
@@ -488,27 +530,40 @@ class SwapThrashRule(Rule):
         if not thrash_rows:
             return []
 
-        # Aggregate evidence.
+        # swap_in / swap_out are byte counts (psutil swap_memory sin/sout deltas).
         total_swap_in = sum(r["swap_in"] or 0 for r in thrash_rows)
         total_swap_out = sum(r["swap_out"] or 0 for r in thrash_rows)
         peak_psi_full = max(r["psi_mem_full10"] or 0.0 for r in thrash_rows)
         thrash_start = min(r["ts"] for r in thrash_rows)
         thrash_end = max(r["ts"] for r in thrash_rows)
-        duration_minutes = max(1, round((thrash_end - thrash_start) / 60.0) + 1)
+
+        episode_minutes: list[int] = []
+        first = prev = thrash_rows[0]["ts"]
+        for row in thrash_rows[1:]:
+            if row["ts"] - prev > _SWAP_THRASH_EPISODE_GAP_SECONDS:
+                episode_minutes.append(max(1, round((prev - first) / 60.0) + 1))
+                first = row["ts"]
+            prev = row["ts"]
+        episode_minutes.append(max(1, round((prev - first) / 60.0) + 1))
+        duration_minutes = sum(episode_minutes)
+        episode_count = len(episode_minutes)
 
         evidence = {
             "thrash_event_count": len(thrash_rows),
-            "swap_in_total_pages": total_swap_in,
-            "swap_out_total_pages": total_swap_out,
+            "swap_in_total_bytes": total_swap_in,
+            "swap_out_total_bytes": total_swap_out,
             "peak_psi_mem_full10": round(peak_psi_full, 2),
             "period_start": thrash_start,
             "period_end": thrash_end,
+            "episode_count": episode_count,
+            "longest_episode_minutes": max(episode_minutes),
             "duration_minutes": duration_minutes,
         }
 
         summary = (
             f"スワップスラッシング: {len(thrash_rows)} サンプルで swap_in/out 同時発生"
-            f" (psi_mem_full10 最大 {peak_psi_full:.1f}%、{duration_minutes}分間)"
+            f" ({episode_count}回、合計{duration_minutes}分間、"
+            f"psi_mem_full10 最大 {peak_psi_full:.1f}%)"
         )
 
         return [

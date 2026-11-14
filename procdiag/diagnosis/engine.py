@@ -47,6 +47,7 @@ from ..core import (
     covers,
     rule_id_problems,
 )
+from ..core.util import humanize_bytes
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
@@ -85,11 +86,13 @@ _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 def _make_jinja_env() -> Environment:
     """Return a Jinja2 environment backed by the templates/ directory."""
-    return Environment(
+    env = Environment(
         loader=FileSystemLoader(str(_TEMPLATE_DIR)),
         autoescape=False,
         keep_trailing_newline=True,
     )
+    env.filters["humanize_bytes"] = humanize_bytes
+    return env
 
 
 # Leading "<delay>s" token in a gap event's detail (see recorder._on_gap).
