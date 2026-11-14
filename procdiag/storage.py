@@ -42,7 +42,7 @@ from .core.util import MiB, parse_duration, storable_text
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _Migration = Union[str, Callable[[sqlite3.Connection], None]]
 
@@ -69,6 +69,41 @@ def _add_column(
     return step
 
 
+# One row per minute and process.  ``pid`` keeps the processes of one program
+# (same name and command line) apart: workers running side by side, or the
+# process before and after a restart.  Rows rolled up before schema 5 have
+# ``pid`` NULL and stand for every process of the program at that minute.
+_PROC_ROLLUP_1M = """(
+  ts_min REAL, proc_id INTEGER,
+  cpu_avg REAL, cpu_max REAL,
+  rss_avg INTEGER, rss_max INTEGER,
+  fds_max INTEGER, threads_max INTEGER,
+  pid INTEGER,
+  PRIMARY KEY (ts_min, proc_id, pid)
+)"""
+
+
+def _rebuild_proc_rollup_with_pid(conn: sqlite3.Connection) -> None:
+    """Give ``proc_rollup_1m`` its ``pid`` column, keeping every rolled-up row.
+
+    The primary key changes, which SQLite can only do by copying the table.
+    The copy runs in a savepoint, so a crash leaves the old table whole and
+    the next open copies again.
+    """
+    if "pid" in _table_columns(conn, "proc_rollup_1m"):
+        return
+    cols = "ts_min, proc_id, cpu_avg, cpu_max, rss_avg, rss_max, fds_max, threads_max"
+    conn.execute("SAVEPOINT proc_rollup_pid")
+    conn.execute("DROP TABLE IF EXISTS proc_rollup_1m_v5")
+    conn.execute(f"CREATE TABLE proc_rollup_1m_v5 {_PROC_ROLLUP_1M}")
+    conn.execute(
+        f"INSERT INTO proc_rollup_1m_v5 ({cols}) SELECT {cols} FROM proc_rollup_1m"
+    )
+    conn.execute("DROP TABLE proc_rollup_1m")
+    conn.execute("ALTER TABLE proc_rollup_1m_v5 RENAME TO proc_rollup_1m")
+    conn.execute("RELEASE proc_rollup_pid")
+
+
 # Forward migrations keyed by the schema version they produce.  Each value is a
 # list of idempotent steps (SQL text or a callable taking the connection) that
 # upgrade a DB from (version - 1) to version, applied in order on the write
@@ -92,7 +127,20 @@ _MIGRATIONS: Dict[int, List[_Migration]] = {
         _add_column("proc_registry", "fd_soft_limit", "INTEGER"),
         _add_column("proc_registry", "fd_hard_limit", "INTEGER"),
     ],
+    5: [_rebuild_proc_rollup_with_pid],
 }
+
+
+class ProcIdentity(NamedTuple):
+    """A program as ``proc_registry`` knows it.
+
+    ``cmdline`` is the command line of the first process seen; processes of
+    the program may differ from it in their digits (``--id 2``).
+    """
+
+    name: str
+    cmdline_hash: str
+    cmdline: Optional[str]
 
 
 class StorageVersionError(RuntimeError):
@@ -132,7 +180,7 @@ class _Loss(NamedTuple):
 # DDL — verbatim from design doc §5.2
 # ---------------------------------------------------------------------------
 
-_SCHEMA = """
+_SCHEMA = f"""
 -- メタ情報
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
@@ -247,13 +295,7 @@ CREATE TABLE IF NOT EXISTS sys_rollup_1m (
   psi_cpu_max REAL, psi_mem_max REAL, psi_io_max REAL,
   swap_out_sum INTEGER
 );
-CREATE TABLE IF NOT EXISTS proc_rollup_1m (
-  ts_min REAL, proc_id INTEGER,
-  cpu_avg REAL, cpu_max REAL,
-  rss_avg INTEGER, rss_max INTEGER,
-  fds_max INTEGER, threads_max INTEGER,
-  PRIMARY KEY (ts_min, proc_id)
-);
+CREATE TABLE IF NOT EXISTS proc_rollup_1m {_PROC_ROLLUP_1M};
 CREATE TABLE IF NOT EXISTS cg_rollup_1m (
   ts_min REAL, cg_id INTEGER,
   cpu_usec_sum INTEGER,
@@ -358,6 +400,7 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "rss_max",
         "fds_max",
         "threads_max",
+        "pid",
     ],
     "cg_rollup_1m": [
         "ts_min",
@@ -602,7 +645,9 @@ class Storage:
         """Refuse a read-only DB written by a *newer* procdiag.
 
         Older DBs are tolerated silently: a read-only connection cannot migrate,
-        and past migrations only add indexes/columns that reads survive without.
+        and past migrations only add indexes/columns that reads survive without
+        (``rows`` reads the ``proc_rollup_1m.pid`` of a DB before schema 5 as
+        NULL).
         """
         try:
             row = self.conn.execute(
@@ -801,15 +846,15 @@ class Storage:
         # Python ``_avg([]) -> None`` / ``max(...) if vals else None`` semantics.
         self.conn.execute(
             "INSERT OR REPLACE INTO proc_rollup_1m "
-            "(ts_min, proc_id, cpu_avg, cpu_max, rss_avg, rss_max, "
+            "(ts_min, proc_id, pid, cpu_avg, cpu_max, rss_avg, rss_max, "
             " fds_max, threads_max) "
-            "SELECT CAST(ts / 60 AS INTEGER) * 60.0 AS ts_min, proc_id, "
+            "SELECT CAST(ts / 60 AS INTEGER) * 60.0 AS ts_min, proc_id, pid, "
             "       AVG(cpu_pct), MAX(cpu_pct), "
             "       CAST(AVG(rss) AS INTEGER), MAX(rss), "
             "       MAX(num_fds), MAX(num_threads) "
             "FROM proc_samples "
             "WHERE ts >= ? AND ts < ? "
-            "GROUP BY ts_min, proc_id",
+            "GROUP BY ts_min, proc_id, pid",
             (watermark, current_minute_floor),
         )
 
@@ -1213,7 +1258,10 @@ class Storage:
             raise ValueError(
                 f"テーブル {table} には時刻列がないため since/until は使えません"
             )
-        q = f"SELECT * FROM {table} WHERE 1=1"
+        columns = "*"
+        if table == "proc_rollup_1m" and not self.has_column(table, "pid"):
+            columns = "*, NULL AS pid"  # a DB from before schema 5, read as is
+        q = f"SELECT {columns} FROM {table} WHERE 1=1"
         p: List[Any] = []
 
         if since is not None:
@@ -1416,13 +1464,16 @@ class Storage:
         ).fetchone()
         return row["name"] if row else f"proc_{proc_id}"
 
-    def proc_identities(self) -> Dict[int, Tuple[str, str]]:
-        """``{proc_id: (name, cmdline_hash)}`` for every registered process.
+    def proc_identities(self) -> Dict[int, "ProcIdentity"]:
+        """``{proc_id: ProcIdentity}`` for every registered process.
 
-        The pair is ``proc_registry``'s UNIQUE key and is stable across DBs.
+        ``(name, cmdline_hash)`` is ``proc_registry``'s UNIQUE key and is
+        stable across DBs.
         """
         return {
-            r["proc_id"]: (r["name"], r["cmdline_hash"])
+            r["proc_id"]: ProcIdentity(
+                r["name"], r["cmdline_hash"], r["cmdline_sample"]
+            )
             for r in self.rows("proc_registry")
         }
 

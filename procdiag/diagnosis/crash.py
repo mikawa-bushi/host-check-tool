@@ -13,20 +13,25 @@
 
 OOM-KILL-01 design:
 
-1. Identify proc_ids whose last sample is significantly before the window
-   end (> ``GAP_THRESHOLD_S`` seconds) — the process disappeared while
-   recording continued, distinguishing it from machine-wide stops.
+1. Identify processes (PIDs) whose last sample is significantly before the
+   window end (> ``GAP_THRESHOLD_S`` seconds) — the process disappeared while
+   recording continued, distinguishing it from machine-wide stops.  A victim
+   that its supervisor started again (same program, new PID) counts too.
+   A recorded kernel OOM line naming the PID (``kernel_events``) makes it a
+   finding with HIGH confidence; steps 2-4 apply only without one.
 2. Exclude short-lived processes (lifetime < ``MIN_LIFETIME_S`` seconds),
    which are expected to exit.
-3. Exclude trivial consumers: last RSS must be >= 1% of estimated total
-   memory (``mem_used + mem_available`` from the nearest sys_sample).
-   This estimation is documented as approximate in the method body.
+3. Exclude trivial consumers: the RSS of the last sample must be >= 1% of
+   estimated total memory (``mem_used + mem_available`` from the nearest
+   sys_sample).  This estimation is documented as approximate in the method
+   body.
 4. Correlate with a memory-crisis window: if ``sys_samples`` in
    ``[last_ts - 180s, last_ts + 60s]`` contains any row where
    ``psi_mem_full10 >= 1.0`` OR ``swap_out > 0`` OR
    ``mem_available < 5% of mem_total``, the process is flagged.
 5. All four conditions met → Finding(WARNING, MEDIUM, subject=process name).
-6. If multiple candidates, cap at 5, sorted by last_rss descending.
+6. If multiple candidates, cap at 5: kernel-confirmed first, then by last
+   RSS descending.
 7. Optional journal probe: calls ``_read_oom_journal`` (monkeypatchable),
    searches for process name / PID in OOM-kill log lines, elevates
    confidence to HIGH.
@@ -37,7 +42,8 @@ Design doc reference: procdiag_extension_proposal.md EXT-01 / OOM-KILL-01.
 from __future__ import annotations
 
 import bisect
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, Optional
 
 from .. import kernlog
 from ..core import (
@@ -101,6 +107,16 @@ def _read_oom_journal(since: float, until: float) -> list[str]:
     return [e.message for e in events or [] if e.kind == "oom"]
 
 
+# The victim's PID in a kernel OOM line: "Killed process 1234 (name)" or, from
+# Linux 4.19, "oom-kill:...,task=name,pid=1234,...".
+_OOM_LINE_PID = re.compile(r"Killed process (\d+)|\bpid=(\d+)")
+
+
+def _oom_line_pid(line: str) -> Optional[int]:
+    m = _OOM_LINE_PID.search(line)
+    return int(m.group(1) or m.group(2)) if m else None
+
+
 # ---------------------------------------------------------------------------
 # OOM-KILL-01 Rule
 # ---------------------------------------------------------------------------
@@ -161,21 +177,19 @@ class OomKillRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run OOM-KILL-01 against the observation window."""
-        # --- Step 1: gather per-process first/last sample timestamps and RSS ---
-        # Query proc_samples within the window.  GROUP BY proc_id to get bounds.
+        # One group per process, not per program: a victim that its supervisor
+        # started again has gone even though its program goes on.
         proc_rows = store.conn.execute(
-            "SELECT proc_id, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
-            "       MAX(rss) AS last_rss "
+            "SELECT proc_id, pid, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
             "FROM proc_samples "
             "WHERE ts >= ? AND ts <= ? "
-            "GROUP BY proc_id",
+            "GROUP BY proc_id, pid",
             (window.start_ts, window.end_ts),
         ).fetchall()
 
         if not proc_rows:
             return []
 
-        # --- Step 2: load sys_samples once for cost-efficient lookups ---
         sys_rows = store.rows(
             "sys_samples",
             since=window.start_ts,
@@ -187,68 +201,106 @@ class OomKillRule(Rule):
         if not sys_rows:
             return []
 
+        oom_lines = (
+            store.rows(
+                "kernel_events",
+                since=window.start_ts - self.crisis_window_before_s,
+                until=window.end_ts + self.crisis_window_after_s,
+                where="kind = 'oom'",
+            )
+            if store.has_table("kernel_events")
+            else []
+        )
+        identities = store.proc_identities()
         findings: list[Finding] = []
 
         for proc_row in proc_rows:
             proc_id = proc_row["proc_id"]
+            pid = proc_row["pid"]
             first_ts: float = proc_row["first_ts"]
             last_ts: float = proc_row["last_ts"]
-            last_rss: int = proc_row["last_rss"] or 0
 
             # --- Condition 1: recording continued after the process disappeared ---
             gap = window.end_ts - last_ts
             if gap <= self.gap_threshold_s:
                 continue
 
+            # The kernel's own line naming this PID settles it; without one the
+            # remaining conditions have to point to an OOM kill.
+            kernel_line = next(
+                (
+                    row["message"]
+                    for row in oom_lines
+                    if last_ts - self.crisis_window_before_s
+                    <= row["ts"]
+                    <= last_ts + self.crisis_window_after_s
+                    and _oom_line_pid(row["message"]) == pid
+                ),
+                None,
+            )
+
             # --- Condition 2: process was not short-lived ---
             lifetime = last_ts - first_ts
-            if lifetime < self.min_lifetime_s:
+            if kernel_line is None and lifetime < self.min_lifetime_s:
                 continue
 
             # --- Condition 3: process was a significant memory consumer ---
-            # Estimate mem_total from the nearest sys_sample to last_ts.
-            nearest_sys = self._nearest_sys_sample(last_ts, sys_rows, sys_ts_list)
-            if nearest_sys is None:
-                continue
-            mem_total = self._estimate_mem_total(nearest_sys)
-            if mem_total is None or mem_total == 0:
-                continue
-            if last_rss < mem_total * self.min_rss_fraction:
-                continue
-
             # --- Condition 4: memory crisis correlated with disappearance ---
-            crisis_start = last_ts - self.crisis_window_before_s
-            crisis_end = last_ts + self.crisis_window_after_s
-            crisis_indicator = self._find_crisis_indicator(
-                sys_rows, crisis_start, crisis_end, mem_total
+            last_rss = self._last_rss(store, proc_id, pid, last_ts)
+            mem_total = self._estimate_mem_total(
+                self._nearest_sys_sample(last_ts, sys_rows, sys_ts_list)
             )
-            if crisis_indicator is None:
+            crisis = (
+                self._find_crisis_indicator(
+                    sys_rows,
+                    last_ts - self.crisis_window_before_s,
+                    last_ts + self.crisis_window_after_s,
+                    mem_total,
+                )
+                if mem_total
+                else None
+            )
+            if kernel_line is None and (
+                not mem_total
+                or last_rss < mem_total * self.min_rss_fraction
+                or crisis is None
+            ):
                 continue
 
-            # All four conditions met — look up process name.
-            process_name = store.proc_name(proc_id)
+            identity = identities.get(proc_id)
+            process_name = identity.name if identity else f"proc_{proc_id}"
 
-            # Build evidence.
             lifetime_minutes = round(lifetime / 60.0, 1)
             evidence: dict = {
                 "proc_id": proc_id,
                 "process_name": process_name,
+                "pid": pid,
+                "cmdline": identity.cmdline if identity else None,
                 "last_seen": last_ts,
                 "last_rss_bytes": last_rss,
                 "last_rss_mb": round(last_rss / MiB, 1),
-                "mem_total_mb": round(mem_total / MiB, 1),
+                "mem_total_mb": round(mem_total / MiB, 1) if mem_total else None,
                 "lifetime_minutes": lifetime_minutes,
                 "gap_to_window_end_s": round(gap, 1),
-                "crisis_indicator": crisis_indicator["type"],
-                "crisis_value": crisis_indicator["value"],
-                "crisis_ts": crisis_indicator["ts"],
+                "crisis_indicator": crisis["type"] if crisis else None,
+                "crisis_value": crisis["value"] if crisis else None,
+                "crisis_ts": crisis["ts"] if crisis else None,
             }
-            summary = (
-                f"OOM Kill 疑い: {process_name} が消滅"
-                f" (最終 RSS {evidence['last_rss_mb']:.1f} MB,"
-                f" 生存 {lifetime_minutes}分,"
-                f" 危機指標: {crisis_indicator['type']}={crisis_indicator['value']})"
-            )
+            label = f"{process_name} (PID {pid})"
+            if kernel_line is not None:
+                evidence["kernel_line"] = kernel_line
+                summary = (
+                    f"OOM Kill: {label} がカーネルに強制終了されました"
+                    f" (最終 RSS {evidence['last_rss_mb']:.1f} MB,"
+                    f" 生存 {lifetime_minutes}分)"
+                )
+            else:
+                summary = (
+                    f"OOM Kill 疑い: {label} が消滅"
+                    f" (最終 RSS {evidence['last_rss_mb']:.1f} MB,"
+                    f" 生存 {lifetime_minutes}分,"
+                    f" 危機指標: {evidence['crisis_indicator']}={evidence['crisis_value']})"
+                )
 
             findings.append(
                 Finding(
@@ -258,22 +310,39 @@ class OomKillRule(Rule):
                     summary=summary,
                     evidence=evidence,
                     detected_at=(first_ts, last_ts),
-                    confidence=Confidence.MEDIUM,
+                    confidence=(
+                        Confidence.MEDIUM if kernel_line is None else Confidence.HIGH
+                    ),
                 )
             )
 
         if not findings:
             return []
 
-        # --- Step 5: cap at max_findings sorted by last_rss descending ---
-        findings.sort(key=lambda f: f.evidence.get("last_rss_bytes", 0), reverse=True)
+        # --- Step 5: cap at max_findings, the kernel's own kills first ---
+        findings.sort(
+            key=lambda f: ("kernel_line" in f.evidence, f.evidence["last_rss_bytes"]),
+            reverse=True,
+        )
         findings = findings[: self.max_findings]
 
         # --- Optional: journal probe to elevate confidence ---
         for finding in findings:
-            self._try_elevate_confidence(finding)
+            if "kernel_line" not in finding.evidence:
+                self._try_elevate_confidence(finding)
 
         return findings
+
+    @staticmethod
+    def _last_rss(store: "Storage", proc_id: int, pid: int, last_ts: float) -> int:
+        """RSS of the process's last sample that has one (0 when none does)."""
+        row = store.conn.execute(
+            "SELECT rss FROM proc_samples "
+            "WHERE proc_id = ? AND pid = ? AND ts <= ? AND rss > 0 "
+            "ORDER BY ts DESC LIMIT 1",
+            (proc_id, pid, last_ts),
+        ).fetchone()
+        return int(row["rss"]) if row else 0
 
     # ------------------------------------------------------------------
     # Internal helpers

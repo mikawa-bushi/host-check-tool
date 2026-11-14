@@ -41,6 +41,8 @@ from .trend import (
     days_until,
     fit_linear,
     observed_fit,
+    proc_details,
+    proc_label,
     proc_trend_observations,
 )
 
@@ -145,8 +147,7 @@ class FdLeakRule(MeasuredRule):
         days_to_hard_limit = days_until(current_fds, hard, slope_fd_h)
 
         evidence = {
-            "proc_id": proc_id,
-            "process_name": process_name,
+            **proc_details(obs),
             "slope_fd_per_h": slope_fd_h,
             "r2": fit.r2,
             "n": fit.n,
@@ -160,7 +161,8 @@ class FdLeakRule(MeasuredRule):
         }
 
         summary = (
-            f"{process_name}: FD数 +{slope_fd_h:.1f}/h で単調増加"
+            f"{proc_label(process_name, obs.evidence['pid'])}:"
+            f" FD数 +{slope_fd_h:.1f}/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )
 
@@ -253,8 +255,7 @@ class ThreadLeakRule(MeasuredRule):
         )
 
         evidence = {
-            "proc_id": obs.evidence["proc_id"],
-            "process_name": process_name,
+            **proc_details(obs),
             "slope_threads_per_h": slope_h,
             "r2": fit.r2,
             "n": fit.n,
@@ -266,7 +267,8 @@ class ThreadLeakRule(MeasuredRule):
         }
 
         summary = (
-            f"{process_name}: スレッド数 +{slope_h:.1f}/h で単調増加"
+            f"{proc_label(process_name, obs.evidence['pid'])}:"
+            f" スレッド数 +{slope_h:.1f}/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )
 

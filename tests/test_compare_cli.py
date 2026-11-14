@@ -292,7 +292,7 @@ def _python3_procs(directory, procs):
             slope, t0 = (slopes[0], start) if ts < at else (slopes[1], at)
             if slope is not None:
                 rss = int((200 + slope * (ts - t0) / _HOUR) * _MB)
-                rows.append((ts, pid, 5.0, 6.0, rss, rss, 30, 8))
+                rows.append((ts, pid, 5.0, 6.0, rss, rss, 30, 8, None))
     store.buffer("proc_rollup_1m", rows)
     store.flush(reason="synth")
     path = store.path
@@ -347,7 +347,7 @@ def _noisy_leak(directory, *, after_slope: float, after_wobble: float):
         slope, wobble = (10.0, 10.0) if ts < at else (after_slope, after_wobble)
         t_h = (ts - (start if ts < at else at)) / _HOUR
         rss = int((300 + slope * t_h + wobble * math.sin(math.pi * t_h)) * _MB)
-        rows.append((ts, pid, 5.0, 6.0, rss, rss, 50, 8))
+        rows.append((ts, pid, 5.0, 6.0, rss, rss, 50, 8, None))
     store.buffer("proc_rollup_1m", rows)
     store.flush(reason="synth")
     path = store.path

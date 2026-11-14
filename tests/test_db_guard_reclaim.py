@@ -64,7 +64,7 @@ def _build_db(
         t = now - rollup_days * _DAY
         while t < now:
             for p in range(rollup_procs):
-                rollup.append((t, p, 1.0, 2.0, 50_000_000, 60_000_000, 20, 4))
+                rollup.append((t, p, 1.0, 2.0, 50_000_000, 60_000_000, 20, 4, None))
             t += 60.0
         rollup.sort(reverse=newest_first)
         store.buffer("proc_rollup_1m", rollup)

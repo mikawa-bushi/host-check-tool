@@ -49,7 +49,17 @@ def _record(
     for m in range(minutes):
         rss = (rss_mb + slope_mb_h * m / 60 + math.sin(m / 7)) * _MB
         rows.append(
-            (start + m * 60, proc_id, 10.0, 11.0, int(rss), int(rss), fds, threads)
+            (
+                start + m * 60,
+                proc_id,
+                10.0,
+                11.0,
+                int(rss),
+                int(rss),
+                fds,
+                threads,
+                None,
+            )
         )
     store.buffer("proc_rollup_1m", rows)
     store.flush(reason="synth")
@@ -250,7 +260,7 @@ class TestRecordingHoles:
         store.buffer(
             "proc_rollup_1m",
             [
-                (ts, proc_id, 1.0, 1.0, int((200 + 20 * h) * _MB), 0, 48, 24)
+                (ts, proc_id, 1.0, 1.0, int((200 + 20 * h) * _MB), 0, 48, 24, None)
                 for h in [k * 0.1 for k in range(120)]
                 for ts in [start + h * _HOUR]
             ],
@@ -274,7 +284,17 @@ class TestRecordingHoles:
             store.buffer(
                 "proc_rollup_1m",
                 [
-                    (start + m * 60, proc_id, 1.0, 1.0, int((200 + m) * _MB), 0, 48, 24)
+                    (
+                        start + m * 60,
+                        proc_id,
+                        1.0,
+                        1.0,
+                        int((200 + m) * _MB),
+                        0,
+                        48,
+                        24,
+                        None,
+                    )
                     for m in range(30)
                 ],
             )

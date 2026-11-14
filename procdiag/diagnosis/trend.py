@@ -18,9 +18,12 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import accumulate
-from typing import Any, Hashable, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence
 
 from ..core import Confidence, Observation, covers
+
+if TYPE_CHECKING:
+    from ..storage import ProcIdentity
 
 # ---------------------------------------------------------------------------
 # TrendFit — result of linear regression
@@ -107,144 +110,228 @@ def fit_linear(
     of determination: 0 = flat / random, 1 = perfect line.
     """
     pts = [(t, v) for t, v in series if v is not None]
-    if len(pts) < min_points:
+    return fit_segments(
+        _split_at_holes(pts, holes),
+        min_points=min_points,
+        min_span_hours=min_span_hours,
+    )
+
+
+def _split_at_holes(
+    points: list[tuple[float, float]], holes: Sequence[tuple[float, float]]
+) -> list[list[tuple[float, float]]]:
+    hole_starts = [start for start, _ in holes]
+    segments: dict[int, list[tuple[float, float]]] = {}
+    for t, v in points:
+        segments.setdefault(bisect_left(hole_starts, t), []).append((t, v))
+    return list(segments.values())
+
+
+def fit_segments(
+    segments: Sequence[Sequence[tuple[float, float]]],
+    *,
+    min_points: int,
+    min_span_hours: float,
+) -> Optional[TrendFit]:
+    """One slope through *segments* of a series, each at its own level.
+
+    See :func:`fit_linear`; a segment is a stretch between holes in the
+    recording, or one process of a program that was restarted.
+    """
+    segments = [seg for seg in segments if seg]
+    n = sum(len(seg) for seg in segments)
+    if n < min_points:
         return None
 
-    hole_starts = [start for start, _ in holes]
-    seg_of = [bisect_left(hole_starts, t) for t, _ in pts]
-    segments: dict[int, list[int]] = {}
-    for i, k in enumerate(seg_of):
-        segments.setdefault(k, []).append(i)
-
     span_hours = (
-        sum(
-            max(pts[i][0] for i in members) - min(pts[i][0] for i in members)
-            for members in segments.values()
-        )
+        sum(max(t for t, _ in seg) - min(t for t, _ in seg) for seg in segments)
         / 3600.0
     )
     if not _series_covers(span_hours, min_span_hours, len(segments)):
         return None
 
-    n = len(pts)
-    ts_min = min(t for t, _ in pts)
+    ts_min = min(t for seg in segments for t, _ in seg)
     # Convert timestamps to hours relative to the earliest point so the
     # slope is already in (value / hour) without needing large-number arithmetic.
-    xs = [(t - ts_min) / 3600.0 for t, _ in pts]
-    ys = [v for _, v in pts]
+    hours = [[((t - ts_min) / 3600.0, v) for t, v in seg] for seg in segments]
+    means = [
+        (statistics.fmean(x for x, _ in seg), statistics.fmean(y for _, y in seg))
+        for seg in hours
+    ]
 
-    x_mean = {k: statistics.fmean([xs[i] for i in m]) for k, m in segments.items()}
-    y_mean = {k: statistics.fmean([ys[i] for i in m]) for k, m in segments.items()}
-
-    ss_xy = sum((x - x_mean[k]) * (y - y_mean[k]) for k, x, y in zip(seg_of, xs, ys))
-    ss_xx = sum((x - x_mean[k]) ** 2 for k, x in zip(seg_of, xs))
+    ss_xy = sum(
+        (x - mx) * (y - my) for seg, (mx, my) in zip(hours, means) for x, y in seg
+    )
+    ss_xx = sum((x - mx) ** 2 for seg, (mx, _) in zip(hours, means) for x, _ in seg)
 
     if ss_xx == 0.0:
         # Each segment is a single instant — degenerate; cannot fit a line.
         return None
 
     slope = ss_xy / ss_xx
-    intercept = {k: y_mean[k] - slope * x_mean[k] for k in segments}
 
     # R² = 1 - SS_res / SS_tot, both around each segment's own level
     ss_res = sum(
-        (y - (slope * x + intercept[k])) ** 2 for k, x, y in zip(seg_of, xs, ys)
+        (y - my - slope * (x - mx)) ** 2
+        for seg, (mx, my) in zip(hours, means)
+        for x, y in seg
     )
-    ss_tot = sum((y - y_mean[k]) ** 2 for k, y in zip(seg_of, ys))
+    ss_tot = sum((y - my) ** 2 for seg, (_, my) in zip(hours, means) for _, y in seg)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
 
     return TrendFit(slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours)
 
 
 # ---------------------------------------------------------------------------
-# Per-subject series helpers (shared by the regression-based leak rules)
+# Per-process series (shared by the regression-based leak rules)
 # ---------------------------------------------------------------------------
 
+# A process that ran for less than this, restarted within one stretch of the
+# recording, is left out of its program's trend: a program restarted every few
+# minutes grows while it starts up, not because it leaks.  One that ran through
+# a short stretch on its own (a PC on for half an hour a day) still counts.
+_MIN_RUN_HOURS = 1.0
 
-def group_series(
-    rows: Iterable[Mapping[str, Any]],
-    *,
-    key: str,
-    value: str,
-    ts: str = "ts_min",
-) -> dict[Any, list[tuple[float, float]]]:
-    """Group rows into ``{row[key]: [(row[ts], float(row[value])), ...]}``.
 
-    Rows whose *value* is NULL are skipped; row order (time order, as returned
-    by ``Storage.rows``) is preserved within each group.
+@dataclass
+class ProcInstance:
+    """One running copy of a program, followed across its restarts.
+
+    ``runs`` are its processes in the order they ran, each ``(pid, points)``.
+    Two copies of a program that run side by side are two instances.  The pid
+    is None for rows rolled up before procdiag kept processes apart.
     """
-    out: dict[Any, list[tuple[float, float]]] = {}
-    for row in rows:
-        v = row[value]
-        if v is not None:
-            out.setdefault(row[key], []).append((row[ts], float(v)))
-    return out
 
+    proc_id: int
+    runs: list[tuple[Optional[int], list[tuple[float, float]]]]
 
-def fit_all(
-    series_by_key: Mapping[Hashable, list[tuple[float, float]]],
-    *,
-    min_points: int,
-    min_span_hours: float,
-    holes: Sequence[tuple[float, float]] = (),
-) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
-    for key, series in series_by_key.items():
-        fit = fit_linear(
-            series,
+    @property
+    def pid(self) -> Optional[int]:
+        """The process running last."""
+        return self.runs[-1][0]
+
+    @property
+    def pids(self) -> list[int]:
+        return [pid for pid, _ in self.runs if pid is not None]
+
+    @property
+    def last_value(self) -> float:
+        return self.runs[-1][1][-1][1]
+
+    @property
+    def last_ts(self) -> float:
+        return self.runs[-1][1][-1][0]
+
+    def fit(
+        self,
+        *,
+        min_points: int,
+        min_span_hours: float,
+        holes: Sequence[tuple[float, float]] = (),
+    ) -> Optional[TrendFit]:
+        """The trend of the instance, each process at its own level."""
+        hole_starts = [start for start, _ in holes]
+        stretch = [bisect_left(hole_starts, points[0][0]) for _, points in self.runs]
+        restarted = {k for k, n in Counter(stretch).items() if n > 1}
+        return fit_segments(
+            [
+                segment
+                for k, (_, points) in zip(stretch, self.runs)
+                if k not in restarted
+                or points[-1][0] - points[0][0] >= _MIN_RUN_HOURS * 3600.0
+                for segment in _split_at_holes(points, holes)
+            ],
             min_points=min_points,
             min_span_hours=min_span_hours,
-            holes=holes,
         )
-        if fit is not None:
-            yield key, series, fit
 
 
-def fit_each(
-    series_by_key: Mapping[Hashable, list[tuple[float, float]]],
-    *,
-    min_points: int,
-    min_span_hours: float,
-    min_r2: float,
-) -> Iterator[tuple[Any, list[tuple[float, float]], TrendFit]]:
-    for key, series, fit in fit_all(
-        series_by_key, min_points=min_points, min_span_hours=min_span_hours
+def proc_instances(
+    rows: Iterable[Mapping[str, Any]], column: str
+) -> list[ProcInstance]:
+    """Follow the processes of each program in ``proc_rollup_1m`` *rows*.
+
+    A process that starts once another process of the same program has stopped
+    continues that one's instance (a restart).  One that starts while every
+    instance still runs is a new instance (another worker).  When several have
+    stopped, the one that stopped last is continued.  Rows whose *column* is
+    NULL are skipped.
+    """
+    runs: dict[tuple[int, Optional[int]], list[tuple[float, float]]] = {}
+    for row in rows:
+        v = row[column]
+        if v is not None:
+            runs.setdefault((row["proc_id"], row["pid"]), []).append(
+                (row["ts_min"], float(v))
+            )
+
+    by_program: dict[int, list[ProcInstance]] = {}
+    for (proc_id, pid), points in sorted(
+        runs.items(), key=lambda kv: (kv[1][0][0], kv[0][0], kv[0][1] or 0)
     ):
-        if fit.r2 >= min_r2:
-            yield key, series, fit
+        instances = by_program.setdefault(proc_id, [])
+        stopped = [i for i in instances if i.last_ts <= points[0][0]]
+        if stopped:
+            max(stopped, key=lambda i: i.last_ts).runs.append((pid, points))
+        else:
+            instances.append(ProcInstance(proc_id, [(pid, points)]))
+    return [i for instances in by_program.values() for i in instances]
 
 
 def proc_trend_observations(
     rows: Iterable[Mapping[str, Any]],
-    identities: Mapping[int, tuple[str, str]],
+    identities: Mapping[int, "ProcIdentity"],
     column: str,
     *,
     min_span_hours: float,
     unit: float = 1.0,
     holes: Sequence[tuple[float, float]] = (),
 ) -> list[Observation]:
+    """One Observation per program instance whose *column* trend can be fitted.
+
+    *identities* is ``Storage.proc_identities()``.
+    """
     observations = []
-    for proc_id, series, fit in fit_all(
-        group_series(rows, key="proc_id", value=column),
-        min_points=12,
-        min_span_hours=min_span_hours,
-        holes=holes,
-    ):
-        name, cmdline_hash = identities.get(proc_id, (f"proc_{proc_id}", None))
+    for instance in proc_instances(rows, column):
+        fit = instance.fit(min_points=12, min_span_hours=min_span_hours, holes=holes)
+        if fit is None:
+            continue
+        identity = identities.get(instance.proc_id)
         observations.append(
             Observation(
-                subject=name,
-                identity=cmdline_hash,
+                subject=identity.name if identity else f"proc_{instance.proc_id}",
+                identity=identity.cmdline_hash if identity else None,
                 value=fit.slope_per_hour / unit,
                 evidence={
-                    "proc_id": proc_id,
+                    "proc_id": instance.proc_id,
+                    "pid": instance.pid,
+                    "pids": instance.pids,
+                    "cmdline": identity.cmdline if identity else None,
                     "r2": fit.r2,
                     "n": fit.n,
                     "span_hours": fit.span_hours,
-                    "last_value": series[-1][1],
+                    "last_value": instance.last_value,
                 },
             )
         )
     return observations
+
+
+def proc_details(obs: Observation) -> dict[str, Any]:
+    """The evidence that tells which process a per-process finding is about."""
+    ev = obs.evidence
+    return {
+        "proc_id": ev["proc_id"],
+        "process_name": obs.subject,
+        "pid": ev["pid"],
+        "pids": ev["pids"],
+        "cmdline": ev["cmdline"],
+    }
+
+
+def proc_label(name: str, pid: Optional[int]) -> str:
+    """``name (PID n)``, or the name alone when the PID was not recorded."""
+    return name if pid is None else f"{name} (PID {pid})"
 
 
 def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:
