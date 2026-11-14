@@ -97,6 +97,9 @@ procdiag status --config /etc/procdiag/config.py   # DB の場所は config の 
 DB の場所 (`db_path`) と保持期間などを設定ファイルから解決する (`--db` 指定が優先)。
 `db_path` の相対パスは、設定ファイルのあるフォルダからの位置になる (どのフォルダで実行しても同じ DB)。
 `~` はホームフォルダに展開する。設定ファイルが無いときの既定は、カレントフォルダの `./procdiag.db` である。
+以前の版は、設定ファイルの相対パスもカレントフォルダから読んでいた。設定ファイルのフォルダに DB が無く、
+カレントフォルダからの以前の位置に DB があるときは、その DB を使い、両方のパスを警告に 1 行出す (`doctor` も警告する)。
+`db_path` をその絶対パスに書き換えるか、DB を設定ファイルのフォルダに移すと、警告は消える。
 `--db` の相対パスはカレントフォルダからの位置、空の値 (`--db ""` / `--config ""`) はエラーになる。
 
 `--config` を省くと、カレントフォルダの `config.py` を読む。ただし、他のユーザーが書き換えられるファイル
@@ -198,6 +201,8 @@ procdiag compare before.db after.db --format json --output compare.json
 `status` / `export` / `bundle` / `prune` / `record` / `init` も、前提を満たせないときは理由を 1 行で示して `4` で終わる。
 DB が開けない (新しい版・壊れている・SQLite でない・ディレクトリ)、`-o` / `--output` / `--out` の出力先が無い・書けない・ディレクトリ、
 `prune` の `--raw` / `--rollup` の形式が違う、`init` の作成先に作れない、などである。
+ただし `record` は、記録を始めるときに DB を開けない・作れない (DB のフォルダが無い・書けない) と、理由を 1 行で示して `1` で終わる。
+後からつながるディスクのように時間がたてば直ることがあり、systemd のユニットは `1` なら再起動するためである。
 コマンドラインの書き間違い (未知のコマンドやオプション、値の抜け、`--format` の誤り、余分な引数) も `4` で、
 `check` の `2` (info のみ) とは区別される。出力先は診断の前に確かめる。
 出力ファイルは書き終えてから置くので、途中で失敗しても壊れたファイルは残らない。
@@ -233,10 +238,16 @@ procdiag service print --system --config /etc/procdiag/config.py | sudo tee /etc
 (フォルダは systemd が `StateDirectory=` で作る)。読むときは `procdiag status --db /var/lib/procdiag/procdiag.db` とする。
 user ユニットは `--config` を付ける運用を勧める。付けないとホームフォルダの `config.py` と `./procdiag.db` を使う。
 
-`procdiag record` が終了コード `4` (設定ファイルの誤り・DB を使えない・オプションの誤り) で終わったときは、
-再起動しても直らないので、ユニットは再起動しない (`RestartPreventExitStatus=4`)。理由は
-`journalctl -u procdiag-record` に 1 行で残る。それ以外の失敗は 10 秒後に再起動する。
-終了コード `1` (DB に書けない: ディスク満杯など) は、空きができれば直るため、再起動の対象にしている。
+`procdiag record` が終了コード `4` (設定ファイルの誤り・オプションの誤り・DB として使えないファイル: ディレクトリ、
+壊れた DB、新しい版の DB) で終わったときは、再起動しても直らないので、ユニットは再起動しない (`RestartPreventExitStatus=4`)。
+理由は `journalctl -u procdiag-record` に 1 行で残る。それ以外の失敗は 10 秒後に再起動する。
+記録を始めるときに DB を開けない・作れない (DB のフォルダが無い・書けない) とき、DB に書けない (ディスク満杯など) ときは
+終了コード `1` で、再起動の対象である。DB のフォルダが後からつながるディスクにあって、記録を始めるときに無い・書けないときも、
+使えるようになった後の再起動で記録を始める。
+
+以前の README の手順 (`--config /etc/procdiag/config.py` と、`./procdiag.db` のような相対パスの `db_path`) で作ったユニットは、
+ユニットの作業フォルダ (user ユニットはホームフォルダ、system ユニットは `/`) の `procdiag.db` に記録していた。
+更新後もその DB に記録を続け、`journalctl` に警告を 1 行出す。`db_path` をその絶対パスに書き換えると警告は消える。
 
 ## 設定
 
