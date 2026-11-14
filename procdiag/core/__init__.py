@@ -29,6 +29,7 @@ from .rule import (
     get_rule,
     register,
     registry_names,
+    rule_id_problems,
     validate_rule_overrides,
 )
 from .sampler import (
@@ -75,6 +76,7 @@ __all__ = [
     "all_rules",
     "registry_names",
     "configure_rule",
+    "rule_id_problems",
     "validate_rule_overrides",
     # sampler
     "SampleBatch",

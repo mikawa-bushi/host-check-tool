@@ -9,11 +9,13 @@ filtered subset) against a Storage instance.
 
 from __future__ import annotations
 
+import difflib
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -218,16 +220,36 @@ def validate_rule_overrides(overrides: Mapping[str, Mapping[str, float]]) -> Lis
     typo in ``config.py`` fails at start-up instead of silently keeping the
     default threshold.  The rule registry must already be populated.
     """
-    problems: List[str] = []
+    problems = rule_id_problems("rules.overrides", overrides)
     for rule_id, values in overrides.items():
         cls = _REGISTRY.get(rule_id)
         if cls is None:
-            problems.append(f"rules.overrides: 不明なルール ID です: {rule_id}")
             continue
         try:
             resolve_overrides(cls, values)
         except ValueError as exc:
             problems.append(f"rules.overrides: {exc}")
+    return problems
+
+
+def rule_id_problems(setting: str, rule_ids: Iterable[str]) -> List[str]:
+    """Return a message for every ID in *rule_ids* that no rule is registered as.
+
+    *setting* names where the IDs came from (``rules.disabled``, ``--only``);
+    the message suggests the closest registered ID, e.g. for a lower-case one.
+    The rule registry must already be populated.
+    """
+    problems: List[str] = []
+    for rule_id in rule_ids:
+        if rule_id in _REGISTRY:
+            continue
+        close = difflib.get_close_matches(rule_id.upper(), list(_REGISTRY), n=1)
+        hint = (
+            f"{close[0]} のことですか?"
+            if close
+            else "ルール ID の一覧は procdiag explain で表示できます"
+        )
+        problems.append(f"{setting}: 不明なルール ID です: {rule_id} ({hint})")
     return problems
 
 
@@ -237,11 +259,26 @@ _REGISTRY: Dict[str, Type[Rule]] = {}
 
 
 def register(cls: Type[Rule]) -> Type[Rule]:
-    """Class decorator: add a rule to the global registry by its ``rule_id``."""
+    """Class decorator: add a rule to the global registry by its ``rule_id``.
+
+    Raises :class:`ValueError` when another rule class already has that ID, so
+    an extra rule cannot silently take a built-in rule's place.  The same
+    class registered again (its module imported again) replaces itself.
+    """
     if not cls.rule_id:
         raise ValueError(f"ルールクラス {cls.__name__} に rule_id が設定されていません")
+    existing = _REGISTRY.get(cls.rule_id)
+    if existing is not None and _class_name(existing) != _class_name(cls):
+        raise ValueError(
+            f"ルール ID {cls.rule_id} は {_class_name(existing)} が使っているため、"
+            f"{_class_name(cls)} を登録できません。別のルール ID にしてください"
+        )
     _REGISTRY[cls.rule_id] = cls
     return cls
+
+
+def _class_name(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
 
 
 def get_rule(rule_id: str) -> Optional[Type[Rule]]:

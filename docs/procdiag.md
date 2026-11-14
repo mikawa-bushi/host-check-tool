@@ -105,6 +105,8 @@ procdiag check -o report.html
 --verbose                 # 推論過程を表示
 ```
 
+`--only` / `--skip` (`compare` も同じ) と `config.rules.disabled` のルール ID は、`procdiag explain` の一覧どおり大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に書いたとき、実行するルールが 1 つも残らないときは、診断せずに終了コード `4` で終わる。
+
 ### 終了コード (check)
 
 | コード | 意味 |
@@ -195,7 +197,7 @@ host-check-tool/
 │   ├── bundle.py         # 持ち出し用バンドル (procdiag bundle)
 │   ├── status.py         # 記録 DB の概況 (status / bundle で共用)
 │   ├── systemd.py        # systemctl / timedatectl / journalctl の読み取り専用ラッパー
-│   ├── kernlog.py        # カーネルログ (journalctl -k) の異常行の分類
+│   ├── kernlog.py        # カーネルログ (journal のカーネルの行) の異常行の分類
 │   ├── export.py         # CSV / JSON エクスポート
 │   ├── service.py        # systemd ユニット生成
 │   ├── report.py         # terminal / JSON / HTML+SVG レポート生成
@@ -301,14 +303,18 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
   `Restart=always`、`RestartForceExitStatus=` のあるユニットは正常終了の後も再起動されるため、
   systemd がジャーナルに残す「Failed with result」の行 (systemd 240 より前は MESSAGE_ID の無い
   同じ文の行) で見分け、異常終了の後の再起動を `kind=restart`、それ以外を `kind=restart_clean`
-  として記録する (`Restart=on-success` は常に `restart_clean`)。行は再起動より `RestartSec=` だけ前に
-  出るので、前回の確認より前の行もさかのぼって照らし合わせる。ジャーナルを読めない
+  として記録する (`Restart=on-success` は常に `restart_clean`)。行は再起動より `RestartSec=` だけ
+  前に出るので、前回の確認より前の行もさかのぼって照らし合わせる。ジャーナルを読めない
   (root または systemd-journal / adm グループが必要) とき、`LogLevelMax=` が warning より低く
-  この行が出ないときは `kind=restart_maybe_clean` として記録する。最初の確認で既に failed のユニットは遷移として数えず、
-  `kind=failed_at_start` として記録する。
-- `KernelLogSampler`: `journalctl -k` を前回の続き (cursor) から読み、I/O エラー・FS エラー・
+  この行が出ないときは `kind=restart_maybe_clean` として記録する。最初の確認で既に failed の
+  ユニットは遷移として数えず、`kind=failed_at_start` として記録する。
+- `KernelLogSampler`: journal のカーネルの行を前回の続き (cursor) から読み、I/O エラー・FS エラー・
   ハングタスク・MCE・segfault・USB 切断・温度制限の行だけを `kernel_events` に記録する。
+  cursor は記録した行と同じフラッシュで `meta` の `kernel_log_cursor` に保存し、同じ DB への
+  次の `record` はその続きから読む。記録を止めていた間の行と、再起動・電源断の前のブートの
+  最後の行も、journal に残っていれば記録される。
   読み取りには root または systemd-journal / adm グループが必要。
+- どちらも停止するときにもう一度読む。前回の読み取りから停止までの最大 5 分の出来事も残る。
 
 ### 記録セッション
 

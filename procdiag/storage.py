@@ -299,6 +299,8 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
     "proc_counts": ["ts", "total", "zombies"],
     "service_events": ["ts", "unit", "kind", "n_restarts", "result"],
     "kernel_events": ["ts", "kind", "message"],
+    # A sampler's read position, committed in the same flush as its rows.
+    "meta": ["key", "value"],
     "sys_rollup_1m": [
         "ts_min",
         "cpu_avg",

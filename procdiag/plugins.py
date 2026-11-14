@@ -31,7 +31,13 @@ def load_plugins() -> List[Tuple[str, bool, str]]:
     loaded and what failed without aborting on a single bad plugin.
     """
     results: List[Tuple[str, bool, str]] = []
-    for ep in entry_points(group=ENTRY_POINT_GROUP):
+    plugins = entry_points(group=ENTRY_POINT_GROUP)
+    if plugins:
+        # Built-in rules first, so a plugin reusing one of their IDs is the
+        # one register() rejects.
+        from . import diagnosis  # noqa: F401
+
+    for ep in plugins:
         try:
             target = ep.load()
             # If the entry point resolves to a callable (rather than a module),

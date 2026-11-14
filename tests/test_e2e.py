@@ -26,11 +26,17 @@ Test cases
 
 5. ``test_quick_ctrl_c_during_recording_still_diagnoses`` — SIGINT during the
    recording ends it early; the diagnosis and report.html still follow.
+
+6. ``test_record_keeps_kernel_errors_logged_since_its_last_read`` and
+   ``test_record_resumes_the_kernel_log_after_a_restart_and_a_reboot`` — with a
+   stand-in ``journalctl``, KERNEL-ERROR-01 counts each kernel error once,
+   including the ones logged after the last read and while record was stopped.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import sqlite3
@@ -97,6 +103,7 @@ def _run(
     *,
     timeout: int = 60,
     cwd: Optional[Path] = None,
+    env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """Run a procdiag sub-command and return the CompletedProcess."""
     return subprocess.run(
@@ -105,6 +112,7 @@ def _run(
         text=True,
         timeout=timeout,
         cwd=str(cwd) if cwd else None,
+        env=env,
     )
 
 
@@ -392,3 +400,175 @@ def test_quick_ctrl_c_during_recording_still_diagnoses(tmp_path: Path) -> None:
         pytest.fail("quick did not finish within 60 s after SIGINT")
 
     _assert_quick_finished(out_dir, "".join(seen) + rest, proc.returncode)
+
+
+# ---------------------------------------------------------------------------
+# Test 6: kernel errors reach KERNEL-ERROR-01 across stops and reboots
+# ---------------------------------------------------------------------------
+
+# A stand-in journalctl.  $FAKE_JOURNAL holds one JSON object per kernel line
+# (boot, ts, message) and $FAKE_BOOT names the running boot.  As in systemd,
+# "-k" shows only the running boot.  A cursor is the line number.  Each call is
+# appended to $FAKE_JOURNAL.calls after its output, so a test can wait for a
+# read to finish.
+_FAKE_JOURNALCTL = """\
+import json, os, sys
+
+args = sys.argv[1:]
+
+
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+
+
+path = os.environ["FAKE_JOURNAL"]
+with open(path, encoding="utf-8") as f:
+    shown = list(enumerate(map(json.loads, f), 1))
+if "-k" in args:
+    shown = [(i, e) for i, e in shown if e["boot"] == os.environ["FAKE_BOOT"]]
+if opt("--after-cursor"):
+    after = int(opt("--after-cursor").split("i=")[1])
+    shown = [(i, e) for i, e in shown if i > after]
+elif opt("--since"):
+    since = float(opt("--since").lstrip("@"))
+    shown = [(i, e) for i, e in shown if e["ts"] >= since]
+if opt("-n"):
+    shown = shown[-int(opt("-n")) :]
+for i, e in shown:
+    print(f"{e['ts']:.6f} edge kernel: {e['message']}")
+if shown and "--show-cursor" in args:
+    print(f"-- cursor: s=fake;i={shown[-1][0]}")
+sys.stdout.flush()
+with open(path + ".calls", "a", encoding="utf-8") as f:
+    f.write(" ".join(args) + "\\n")
+"""
+
+_BOOT_LINE = "Linux version 6.8.0-fake (gcc 13.2.0) #1 SMP PREEMPT_DYNAMIC"
+
+
+def _io_error(sector: int) -> str:
+    return (
+        f"I/O error, dev sda, sector {sector} op 0x1:(WRITE) flags 0x800 "
+        "phys_seg 1 prio class 2"
+    )
+
+
+class _KernelJournal:
+    """The stand-in journal; ``log`` appends a kernel line logged now."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self._bin = tmp_path / "bin"
+        self._bin.mkdir()
+        script = tmp_path / "fake_journalctl.py"
+        script.write_text(_FAKE_JOURNALCTL, encoding="utf-8")
+        wrapper = self._bin / "journalctl"
+        wrapper.write_text(
+            f"#!/bin/sh\nexec '{sys.executable}' '{script}' \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.path = tmp_path / "journal.jsonl"
+        self.path.touch()
+        self._calls = Path(f"{self.path}.calls")
+
+    def log(self, boot: str, message: str) -> None:
+        line = {"boot": boot, "ts": time.time(), "message": message}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+
+    def env(self, boot: str) -> dict:
+        return {
+            **os.environ,
+            "PATH": f"{self._bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_JOURNAL": str(self.path),
+            "FAKE_BOOT": boot,
+        }
+
+    def wait_for_a_read(self, proc: subprocess.Popen) -> None:
+        """Wait until a read of the new lines (not a probe of the newest) ends."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and proc.poll() is None:
+            calls = self._calls.read_text() if self._calls.exists() else ""
+            if any(
+                "--show-cursor" in call and "-n" not in call.split()
+                for call in calls.splitlines()
+            ):
+                return
+            time.sleep(0.05)
+        pytest.fail("record never read the kernel log")
+
+
+def _record(config_path: Path, db_path: Path, duration: str, env: dict):
+    return subprocess.Popen(
+        [_PROCDIAG, "record", "--duration", duration]
+        + ["--config", str(config_path), "--db", str(db_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+
+def _kernel_errors(config_path: Path, db_path: Path) -> dict:
+    """``{kind: count}`` of the KERNEL-ERROR-01 findings for the DB."""
+    ck = _run(
+        ["check", "--db", str(db_path), "--config", str(config_path)]
+        + ["--only", "KERNEL-ERROR-01", "--format", "json", "-q"],
+        timeout=30,
+    )
+    return {
+        f["evidence"]["kind"]: f["evidence"]["count"]
+        for f in json.loads(ck.stdout)["findings"]
+    }
+
+
+@pytest.mark.e2e
+def test_record_keeps_kernel_errors_logged_since_its_last_read(
+    tmp_path: Path,
+) -> None:
+    """The kernel log is read every 5 minutes; stopping reads it once more."""
+    config_path = tmp_path / "config.py"
+    db_path = tmp_path / "procdiag.db"
+    _write_config(config_path, db_path)
+    journal = _KernelJournal(tmp_path)
+    journal.log("A", _BOOT_LINE)
+
+    proc = _record(config_path, db_path, "2s", journal.env("A"))
+    journal.wait_for_a_read(proc)
+    journal.log("A", _io_error(2048))
+    _out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, err
+
+    assert _kernel_errors(config_path, db_path) == {"io_error": 1}
+
+
+@pytest.mark.e2e
+def test_record_resumes_the_kernel_log_after_a_restart_and_a_reboot(
+    tmp_path: Path,
+) -> None:
+    """Errors logged while record was stopped are recorded once, the tail of
+    the previous boot included."""
+    config_path = tmp_path / "config.py"
+    db_path = tmp_path / "procdiag.db"
+    _write_config(config_path, db_path)
+    journal = _KernelJournal(tmp_path)
+    journal.log("A", _BOOT_LINE)
+
+    proc = _record(config_path, db_path, "2s", journal.env("A"))
+    journal.wait_for_a_read(proc)
+    journal.log("A", _io_error(100))
+    _out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, err
+    journal.log("A", _io_error(200))
+    journal.log("B", _BOOT_LINE)
+    journal.log("B", _io_error(300))
+    time.sleep(1.5)
+    second = _run(
+        ["record", "--duration", "1s"]
+        + ["--config", str(config_path), "--db", str(db_path)],
+        timeout=30,
+        env=journal.env("B"),
+    )
+    assert second.returncode == 0, second.stderr
+
+    assert _kernel_errors(config_path, db_path) == {"io_error": 3}
