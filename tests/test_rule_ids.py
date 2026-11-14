@@ -222,6 +222,29 @@ class TestExtraRules:
             diag = Engine(ProcdiagConfig()).run(store, only=["DISK-FULL-01"])
         assert [f.rule_id for f in diag.findings] == ["DISK-FULL-01"]
 
+    def test_select_finds_the_extra_rules_of_its_config(
+        self, tmp_path, monkeypatch, restore_registry
+    ):
+        (tmp_path / "site_only_rules_under_test.py").write_text(
+            "from procdiag.core import Rule, register\n"
+            "\n"
+            "@register\n"
+            "class SiteOnlyRule(Rule):\n"
+            "    rule_id = 'SITE-ONLY-01'\n"
+            "    def evaluate(self, store, window):\n"
+            "        return []\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        config = ProcdiagConfig(
+            rules=RulesConfig(extra_rules=["site_only_rules_under_test"])
+        )
+        try:
+            selected = Engine(config).select(only=["SITE-ONLY-01"])
+        finally:
+            sys.modules.pop("site_only_rules_under_test", None)
+        assert [cls.rule_id for cls in selected] == ["SITE-ONLY-01"]
+
     def test_installed_plugin_cannot_replace_a_builtin_rule(
         self, disk_db, tmp_path, plugin
     ):
