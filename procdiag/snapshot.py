@@ -470,8 +470,7 @@ def _check_kernel_log(item: _Item) -> List[SnapshotItem]:
     from .diagnosis.crash import KERNEL_SEVERITY
 
     events, _ = kernlog.read_events(since=time.time() - _KERNEL_LOOKBACK_SEC)
-    # journalctl can exit 0 with no output when the system journal is unreadable.
-    if events is None or (not events and not kernlog.journal_readable()):
+    if events is None:
         return [
             item(
                 INFO, "読み取れません (root または systemd-journal/adm グループが必要)"
