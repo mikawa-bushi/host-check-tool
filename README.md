@@ -73,7 +73,7 @@ procdiag bundle
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 (`-o report.html` / `-o report.json` でファイルに) |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
-| `procdiag status` | 記録期間・サンプル数・自己負荷を表示 |
+| `procdiag status` | 記録期間・サンプル数・自己負荷を表示 (生サンプルが期限切れで 1 分集計だけ残った DB も期間を示す。サイズは `-wal` を含む) |
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
 | `procdiag explain [RULE\|sampler]` | ルールまたはサンプラーの詳細を表示 (引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示) |
 | `procdiag export` | 記録データを CSV または JSON でエクスポート |
@@ -95,6 +95,14 @@ procdiag status --config /etc/procdiag/config.py   # DB の場所は config の 
 
 `check` / `status` / `export` / `prune` / `bundle` は `--config` を受け取り、
 DB の場所 (`db_path`) と保持期間などを設定ファイルから解決する (`--db` 指定が優先)。
+`db_path` の相対パスは、設定ファイルのあるフォルダからの位置になる (どのフォルダで実行しても同じ DB)。
+`~` はホームフォルダに展開する。設定ファイルが無いときの既定は、カレントフォルダの `./procdiag.db` である。
+`--db` の相対パスはカレントフォルダからの位置、空の値 (`--db ""` / `--config ""`) はエラーになる。
+
+`--config` を省くと、カレントフォルダの `config.py` を読む。ただし、他のユーザーが書き換えられるファイル
+(自分と root 以外の所有、誰でも書き込める、誰でも書き込めるフォルダにあって sticky ビットが無い) は実行せず、
+終了コード `4` で終わる。たとえば他人が置いた `/tmp/config.py` は、`/tmp` で `procdiag` を実行しても動かない。
+そのファイルを使うときは `--config` で明示する。
 
 記録時間が短いと、長期の観測が必要なルール (リーク系は 6 時間、慢性メモリ圧迫は 24 時間以上)
 は評価されない。`check` はその場合「評価範囲: 20 ルール中 N 件のみ評価」と未評価の
@@ -210,13 +218,27 @@ sudo loginctl enable-linger $USER
 system ユニット (root) として配置する場合:
 
 ```bash
-procdiag service print --system | sudo tee /etc/systemd/system/procdiag-record.service
+procdiag service print --system --config /etc/procdiag/config.py | sudo tee /etc/systemd/system/procdiag-record.service
 ```
+
+`--config` と `--db` の相対パスは、コマンドを実行したフォルダからの絶対パスにして ExecStart に書く
+(systemd は `$HOME` や `/` から起動するため)。空白や `%` `$` を含むパスも、systemd の引用規則に合わせて書く。
+`--duration` の形式 (`60s` / `24h` / `90d`) が違うときは、ユニットを書かずに終了コード `4` で終わる。
+`--config` も `--db` も付けない system ユニットは、`/var/lib/procdiag/procdiag.db` に記録する
+(フォルダは systemd が `StateDirectory=` で作る)。読むときは `procdiag status --db /var/lib/procdiag/procdiag.db` とする。
+user ユニットは `--config` を付ける運用を勧める。付けないとホームフォルダの `config.py` と `./procdiag.db` を使う。
+
+`procdiag record` が終了コード `4` (設定ファイルの誤り・DB を使えない・オプションの誤り) で終わったときは、
+再起動しても直らないので、ユニットは再起動しない (`RestartPreventExitStatus=4`)。理由は
+`journalctl -u procdiag-record` に 1 行で残る。それ以外の失敗は 10 秒後に再起動する。
+終了コード `1` (DB に書けない: ディスク満杯など) は、空きができれば直るため、再起動の対象にしている。
 
 ## 設定
 
 `procdiag init` で生成される `config.py` を編集する。
 Pydantic モデルで検証されるため、タイポや型ミスは起動時にエラーになる。
+間隔・しきい値・容量などの数値に NaN や inf は書けない (`rules.overrides` で書けないのは NaN だけ)。
+`db_path` の相対パスは、この `config.py` のあるフォルダからの位置である。
 
 ```python
 config = ProcdiagConfig(

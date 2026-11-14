@@ -8,15 +8,19 @@ of the rest of the tool.
 The ``load_config`` function reads a user-supplied ``config.py`` by executing
 it in a fresh namespace and extracting the ``config`` variable — the same
 approach as netdiag's scenario files.  If the file is absent, a
-``ProcdiagConfig()`` with all defaults is returned.
+``ProcdiagConfig()`` with all defaults is returned.  Without an explicit path
+the file is ``./config.py``, which is only executed when no other user could
+have written it (see :func:`config_trust_problem`).
 """
 
 from __future__ import annotations
 
+import math
+import os
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .core.util import parse_duration
 
@@ -31,10 +35,26 @@ DEFAULT_CONFIG_PATH = Path("./config.py")
 # ---------------------------------------------------------------------------
 
 
-class WatchDir(BaseModel):
-    """One entry in the ``watch_dirs`` list."""
+class _Model(BaseModel):
+    """Base of every config model: unknown keys and NaN / inf are errors.
+
+    NaN passes ``v <= 0`` and inf is "positive", so the per-field range checks
+    alone let ``system_interval=nan`` through, which makes the recorder spin.
+    """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _finite_numbers(self) -> "_Model":
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} は有限の数でなければなりません: {value}")
+        return self
+
+
+class WatchDir(_Model):
+    """One entry in the ``watch_dirs`` list."""
 
     path: str
     time_budget_sec: float = 10.0
@@ -47,10 +67,8 @@ class WatchDir(BaseModel):
         return v
 
 
-class SamplingConfig(BaseModel):
+class SamplingConfig(_Model):
     """Tier-interval and watch-dir settings."""
-
-    model_config = ConfigDict(extra="forbid")
 
     system_interval: float = 1.0  # T1 — seconds
     cgroup_interval: float = 5.0  # T2a
@@ -89,10 +107,8 @@ class SamplingConfig(BaseModel):
         return v
 
 
-class TriggerConfig(BaseModel):
+class TriggerConfig(_Model):
     """Spike-trigger thresholds and debounce settings."""
-
-    model_config = ConfigDict(extra="forbid")
 
     psi_cpu_some10: float = 20.0
     psi_mem_some10: float = 5.0
@@ -118,10 +134,8 @@ class TriggerConfig(BaseModel):
         return v
 
 
-class BudgetConfig(BaseModel):
+class BudgetConfig(_Model):
     """Self-throttling overhead budget."""
-
-    model_config = ConfigDict(extra="forbid")
 
     overhead_budget_pct: float = 1.0
     throttle_factor: float = 1.5
@@ -144,10 +158,8 @@ class BudgetConfig(BaseModel):
         return v
 
 
-class RetentionConfig(BaseModel):
+class RetentionConfig(_Model):
     """Data-retention policy."""
-
-    model_config = ConfigDict(extra="forbid")
 
     raw: str = "48h"
     rollup: str = "90d"
@@ -180,10 +192,8 @@ class RetentionConfig(BaseModel):
         return v
 
 
-class RulesConfig(BaseModel):
+class RulesConfig(_Model):
     """Rule-engine settings."""
-
-    model_config = ConfigDict(extra="forbid")
 
     disabled: list[str] = Field(default_factory=list)
     extra_rules: list[str] = Field(default_factory=list)  # importlib paths
@@ -192,6 +202,21 @@ class RulesConfig(BaseModel):
     # Per-rule threshold overrides: {"CPU-SATURATION-01": {"psi_threshold": 30}}.
     # Keys are checked against each rule's tunables at start-up.
     overrides: dict[str, dict[str, float]] = Field(default_factory=dict)
+
+    @field_validator("overrides")
+    @classmethod
+    def _no_nan_threshold(cls, v: dict[str, dict[str, float]]) -> dict:
+        # inf stays legal: an unbounded threshold (CPU-PERIODIC-01 tol_sec) is
+        # meaningful, while NaN compares false both ways and silently disables
+        # the rule.
+        for rule_id, values in v.items():
+            for name, number in values.items():
+                if math.isnan(number):
+                    raise ValueError(
+                        f"overrides の {rule_id} の {name} が NaN です。"
+                        "しきい値には数を書いてください"
+                    )
+        return v
 
     @field_validator("min_observation_hours")
     @classmethod
@@ -209,10 +234,8 @@ class RulesConfig(BaseModel):
         return v
 
 
-class ReportConfig(BaseModel):
+class ReportConfig(_Model):
     """Report-generation settings."""
-
-    model_config = ConfigDict(extra="forbid")
 
     lang: str = "ja"
     hostname_label: Optional[str] = None  # display name for the report title
@@ -223,14 +246,12 @@ class ReportConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ProcdiagConfig(BaseModel):
+class ProcdiagConfig(_Model):
     """Root configuration for procdiag.
 
     Instantiate with no arguments to use all defaults.  Pass keyword
     arguments or load from a ``config.py`` file with :func:`load_config`.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     db_path: str = "./procdiag.db"
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
@@ -239,6 +260,13 @@ class ProcdiagConfig(BaseModel):
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     rules: RulesConfig = Field(default_factory=RulesConfig)
     report: ReportConfig = Field(default_factory=ReportConfig)
+
+    @field_validator("db_path")
+    @classmethod
+    def _expand_home(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("db_path が空です。DB ファイルのパスを指定してください")
+        return os.path.expanduser(v)
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +289,8 @@ from procdiag.config import (
 )
 
 config = ProcdiagConfig(
-    # 記録先DB(絶対パスを推奨)
-    db_path="./procdiag.db",
+    # 記録先DB。相対パスはこの config.py のあるフォルダからの位置 (~ はホームフォルダ)
+    db_path="./data/procdiag.db",
 
     sampling=SamplingConfig(
         system_interval=1.0,          # Tier1: システム全体 + PSI (秒)
@@ -328,13 +356,49 @@ config = ProcdiagConfig(
 # ---------------------------------------------------------------------------
 
 
+def config_trust_problem(path: Path) -> Optional[str]:
+    """Why another user could change what *path* does, or ``None`` when none can.
+
+    ``load_config`` executes the file, so whoever can rewrite it, or swap it
+    for another file, runs code as the user running procdiag.  That is the
+    file's owner unless it is the current user or root, anyone when the file
+    is world-writable, and anyone when its folder is world-writable without
+    the sticky bit (or with a sticky bit but another user's ownership).
+    """
+    me = os.geteuid()
+    info = path.stat()
+    if info.st_uid not in (me, 0):
+        return (
+            f"{path} は他のユーザー (uid {info.st_uid}) の所有です。"
+            "自分の所有にするか (chown)、別の場所に置いてください"
+        )
+    if info.st_mode & 0o002:
+        return (
+            f"{path} が誰でも書き込み可能 (world-writable) です。"
+            "chmod o-w で権限を絞ってください"
+        )
+    folders = {Path(os.path.abspath(path)).parent, path.resolve().parent}
+    for folder in sorted(folders):
+        info = folder.stat()
+        sticky_and_trusted = info.st_mode & 0o1000 and info.st_uid in (me, 0)
+        if info.st_mode & 0o002 and not sticky_and_trusted:
+            return (
+                f"{path} のあるフォルダ {folder} は誰でも書き込めるため、"
+                "他のユーザーがファイルを差し替えられます "
+                "(sticky ビットが無い、または所有者が自分・root 以外です)。"
+                "chmod +t で sticky ビットを付けるか、別のフォルダに置いてください"
+            )
+    return None
+
+
 def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
     """Load a ``ProcdiagConfig`` from *path*.
 
     Resolution order:
 
     1. If *path* is given explicitly, read that file.
-    2. If *path* is ``None`` and ``./config.py`` exists, read it.
+    2. If *path* is ``None`` and ``./config.py`` exists, read it, unless
+       :func:`config_trust_problem` says another user could have written it.
     3. Otherwise return a ``ProcdiagConfig()`` with all defaults.
 
     The file is executed in a fresh namespace; the ``config`` variable in
@@ -342,8 +406,13 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
     by netdiag for scenario files — it lets operators use full Python
     expressions in the config without a custom parser.
 
+    A relative ``db_path`` read from a file is relative to that file's folder,
+    so one config names one DB wherever procdiag runs; with no file it stays
+    relative to the current folder.
+
     Raises :class:`ValueError` with a Japanese message on any loading error.
     """
+    implicit = path is None
     if path is None:
         candidate = DEFAULT_CONFIG_PATH
         if not candidate.exists():
@@ -353,20 +422,47 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
     if not Path(path).exists():
         raise ValueError(f"設定ファイルが見つかりません: {path}")
 
+    if implicit:
+        try:
+            problem = config_trust_problem(Path(path))
+        except OSError as e:
+            raise ValueError(
+                f"設定ファイルの所有者を確認できません: {path} ({e})"
+            ) from e
+        if problem:
+            raise ValueError(
+                f"カレントフォルダの {path} は実行しません。{problem}\n"
+                f"このファイルを使うときは --config {path} と指定してください"
+            )
+
+    hint = (
+        "\n(--config を省いたので、カレントフォルダの config.py を読みました。"
+        "別のファイルは --config で指定してください)"
+        if implicit
+        else ""
+    )
     namespace: dict[str, Any] = {}
     try:
         # Bytes: Python then honours a BOM or a "coding:" line, as for any .py.
         source = Path(path).read_bytes()
         exec(compile(source, str(path), "exec"), namespace)  # noqa: S102
     except Exception as e:
-        raise ValueError(f"設定ファイルの読み込みに失敗しました: {path}\n{e}") from e
+        raise ValueError(
+            f"設定ファイルの読み込みに失敗しました: {path}\n{e}{hint}"
+        ) from e
 
     if "config" not in namespace:
-        raise ValueError(f"設定ファイルに 'config' 変数が定義されていません: {path}")
+        raise ValueError(
+            f"設定ファイルに 'config' 変数が定義されていません: {path}{hint}"
+        )
 
     cfg = namespace["config"]
     if not isinstance(cfg, ProcdiagConfig):
         raise ValueError(
-            f"'config' 変数が ProcdiagConfig のインスタンスではありません: {type(cfg)}"
+            "'config' 変数が ProcdiagConfig のインスタンスではありません: "
+            f"{type(cfg)}{hint}"
         )
+    if not Path(cfg.db_path).is_absolute():
+        db = Path(os.path.abspath(path)).parent / cfg.db_path
+        cfg = cfg.model_copy(update={"db_path": str(db)})
     return cfg

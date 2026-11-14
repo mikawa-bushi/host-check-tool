@@ -32,7 +32,7 @@ from typing import Callable, Optional
 import psutil
 
 from . import kernlog
-from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig
+from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig, config_trust_problem
 from .core.util import GiB, MiB
 
 # ---------------------------------------------------------------------------
@@ -231,12 +231,14 @@ def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
     "config_security", "設定ファイルの安全性", what="設定ファイル権限", on_error="info"
 )
 def _check_config_security(config_path: Optional[str]) -> _Outcome:
-    """Check that the config file (executed via ``exec``) is not world-writable.
+    """Check that no other user could change what the config file runs.
 
     ``load_config`` runs ``config.py`` with ``exec``, so write access to that
-    file is equivalent to code execution under whatever runs ``procdiag`` —
-    notably the systemd service.  A world-writable config is therefore a
-    privilege-escalation risk worth surfacing before a recording starts.
+    file, or to the folder it sits in, is equivalent to code execution under
+    whatever runs ``procdiag`` — notably the systemd service.  The rule is the
+    one ``load_config`` applies to the default ``./config.py``
+    (:func:`~procdiag.config.config_trust_problem`); an explicit ``--config``
+    is still executed, but doctor warns about it here.
 
     The check is advisory: an unexpected error (e.g. an unreadable path) is
     reported as ``info`` rather than failing the doctor run, matching how the
@@ -245,14 +247,17 @@ def _check_config_security(config_path: Optional[str]) -> _Outcome:
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     if not path.exists():
         return "info", f"設定ファイルが見つかりません ({path}) — 既定値で動作します"
-    if path.stat().st_mode & 0o002:
+    problem = config_trust_problem(path)
+    if problem:
         return (
             "degraded",
-            f"{path} が誰でも書き込み可能 (world-writable) です。"
-            "config.py は exec() で実行されるため任意コード実行のリスクがあります"
-            " — chmod o-w で権限を絞ってください",
+            f"{problem}。config.py は exec() で実行されるため、"
+            "他のユーザーが書き換えられると任意コード実行のリスクがあります",
         )
-    return "ok", f"{path} の権限は安全です (world-writable ではありません)"
+    return (
+        "ok",
+        f"{path} は自分 (または root) の所有で、他のユーザーは書き換えられません",
+    )
 
 
 # ---------------------------------------------------------------------------

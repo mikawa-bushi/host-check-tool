@@ -20,6 +20,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shlex
 import sqlite3
 import sys
 import time
@@ -150,7 +151,8 @@ def _db_option(help_text: str) -> Callable:
 
 
 def _config_option(
-    help_text: str = "設定ファイルのパス (既定: ./config.py)。",
+    help_text: str = "設定ファイルのパス (既定: ./config.py。"
+    "他のユーザーが書き換えられるときは実行しない)。",
 ) -> Callable:
     """``--config PATH`` option."""
     # readable=False: an unreadable file reaches _load_config and exits 4,
@@ -189,17 +191,22 @@ def _load_config(
 ) -> ProcdiagConfig:
     """Load the config (``./config.py`` by default) with an optional DB override.
 
-    Exits with code 4 when the config file is missing or broken.
+    Exits with code 4 when the config file is missing or broken, or when an
+    option is given as an empty string (an unset shell variable, say) instead
+    of being silently taken for "not given".
     """
     from .config import load_config
 
+    for option, value in (("--config", config_path), ("--db", db_path)):
+        if value == "":
+            _fail(f"{option} に空の値は指定できません")
     try:
-        cfg = load_config(Path(config_path) if config_path else None)
+        cfg = load_config(Path(config_path) if config_path is not None else None)
     except ValueError as exc:
         click.echo(f"エラー: {exc}", err=True)
         sys.exit(_EXIT_USAGE)
-    if db_path:
-        cfg = cfg.model_copy(update={"db_path": db_path})
+    if db_path is not None:
+        cfg = cfg.model_copy(update={"db_path": os.path.expanduser(db_path)})
     if cfg.rules.overrides or cfg.rules.disabled:
         _validate_rules(cfg)
     return cfg
@@ -298,8 +305,8 @@ def _parse_period(
     from .compare import CompareError, parse_instant
 
     try:
-        start = parse_instant(since) if since else None
-        end = parse_instant(until) if until else None
+        start = parse_instant(since) if since is not None else None
+        end = parse_instant(until) if until is not None else None
     except CompareError as exc:
         click.echo(f"エラー: {exc}", err=True)
         sys.exit(_EXIT_USAGE)
@@ -553,11 +560,16 @@ def init(dir: str) -> None:
             click.echo(f"data/ ディレクトリを生成しました: {data_dir}")
     except OSError as exc:
         _fail(f"{target} に作成できません: {_reason(exc)}")
+    config = shlex.quote(str(config_path))
     click.echo(
         "\n次のステップ:\n"
         "  1. config.py を必要に応じて編集してください\n"
-        "  2. procdiag doctor --config config.py で観測能力を確認してください\n"
-        "  3. procdiag record --config config.py で記録を開始してください"
+        "  2. 観測能力を確認します\n"
+        f"       procdiag doctor --config {config}\n"
+        "  3. 記録を開始します (Ctrl-C で止まります)\n"
+        f"       procdiag record --config {config}\n"
+        "  4. 常駐させるときは、systemd のユニットを作ります\n"
+        f"       procdiag service install --config {config}"
     )
 
 
@@ -1364,17 +1376,23 @@ def service_print(
     db_path: Optional[str],
     duration: Optional[str],
 ) -> None:
-    """systemd ユニットファイルのテキストを標準出力に表示します。"""
+    """systemd ユニットファイルのテキストを標準出力に表示します。
+
+    パスは絶対パスにして書き出します。--config も --db も無い system ユニットは
+    /var/lib/procdiag/procdiag.db に記録します。
+    """
     from .service import print_unit
 
-    click.echo(
-        print_unit(
+    try:
+        text = print_unit(
             system=system,
             config_path=config_path,
             db_path=db_path,
             duration=duration,
         )
-    )
+    except ValueError as exc:
+        _fail(str(exc))
+    click.echo(text)
 
 
 @service.command("install")
@@ -1390,23 +1408,24 @@ def service_install(
 
     systemctl は実行しません。有効化コマンドを画面に表示します。
     """
-    from .service import UNIT_NAME, install_unit
+    from .service import UNIT_NAME, install_unit, system_print_command
 
-    unit_path = install_unit(
-        config_path=config_path,
-        db_path=db_path,
-        duration=duration,
-    )
+    try:
+        unit_path = install_unit(
+            config_path=config_path,
+            db_path=db_path,
+            duration=duration,
+        )
+        system_command = system_print_command(config_path, db_path, duration)
+    except ValueError as exc:
+        _fail(str(exc))
     click.echo(f"ユニットファイルを書き出しました: {unit_path}\n")
     click.echo("有効化するには以下のコマンドを実行してください:")
     click.echo("  systemctl --user daemon-reload")
     click.echo(f"  systemctl --user enable --now {UNIT_NAME}")
     click.echo("  # ログアウト後も継続する場合: sudo loginctl enable-linger $USER")
     click.echo("\nsystem ユニットとして配置する場合:")
-    click.echo(
-        f"  procdiag service print --system | "
-        f"sudo tee /etc/systemd/system/{UNIT_NAME}"
-    )
+    click.echo(f"  {system_command} | sudo tee /etc/systemd/system/{UNIT_NAME}")
 
 
 # ---------------------------------------------------------------------------
