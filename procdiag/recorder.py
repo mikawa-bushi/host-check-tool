@@ -260,12 +260,13 @@ class Recorder:
     def _keep_failure_notes(self) -> None:
         """Keep each sampler's first collect failure of this session in the DB.
 
-        Once per sampler: a sampler that fails on every tick must not fill the
-        DB with the same note.  ``check`` shows them in its quality notes.
+        Once per sampler (the text before the first ``": "``): a sampler that
+        fails on every tick must not fill the DB with the same note.  ``check``
+        shows them in its quality notes.
         """
         notes, self._ctx.notes = self._ctx.notes, []
         for note in notes:
-            name = note.partition(":")[0]
+            name = note.partition(": ")[0]
             if name in self._failed_samplers:
                 continue
             self._failed_samplers.add(name)

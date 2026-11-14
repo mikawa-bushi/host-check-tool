@@ -47,14 +47,15 @@ def _snapshot(tmp_path):
 
 
 class TestChecks:
-    def test_disks_capacity_inodes_and_read_only_root(self, monkeypatch):
+    def test_disks_capacity_inodes_and_read_only_root(self, monkeypatch, tmp_path):
+        data = str(tmp_path)
         parts = [
             _Part("/dev/sda1", "/", "ext4", "ro,relatime"),
-            _Part("/dev/sdb1", "/data", "xfs", "rw"),
+            _Part("/dev/sdb1", data, "xfs", "rw"),
             _Part("tmpfs", "/run", "tmpfs", "rw"),  # pseudo-fs: ignored
         ]
-        usage = {"/": _Usage(100, 96, 4, 96.0), "/data": _Usage(100, 50, 50, 50.0)}
-        inodes = {"/": (1000, 100), "/data": (1000, 920)}
+        usage = {"/": _Usage(100, 96, 4, 96.0), data: _Usage(100, 50, 50, 50.0)}
+        inodes = {"/": (1000, 100), data: (1000, 920)}
         monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
         monkeypatch.setattr(snap.psutil, "disk_usage", lambda mp: usage[mp])
         import procdiag.samplers.disk as disk_mod
@@ -65,8 +66,8 @@ class TestChecks:
             "disk:/": "critical",
             "inode:/": "ok",
             "ro:/": "critical",
-            "disk:/data": "ok",
-            "inode:/data": "warning",
+            f"disk:{data}": "ok",
+            f"inode:{data}": "warning",
         }
 
     def test_a_bind_mounted_file_is_not_a_disk(self, monkeypatch, tmp_path):

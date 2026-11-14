@@ -13,7 +13,7 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Hashable, Iterable
+from collections.abc import Hashable, Iterable, Mapping
 from typing import Any, Optional
 
 # Binary byte units, shared by the samplers, rules and reports so every module
@@ -271,6 +271,7 @@ class CounterDelta:
 
     def __init__(self) -> None:
         self._prev: dict[Hashable, int] = {}
+        self._prev_each: dict[Hashable, dict[Hashable, int]] = {}
 
     def update(self, key: Hashable, value: int) -> Optional[int]:
         """Record *value* for *key* and return the clamped delta (None at first)."""
@@ -279,3 +280,20 @@ class CounterDelta:
         if prev is None:
             return None
         return max(0, value - prev)
+
+    def update_each(
+        self, key: Hashable, values: Mapping[Hashable, int]
+    ) -> Optional[dict[Hashable, int]]:
+        """``update`` for counters that come and go (the disks of a host, the devices in an io.stat).
+
+        Each name is differenced against its own previous value, so a name that
+        appears or disappears between calls does not move the others, as it would
+        in a delta of their sum.  A name that appears after the first call counts
+        from 0, because a new device's counters start there.  Returns ``None`` on
+        the first call for *key*.
+        """
+        prev = self._prev_each.get(key)
+        self._prev_each[key] = dict(values)
+        if prev is None:
+            return None
+        return {n: max(0, v - prev.get(n, 0)) for n, v in values.items()}
