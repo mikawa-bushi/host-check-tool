@@ -7,6 +7,7 @@ the service / kernel-log samplers, session recording and the v3→v4 migration.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 
@@ -401,6 +402,30 @@ class TestKernlog:
         assert events[0].message.startswith("usb 1-1")
         assert cursor == "s=abc;i=1"
 
+    @pytest.mark.parametrize(
+        "script, expected",
+        [
+            ("exit 0\n", (None, "c1")),
+            (
+                'if [ "$2" = -n ]; then echo "1700000000.000000 edge kernel: x"; fi\n',
+                ([], "c1"),
+            ),
+        ],
+        ids=["unreadable", "no-new-lines"],
+    )
+    def test_read_events_tells_an_unreadable_journal_from_no_new_lines(
+        self, tmp_path, monkeypatch, script, expected
+    ):
+        from procdiag.kernlog import read_events
+
+        # journalctl exits 0 with no output for a user outside
+        # systemd-journal/adm; only the readability probe ("-n 1") tells.
+        journalctl = tmp_path / "journalctl"
+        journalctl.write_text("#!/bin/sh\n" + script)
+        journalctl.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        assert read_events(after_cursor="c1") == expected
+
 
 class TestKernelError:
     def test_one_finding_per_kind_and_oom_left_to_oom_rule(self, tmp_path):
@@ -428,6 +453,116 @@ class TestKernelError:
         assert found["usb_disconnect"].severity == Severity.WARNING
         store.close()
 
+    @pytest.mark.parametrize(
+        "line, kind",
+        [
+            (
+                "XFS (sda1): Metadata corruption detected at "
+                "xfs_dir3_block_read_verify+0x9e/0xc0 [xfs], "
+                "xfs_dir3_block block 0x1f4c0 ",
+                "fs_error",
+            ),
+            (
+                "XFS (sdb1): Metadata CRC error detected at "
+                "xfs_agf_read_verify+0x70/0x120 [xfs], xfs_agf block 0x1 ",
+                "fs_error",
+            ),
+            (
+                "XFS (sda1): Metadata corruption detected at "
+                "xfs_dinode_verify+0x1a2/0x7a0 [xfs], inode 0x2a0 dinode",
+                "fs_error",
+            ),
+            (
+                "BTRFS: error (device sda2) in btrfs_run_delayed_refs:2150: "
+                "errno=-5 IO failure",
+                "fs_error",
+            ),
+            (
+                "BTRFS: error (device sda2 state A) in __btrfs_free_extent:3072: "
+                "errno=-28 No space left",
+                "fs_error",
+            ),
+            (
+                "critical target error, dev sdb, sector 2048 op 0x1:(WRITE) "
+                "flags 0x800 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "timeout error, dev sdb, sector 4096 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "recoverable transport error, dev sdc, sector 8 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "critical nexus error, dev sdc, sector 8 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "device offline error, dev sdd, sector 0 op 0x1:(WRITE) "
+                "flags 0x800 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "protection error, dev sdb, sector 2048 op 0x0:(READ) "
+                "flags 0x0 phys_seg 1 prio class 2",
+                "io_error",
+            ),
+            (
+                "sd 2:0:0:0: [sdb] tag#0 FAILED Result: hostbyte=DID_OK "
+                "driverbyte=DRIVER_OK cmd_age=0s",
+                "io_error",
+            ),
+            (
+                "nvme nvme0: I/O tag 123 (007b) QID 4 timeout, aborting "
+                "req_op:WRITE(1) size:4096",
+                "io_error",
+            ),
+            ("nvme nvme0: I/O 123 QID 4 timeout, reset controller", "io_error"),
+            ("nvme nvme0: Device not ready; aborting reset, CSTS=0x1", "io_error"),
+            (
+                "operation not supported error, dev sda, sector 0 "
+                "op 0x9:(WRITE_ZEROES) flags 0x800 phys_seg 0 prio class 2",
+                None,
+            ),
+            ("nvme nvme0: I/O 5 QID 0 timeout, completion polled", None),
+            (
+                "sd 2:0:0:0: [sdb] Synchronize Cache(10) failed: Result: "
+                "hostbyte=DID_BAD_TARGET driverbyte=DRIVER_OK",
+                None,
+            ),
+            (
+                "BTRFS info (device sda2): bdev /dev/sda2 errs: wr 1, rd 0, "
+                "flush 0, corrupt 0, gen 0",
+                None,
+            ),
+            (
+                "BTRFS: device fsid 0f5a0d3c devid 1 transid 42 /dev/sda2 "
+                "scanned by mount (512)",
+                None,
+            ),
+            ("XFS (sda1): Mounting V5 Filesystem 0f5a0d3c", None),
+        ],
+    )
+    def test_reports_the_kernels_disk_and_filesystem_error_lines(
+        self, tmp_path, line, kind
+    ):
+        from procdiag.kernlog import parse_short_unix
+
+        store = make_db(tmp_path)
+        add_sys_baseline(store, hours=1.0)
+        events, _ = parse_short_unix(f"{time.time() - 600:.6f} edge kernel: {line}\n")
+        store.buffer("kernel_events", [tuple(e) for e in events])
+        store.flush()
+        diag = Engine(ProcdiagConfig()).run(store, only=["KERNEL-ERROR-01"])
+        found = [(f.evidence["kind"], f.severity) for f in diag.findings]
+        assert found == ([(kind, Severity.CRITICAL)] if kind else [])
+        store.close()
+
 
 class TestKernelLogSampler:
     def test_resumes_from_cursor(self, monkeypatch):
@@ -438,19 +573,25 @@ class TestKernelLogSampler:
 
         calls = []
 
-        def fake_read(*, since=None, after_cursor=None):
-            calls.append((since is not None, after_cursor))
-            return [KernelEvent(1.0, "io_error", "I/O error")], "c1"
+        def fake_read(*, after_cursor):
+            calls.append(after_cursor)
+            return [KernelEvent(1.0, "io_error", "I/O error")], f"{after_cursor}+"
 
-        monkeypatch.setattr(kl_mod.kernlog, "journal_readable", lambda: True)
+        monkeypatch.setattr(kl_mod.kernlog, "newest_cursor", lambda: "newest")
         monkeypatch.setattr(kl_mod.kernlog, "read_events", fake_read)
-        sampler = kl_mod.KernelLogSampler()
         ctx = _make_ctx()
+        sampler = kl_mod.KernelLogSampler()
         sampler.setup(ctx)
-        (batch,) = sampler.collect(ctx)
+        batches = sampler.collect(ctx)
         sampler.collect(ctx)
-        assert batch.rows == [(1.0, "io_error", "I/O error")]
-        assert calls == [(True, None), (False, "c1")]
+        resumed = kl_mod.KernelLogSampler(cursor="stored")
+        resumed.setup(ctx)
+        resumed.collect(ctx)
+        assert [(b.table, b.rows) for b in batches] == [
+            ("meta", [("kernel_log_cursor", "newest+")]),
+            ("kernel_events", [(1.0, "io_error", "I/O error")]),
+        ]
+        assert calls == ["newest", "newest+", "stored"]
 
 
 # ---------------------------------------------------------------------------

@@ -6,18 +6,23 @@ only the lines :mod:`procdiag.kernlog` classifies as anomalies.  Recording them
 in the DB — instead of reading the journal at ``check`` time — keeps the
 evidence with the data when the DB is carried off the host for analysis.
 
+The cursor is stored in ``meta`` in the same flush as the rows it covers, so
+the next recording into the DB resumes right after the last stored read: the
+lines logged while nothing was recording, or before a reboot, are read then.
+
 Capability-gated: reading the system journal needs root or the
 ``systemd-journal`` / ``adm`` group; without it the sampler records nothing.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Optional
 
 from .. import kernlog
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
+
+CURSOR_KEY = "kernel_log_cursor"
 
 
 @register_sampler
@@ -41,15 +46,17 @@ class KernelLogSampler(Sampler):
         "dmesg -T | tail -50",
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, cursor: Optional[str] = None) -> None:
+        """*cursor*: where the DB's last recording stopped reading (``meta``
+        :data:`CURSOR_KEY`); None starts after the newest message at setup."""
         self._enabled = False
-        self._since: float = 0.0
-        self._cursor: Optional[str] = None
+        self._cursor = cursor
 
     def setup(self, ctx: RunContext) -> None:
         """Enable only when the kernel journal is readable."""
-        self._enabled = kernlog.journal_readable()
-        self._since = time.time()
+        newest = kernlog.newest_cursor()
+        self._enabled = newest is not None
+        self._cursor = self._cursor or newest
         ctx.capabilities["kernel_log"] = self._enabled
         if not self._enabled:
             ctx.notes.append(
@@ -61,15 +68,13 @@ class KernelLogSampler(Sampler):
         """Read anomalies logged since the previous read."""
         if not self._enabled:
             return []
-        events, cursor = kernlog.read_events(
-            since=self._since if self._cursor is None else None,
-            after_cursor=self._cursor,
-        )
-        self._cursor = cursor
-        if not events:
-            return []
-        rows = [
-            make_row("kernel_events", ts=e.ts, kind=e.kind, message=e.message)
-            for e in events
-        ]
-        return [SampleBatch(table="kernel_events", rows=rows)]
+        events, self._cursor = kernlog.read_events(after_cursor=self._cursor)
+        position = make_row("meta", key=CURSOR_KEY, value=self._cursor)
+        batches = [SampleBatch(table="meta", rows=[position])]
+        if events:
+            rows = [
+                make_row("kernel_events", ts=e.ts, kind=e.kind, message=e.message)
+                for e in events
+            ]
+            batches.append(SampleBatch(table="kernel_events", rows=rows))
+        return batches
