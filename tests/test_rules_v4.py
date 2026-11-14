@@ -7,6 +7,7 @@ the service / kernel-log samplers, session recording and the v3→v4 migration.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 
@@ -400,6 +401,30 @@ class TestKernlog:
         assert [(e.ts, e.kind) for e in events] == [(1700000000.5, "usb_disconnect")]
         assert events[0].message.startswith("usb 1-1")
         assert cursor == "s=abc;i=1"
+
+    @pytest.mark.parametrize(
+        "script, expected",
+        [
+            ("exit 0\n", (None, "c1")),
+            (
+                'if [ "$2" = -n ]; then echo "1700000000.000000 edge kernel: x"; fi\n',
+                ([], "c1"),
+            ),
+        ],
+        ids=["unreadable", "no-new-lines"],
+    )
+    def test_read_events_tells_an_unreadable_journal_from_no_new_lines(
+        self, tmp_path, monkeypatch, script, expected
+    ):
+        from procdiag.kernlog import read_events
+
+        # journalctl exits 0 with no output for a user outside
+        # systemd-journal/adm; only the readability probe ("-n 1") tells.
+        journalctl = tmp_path / "journalctl"
+        journalctl.write_text("#!/bin/sh\n" + script)
+        journalctl.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        assert read_events(after_cursor="c1") == expected
 
 
 class TestKernelError:
