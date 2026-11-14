@@ -109,12 +109,16 @@ class TestBadDb:
         assert "エラー:" in result.output
         assert str(bad) in result.output
 
-    def test_record_refuses_a_db_path_it_cannot_create(self, runner, tmp_path):
+    def test_record_cannot_create_a_db_path_yet(self, runner, tmp_path):
         blocker = tmp_path / "afile"
         blocker.write_text("x")
         db = blocker / "sub" / "r.db"
         result = runner.invoke(cli, ["record", "--db", str(db), "--duration", "2s"])
-        _assert_refused(result)
+        # 1, not 4: the unit restarts on 1, and the folder may still appear
+        # (a disk mounted late).
+        assert result.exit_code == 1, result.output
+        lines = _lines(result)
+        assert len(lines) == 1 and lines[0].startswith("エラー:"), result.output
         assert str(db) in result.output
 
     @pytest.mark.parametrize("kind", ["truncated", "not-sqlite", "zero-byte"])

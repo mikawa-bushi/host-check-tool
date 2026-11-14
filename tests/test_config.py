@@ -115,8 +115,9 @@ def test_extra_fields_forbidden():
 # ---------------------------------------------------------------------------
 
 
-def test_load_config_no_file_returns_defaults(tmp_path):
+def test_load_config_no_file_returns_defaults(tmp_path, monkeypatch):
     """load_config with a missing optional file path returns ProcdiagConfig()."""
+    monkeypatch.chdir(tmp_path)
     cfg = load_config(None)
     assert isinstance(cfg, ProcdiagConfig)
     assert cfg.db_path == "./procdiag.db"
