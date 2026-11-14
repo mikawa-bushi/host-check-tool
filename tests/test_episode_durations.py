@@ -434,12 +434,13 @@ class TestSinglecoreEpisodes:
         assert f.evidence["top_processes"][0] == "pinned"
         store.close()
 
-    def test_one_busy_process_outranks_a_pool_of_lighter_workers(self, tmp_path):
+    @staticmethod
+    def _per_process(tmp_path, names, busy):
+        """Half an hour on one pinned core of 8; *busy* maps ``(proc_id, pid)``
+        to the CPU % of that process, rolled up as the recorder does."""
         store = make_db(tmp_path)
         store.write_meta({"cpu_count": "8"})
-        _register(store, "pool", "pinned")
-        busy = {(1, 201): 30.0, (1, 202): 30.0, (1, 203): 30.0, (1, 204): 30.0}
-        busy[(2, 300)] = 99.0
+        _register(store, *names)
         procs = [
             make_row(
                 "proc_samples",
@@ -461,11 +462,27 @@ class TestSinglecoreEpisodes:
         store.buffer("proc_samples", procs)
         store.flush(reason="synth")
         store.rollup_incremental()
+        return store
+
+    def test_one_busy_process_outranks_a_pool_of_lighter_workers(self, tmp_path):
+        busy = {(1, 201): 30.0, (1, 202): 30.0, (1, 203): 30.0, (1, 204): 30.0}
+        busy[(2, 300)] = 99.0
+        store = self._per_process(tmp_path, ["pool", "pinned"], busy)
 
         (f,) = _run(store, "CPU-SINGLECORE-01")
 
         assert f.subject == "pinned"
         assert f.evidence["top_processes"][0] == "pinned"
+        store.close()
+
+    def test_a_pool_is_listed_once(self, tmp_path):
+        busy = {(1, 100 + k): 35.0 for k in range(6)}
+        busy.update({(2, 300): 99.0, (3, 400): 60.0, (4, 500): 50.0})
+        store = self._per_process(tmp_path, ["pool", "pinned", "other", "logger"], busy)
+
+        (f,) = _run(store, "CPU-SINGLECORE-01")
+
+        assert f.evidence["top_processes"] == ["pinned", "other", "logger", "pool"]
         store.close()
 
     def test_a_recording_gap_ends_the_episode(self, tmp_path):
