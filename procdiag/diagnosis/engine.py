@@ -20,6 +20,7 @@ differences from the netdiag engine:
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import traceback
@@ -110,10 +111,13 @@ def _make_jinja_env() -> Environment:
     return env
 
 
-# A stretch this long without a system sample is a hole in the recording: well
-# above the step of the coarsest rows (1-minute rollups), well below a stopped
-# recorder or a powered-off night.
-_HOLE_SECONDS = 300.0
+# A stretch without a system sample is a hole in the recording when it is
+# longer than this, well above the step of the coarsest rows (1-minute
+# rollups) and well below a stopped recorder or a powered-off night ...
+_MIN_HOLE_SECONDS = 300.0
+# ... or than this many sampling steps of a recording that samples more
+# slowly (the recorder calls a job this many intervals late a gap).
+_HOLE_STEPS = 3
 # Holes listed by name in the quality notes; the rest are only counted.
 _HOLES_LISTED = 5
 
@@ -239,8 +243,8 @@ class Engine:
 
         *window* defaults to the DB's own bounds (``check``); a given window
         is used verbatim and ``no_data`` then means no system sample inside it.
-        Either way its holes (more than ``_HOLE_SECONDS`` without a system
-        sample) are read from the DB and are not observed time.
+        Either way its holes (see :func:`_hole_seconds`) are read from the DB
+        and are not observed time.
 
         Steps:
 
@@ -274,7 +278,7 @@ class Engine:
             has_data = store.system_bounds(window.start_ts, window.end_ts) is not None
         if has_data:
             holes = store.system_holes(
-                window.start_ts, window.end_ts, longer_than=_HOLE_SECONDS
+                window.start_ts, window.end_ts, longer_than=_hole_seconds(store)
             )
             window = replace(window, holes=tuple(holes))
         observed_hours = window.observed_hours
@@ -563,7 +567,7 @@ class Engine:
             )
         )
         if window.holes:
-            notes.append(_holes_note(window.holes))
+            notes.append(holes_note(window.holes))
         future = store.future_bounds()
         if future is not None:
             notes.append(
@@ -590,11 +594,27 @@ class Engine:
         )
 
 
+def _hole_seconds(store: "Storage") -> float:
+    """How long a stretch without a system sample must be to be a hole.
+
+    The sampling step is ``sampling.system_interval`` of the recording's
+    config in ``meta``; a DB without it is taken to sample every second.
+    """
+    try:
+        interval = float(
+            json.loads(store.meta()["config"])["sampling"]["system_interval"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return _MIN_HOLE_SECONDS
+    return max(_MIN_HOLE_SECONDS, _HOLE_STEPS * interval)
+
+
 def _local_minute(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _holes_note(holes: tuple[tuple[float, float], ...]) -> str:
+def holes_note(holes: tuple[tuple[float, float], ...]) -> str:
+    """Say where the recording was interrupted, for a reader of a report."""
     total_hours = sum(end - start for start, end in holes) / 3600.0
     listed = [
         f"{_local_minute(start)} 〜 {_local_minute(end)}"

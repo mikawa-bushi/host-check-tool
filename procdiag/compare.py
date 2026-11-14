@@ -569,7 +569,7 @@ def _note_list(before: Side, after: Side) -> list[Note]:
         notes.append(Note(NoteKind.RECORDING_CONFIG_DIFFERS))
     for side in (before, after):
         res = side.result
-        if res is None or not 0 < res.raw_hours < res.window.span_hours - 1 / 60:
+        if res is None or not 0 < res.raw_hours < res.window.observed_hours - 1 / 60:
             continue
         raw_rules = [
             rid
@@ -583,7 +583,7 @@ def _note_list(before: Side, after: Side) -> list[Note]:
                     side.name,
                     {
                         "raw_hours": res.raw_hours,
-                        "span_hours": res.window.span_hours,
+                        "span_hours": res.window.observed_hours,
                         "rules": raw_rules,
                     },
                 )
@@ -653,15 +653,6 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
     return 0
 
 
-def _resolve(store: Storage, period: Period) -> Optional[tuple[Window, float]]:
-    bounds = store.system_bounds(period.since, before=period.until)
-    if bounds is None:
-        return None
-    window = Window(*bounds)
-    raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
-    return window, (raw[1] - raw[0]) / 3600.0 if raw else 0.0
-
-
 def _evaluate_side(
     name: SideName,
     store: Storage,
@@ -671,12 +662,14 @@ def _evaluate_side(
     skip: Optional[list[str]],
 ) -> Side:
     meta = store.meta()
-    resolved = _resolve(store, period)
+    bounds = store.system_bounds(period.since, before=period.until)
     result = None
-    if resolved is not None:
-        window, raw_hours = resolved
-        diag = engine.run(store, only=only, skip=skip, window=window)
-        result = Evaluated(diag.window or window, raw_hours, diag)
+    if bounds is not None:
+        diag = engine.run(store, only=only, skip=skip, window=Window(*bounds))
+        window = diag.window or Window(*bounds)
+        raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
+        raw_hours = window.observed_hours_between(*raw) if raw else 0.0
+        result = Evaluated(window, raw_hours, diag)
     return Side(
         name=name,
         db=store.path,

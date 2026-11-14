@@ -78,9 +78,10 @@ class Period:
 # up, so a rollup series spans less than three minutes short of its window.
 # The engine gate lets a window two minutes short through, so a series inside
 # it spans more than the requirement less five minutes.  On raw series such
-# as disk rows or proc_counts this only adds leniency.
-def _series_covers(span_hours: float, hours: float) -> bool:
-    return covers(span_hours + 3 / 60, hours)
+# as disk rows or proc_counts this only adds leniency.  Each segment between
+# holes in the recording loses that much at its edges.
+def _series_covers(span_hours: float, hours: float, segments: int = 1) -> bool:
+    return covers(span_hours + segments * 3 / 60, hours)
 
 
 def fit_linear(
@@ -122,7 +123,7 @@ def fit_linear(
         )
         / 3600.0
     )
-    if not _series_covers(span_hours, min_span_hours):
+    if not _series_covers(span_hours, min_span_hours, len(segments)):
         return None
 
     n = len(pts)

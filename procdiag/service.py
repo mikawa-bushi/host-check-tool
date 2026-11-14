@@ -59,10 +59,13 @@ def _unit_text(
         exec_start = f"{exec_start} --duration {duration}"
 
     install_target = "multi-user.target" if system else "default.target"
+    # time-sync.target belongs to the system manager (systemd.special(7)); a
+    # user manager has no unit to wait for the clock with.
+    after = "local-fs.target time-sync.target" if system else "local-fs.target"
     return f"""\
 [Unit]
 Description=procdiag 常駐記録サービス (procdiag record)
-After=local-fs.target time-sync.target
+After={after}
 Wants=local-fs.target
 
 [Service]

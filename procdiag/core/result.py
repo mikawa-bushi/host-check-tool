@@ -66,6 +66,11 @@ class Window:
         """Hours actually recorded: the span less the holes."""
         return self.span_hours - sum(end - start for start, end in self.holes) / 3600.0
 
+    def observed_hours_between(self, start: float, end: float) -> float:
+        """Hours recorded in ``[start, end]``: its length less the holes in it."""
+        holes = sum(max(0.0, min(b, end) - max(a, start)) for a, b in self.holes)
+        return (end - start - holes) / 3600.0
+
 
 # The span from the first row to the last falls short of the time recorded:
 # a period [X, X+6h) holds rows up to one step before X+6h, rollup rows carry

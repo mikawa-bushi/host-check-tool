@@ -224,7 +224,11 @@ class TestRecordingHoles:
         assert "修正後の期間 2.0 時間は修正前の 24.0 時間より短い" in rows
         header = result.stdout.split("時刻はこのホストのローカルタイム")[0]
         assert "  2.0 時間 (うち生データ 2.0 時間)" in header
-        assert f"{_local(at + 59 * 60)} 〜 {_local(now - _HOUR)}" in header
+        hole = f"{_local(at + 59 * 60)} 〜 {_local(now - _HOUR)}"
+        assert any(
+            line.startswith("  記録が途切れていた 1 か所") and hole in line
+            for line in header.splitlines()
+        ), header
         data = json.loads(
             CliRunner()
             .invoke(
