@@ -15,12 +15,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Type
 
 from .result import Capability
 
 if TYPE_CHECKING:
     from ..config import ProcdiagConfig
+
+
+class Note(NamedTuple):
+    """What the recorder keeps in the DB for a sampler: *text*, once per *key*."""
+
+    key: str
+    text: str
 
 
 @dataclass
@@ -88,8 +95,8 @@ class RunContext:
         # What this session cannot observe and why; the recorder keeps it in
         # the DB so ``check`` reports the rules that needed it as not evaluated.
         self.unobserved: Dict[Capability, str] = {}
-        # Collect failures, kept in the DB by the recorder.
-        self.notes: List[str] = []
+        # Collect failures and unreadable watch dirs, kept in the DB by the recorder.
+        self.notes: List[Note] = []
         # SelfMeter instance attached by the recorder; T1 sampler reads it.
         self.selfmeter: Any = None  # SelfMeter | None
 
@@ -155,7 +162,7 @@ class Sampler:
         except Exception as e:  # never let one sampler kill the loop
             note = f"{self.name}: collect失敗 ({e})"
             if getattr(self, "_last_run_note", None) != note:
-                ctx.notes.append(note)
+                ctx.notes.append(Note(self.name, note))
                 self._last_run_note = note
             return []
 

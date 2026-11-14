@@ -283,13 +283,13 @@ def _check_io(
 @_check("ディスク", "disks", "ディスク")
 def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
     from .diagnosis.io_disk import DiskInodeRule
-    from .samplers.disk import _PSEUDO_FS_TYPES, _inode_usage, is_read_only
+    from .samplers.disk import _inode_usage, is_read_only, is_watched_mount
 
     inode_warn = _threshold(config, DiskInodeRule, "warning_pct")
     inode_crit = _threshold(config, DiskInodeRule, "critical_pct")
     items: List[SnapshotItem] = []
     for part in psutil.disk_partitions(all=False):
-        if not part.fstype or part.fstype.lower() in _PSEUDO_FS_TYPES:
+        if not is_watched_mount(part):
             continue
         path = part.mountpoint
         mp = storable_text(path)

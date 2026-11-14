@@ -10,20 +10,21 @@ drive them at different intervals (``disk_interval`` for partition snapshots,
   flag — "space left but cannot write" (inode exhaustion, or a filesystem
   error that remounted it read-only) is invisible in byte counts alone.
   A mount whose mount point is a file (a bind-mounted ``/etc/hosts`` in a
-  container) is not a filesystem to watch and is skipped.
-  Produces ``disk_samples`` rows.
+  container) is not a filesystem to watch and is skipped (``is_watched_mount``,
+  which ``snapshot`` uses too).  Produces ``disk_samples`` rows.
 
 * ``collect_dirs`` — slow path (1 h default).  Walks each ``WatchDir`` in
   ``config.sampling.watch_dirs`` with ``os.scandir`` and a monotonic time
   budget.  If the budget is exhausted before the walk completes, the
   accumulated size is stored with ``is_estimate=1``.  Symbolic links are
   never followed, and the walk stays on the filesystem the directory is on
-  (``du -x``): ``/proc``, ``/sys`` and other disks mounted below it are not
-  counted.  ``PermissionError`` on an entry below the directory is silenced
-  and traversal continues.  A directory that cannot be read at all (missing,
-  permission denied, not mounted yet) is stored with ``size_bytes`` NULL, not
-  as an empty directory, and named in ``ctx.notes``.  Produces ``dir_samples``
-  rows.
+  (``du -x``, compared by ``st_dev``): ``/proc``, ``/sys``, other disks, and
+  whatever else has its own device number (a btrfs subvolume, a ZFS dataset, an
+  NFS mount) below it are not counted.  ``PermissionError`` on an entry below
+  the directory is silenced and traversal continues.  A directory that cannot
+  be read at all (missing, permission denied, not mounted yet) is stored with
+  ``size_bytes`` NULL, not as an empty directory, and each one is named in
+  ``ctx.notes`` when it becomes unreadable.  Produces ``dir_samples`` rows.
 
 The sampler is registered under the name ``"disk"`` so the recorder can look
 it up via ``get_sampler("disk")``.
@@ -33,11 +34,11 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import psutil
 
-from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
+from ..core.sampler import Note, RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
 # Filesystem types that carry no persistent data and should be excluded from
@@ -91,7 +92,7 @@ class DiskSampler(Sampler):
         "df -h",
         "du -sh /var/log/*",
     ]
-    _unreadable_note: Optional[str] = None
+    _unreadable: frozenset[str] = frozenset()
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
         """Collect disk_usage for all non-pseudo-fs mount points."""
@@ -104,12 +105,7 @@ class DiskSampler(Sampler):
             partitions = []
 
         for part in partitions:
-            if part.fstype.lower() in _PSEUDO_FS_TYPES:
-                continue
-            # Some virtual mounts report an empty fstype — skip those too.
-            if not part.fstype:
-                continue
-            if not os.path.isdir(part.mountpoint):
+            if not is_watched_mount(part):
                 continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
@@ -161,16 +157,34 @@ class DiskSampler(Sampler):
         return [SampleBatch(table="dir_samples", rows=rows)]
 
     def _note_unreadable(self, ctx: RunContext, unreadable: list[str]) -> None:
-        """Name the watch dirs that could not be read, once per change."""
-        note = (
-            "disk_dirs: 監視ディレクトリを読めないため、サイズを記録できません"
-            f" (存在しない・権限がないなど): {', '.join(unreadable)}"
-            if unreadable
-            else None
+        """Name each watch dir that cannot be read, once each time it becomes unreadable.
+
+        The recorder keeps one note per key, so each directory has its own.
+        """
+        ctx.notes.extend(
+            Note(
+                f"disk_dirs {path}",
+                f"disk_dirs {path}: 監視ディレクトリを読めないため、サイズを記録できません"
+                " (存在しない・権限がないなど)",
+            )
+            for path in unreadable
+            if path not in self._unreadable
         )
-        if note is not None and note != self._unreadable_note:
-            ctx.notes.append(note)
-        self._unreadable_note = note
+        self._unreadable = frozenset(unreadable)
+
+
+def is_watched_mount(part: Any) -> bool:
+    """Whether a ``psutil.disk_partitions`` entry is a filesystem to watch.
+
+    Not a pseudo filesystem, not one with an empty type (some virtual mounts),
+    and mounted on a directory: a file mount point is a bind-mounted file such
+    as a container's ``/etc/hosts``.
+    """
+    return (
+        bool(part.fstype)
+        and part.fstype.lower() not in _PSEUDO_FS_TYPES
+        and os.path.isdir(part.mountpoint)
+    )
 
 
 def is_read_only(mount_opts: str) -> bool:
