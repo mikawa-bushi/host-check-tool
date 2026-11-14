@@ -19,8 +19,10 @@ Key design choices that mirror netdiag:
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import logging
+import math
 import shutil
 import sqlite3
 import time
@@ -38,6 +40,7 @@ from typing import (
     Union,
 )
 
+from .core.result import Capability, Unobserved
 from .core.util import MiB, parse_duration, storable_text
 
 logger = logging.getLogger(__name__)
@@ -409,6 +412,12 @@ _LONG_LIVED_TABLES = (
 # Samplers that legitimately never write on some hosts (no thermal sensor, no
 # watch_dirs configured).
 OPTIONAL_SAMPLER_TABLES = frozenset({"thermal_samples", "dir_samples"})
+# What procdiag 0.3 and older (recordings without sessions) never recorded.
+_BEFORE_SESSIONS = (Capability.KERNEL_LOG, Capability.SYSTEMD, Capability.SESSIONS)
+_BEFORE_SESSIONS_REASON = (
+    "0.3 以前の procdiag で記録した期間です。この版はカーネルログ・サービスの再起動・"
+    "記録の開始と停止・inode・読み取り専用マウントを記録していません"
+)
 # Tables without a ``ts`` column (lookups, and the tiny session history that is
 # kept for good so reboots can be compared across the whole recording).
 _NO_TS_TABLES = ("meta", "proc_registry", "cgroup_registry", "sessions")
@@ -1592,6 +1601,68 @@ class Storage:
             "SELECT * FROM sessions ORDER BY started_ts"
         ).fetchall()
 
+    def record_unobserved(self, capability: Capability, reason: str) -> None:
+        """Note that the running session cannot observe *capability*."""
+        self.record_event("unobserved", f"{capability.value}: {reason}")
+
+    def unobserved_periods(self) -> List[Unobserved]:
+        """When the recordings in this DB could not observe what, and why.
+
+        A session's ``unobserved`` events hold for the whole session.
+        Everything before the first session was recorded by procdiag 0.3 or
+        older; so was a whole DB without sessions that a recorder wrote
+        (``meta`` has ``procdiag_version``).  A DB written by other means
+        (tests, tools) without sessions is taken as fully observed.
+        """
+        starts = self._session_starts()
+        periods = []
+        if starts or "procdiag_version" in self.meta():
+            # Rollup rows of the first session's first minute carry its start.
+            first = _minute(starts[0]) if starts else math.inf
+            periods = [
+                Unobserved(c, _BEFORE_SESSIONS_REASON, -math.inf, first)
+                for c in _BEFORE_SESSIONS
+            ]
+        for _, since, until, detail in self.session_events("unobserved"):
+            name, _, reason = detail.partition(": ")
+            try:
+                capability = Capability(name)
+            except ValueError:  # named by a newer procdiag
+                continue
+            periods.append(Unobserved(capability, reason, since, until))
+        return periods
+
+    def session_events(self, kind: str) -> List[Tuple[float, float, float, str]]:
+        """``(ts, since, until, detail)`` of each *kind* ops_event, oldest first.
+
+        ``[since, until)`` is the session the event was logged in, until the
+        next one starts (``inf`` for the last).  *since* is the start of the
+        session's first minute, the time its first rollup rows carry.
+        """
+        starts = self._session_starts()
+        rows = self.rows("ops_events", where="kind = ?", params=(kind,))
+        result = []
+        for r in sorted(rows, key=lambda r: r["ts"]):
+            ts = float(r["ts"])
+            i = bisect.bisect_right(starts, ts)
+            since = _minute(starts[i - 1] if i else ts)
+            until = starts[i] if i < len(starts) else math.inf
+            result.append((ts, since, until, r["detail"] or ""))
+        return result
+
+    def _session_starts(self) -> List[float]:
+        return [float(r["started_ts"]) for r in self.sessions()]
+
+    def has_values(self, table: str, column: str, since: float, until: float) -> bool:
+        """Whether *table* has a non-NULL *column* in ``[since, until]``."""
+        ts_col = _ts_column(table)
+        row = self.conn.execute(
+            f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL"
+            f" AND {ts_col} >= ? AND {ts_col} <= ? LIMIT 1",
+            (since, until),
+        ).fetchone()
+        return row is not None
+
     # ------------------------------------------------------------------
     # Schema introspection (old DBs opened read-only lack newer objects)
     # ------------------------------------------------------------------
@@ -1640,6 +1711,11 @@ class Storage:
 # ---------------------------------------------------------------------------
 # Module-level pure helpers
 # ---------------------------------------------------------------------------
+
+
+def _minute(ts: float) -> float:
+    """Start of the minute *ts* falls in (the ``ts_min`` of its rollup row)."""
+    return int(ts / 60) * 60.0
 
 
 def _storable_row(row: tuple) -> tuple:

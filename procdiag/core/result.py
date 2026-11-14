@@ -9,9 +9,10 @@ the netdiag pattern of ``core/result.py`` holding ``CheckResult`` and
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 
 class Severity(str, Enum):
@@ -204,16 +205,86 @@ class Measurement:
     finding: Optional[Finding]
 
 
+class Capability(str, Enum):
+    """Something a recording may have been unable to observe on its host."""
+
+    PSI = "psi"
+    CGROUP_V2 = "cgroup_v2"
+    KERNEL_LOG = "kernel_log"
+    SYSTEMD = "systemd"
+    THERMAL = "thermal"
+    SESSIONS = "sessions"
+
+    @property
+    def label(self) -> str:
+        return _CAPABILITY_LABELS[self]
+
+
+_CAPABILITY_LABELS = {
+    Capability.PSI: "PSI (/proc/pressure)",
+    Capability.CGROUP_V2: "cgroup v2",
+    Capability.KERNEL_LOG: "カーネルログ",
+    Capability.SYSTEMD: "systemd のサービス",
+    Capability.THERMAL: "温度センサ・CPU クロック",
+    Capability.SESSIONS: "記録の開始・停止",
+}
+
+
+@dataclass(frozen=True)
+class Unobserved:
+    """A period ``[start_ts, end_ts)`` in which *capability* was not observed.
+
+    ``reason`` says why, in the words of the recorder that could not.
+    """
+
+    capability: Capability
+    reason: str
+    start_ts: float
+    end_ts: float
+
+    def within(self, window: Window) -> Optional["Unobserved"]:
+        """The part inside *window*, or None when there is none."""
+        lo = max(self.start_ts, window.start_ts)
+        hi = min(self.end_ts, window.end_ts)
+        if lo < hi or self.start_ts <= lo == hi < self.end_ts:
+            return replace(self, start_ts=lo, end_ts=hi)
+        return None
+
+
+def unobserved_hours(periods: Iterable[Unobserved], window: Window) -> float:
+    """Recorded hours of *window* that *periods* cover, overlaps counted once.
+
+    The window's holes are not recorded time, so a period spanning one only
+    counts the hours around it.
+    """
+    hours, reached = 0.0, -math.inf
+    for p in sorted(periods, key=lambda p: p.start_ts):
+        lo = max(p.start_ts, reached)
+        if p.end_ts > lo:
+            hours += window.observed_hours_between(lo, p.end_ts)
+        reached = max(reached, p.end_ts)
+    return hours
+
+
+def blind_throughout(periods: list[Unobserved], window: Window) -> bool:
+    """Whether *periods* (already cut to *window*) leave none of it observed."""
+    return bool(periods) and (
+        unobserved_hours(periods, window) >= window.observed_hours - 1e-9
+    )
+
+
 class CoverageGap(str, Enum):
     SCHEMA_MISSING = "schema_missing"
     NOT_RECORDED = "not_recorded"
+    NOT_OBSERVED = "not_observed"
 
 
 @dataclass
 class UncoveredRule:
     """A selected rule that was not run because its input data is missing.
 
-    ``missing`` names the tables (or ``table.column``) behind ``reason``.
+    ``missing`` names the tables (or ``table.column``) behind ``reason``, or
+    for ``NOT_OBSERVED`` the :class:`Capability` values the recording lacked.
     Unlike :class:`SkippedRule`, recording longer does not help.
     """
 
@@ -227,6 +298,9 @@ class UncoveredRule:
         names = ", ".join(self.missing)
         if self.reason is CoverageGap.SCHEMA_MISSING:
             return f"DB の版が古く {names} がありません"
+        if self.reason is CoverageGap.NOT_OBSERVED:
+            labels = "、".join(Capability(n).label for n in self.missing)
+            return f"記録時に {labels} を観測できませんでした"
         return f"期間内に {names} の記録がありません"
 
     def to_dict(self) -> dict[str, Any]:
@@ -259,6 +333,8 @@ class Diagnosis:
     uncovered_rules: list[UncoveredRule] = field(default_factory=list)
     measurements: dict[str, list[Measurement]] = field(default_factory=dict)
     folded: list[Finding] = field(default_factory=list)
+    # What the recording could not observe, cut to ``window``.
+    unobserved: list[Unobserved] = field(default_factory=list)
 
     @property
     def fully_evaluated(self) -> bool:

@@ -45,11 +45,13 @@ def test_declared_inputs_exist_in_the_current_schema(cls, schema):
         assert table in schema, f"{cls.rule_id}: unknown table {table}"
         if column:
             assert column in schema[table], f"{cls.rule_id}: unknown column {name}"
-    assert all("." not in t for t in cls.requires_rows)
+    tables = {n for n in cls.requires_rows if "." not in n}
+    assert all(n.partition(".")[0] in tables for n in cls.requires_rows)
 
 
 @pytest.mark.parametrize("cls", _BUILTIN, ids=lambda c: c.rule_id)
 def test_only_sampled_tables_gate_on_rows(cls, schema):
-    assert not set(cls.requires_rows) & _EVENT_TABLES
-    for table in cls.requires_rows:
+    tables = {n.partition(".")[0] for n in cls.requires_rows}
+    assert not tables & _EVENT_TABLES
+    for table in tables:
         assert {"ts", "ts_min"} & schema[table], f"{table} has no time column"

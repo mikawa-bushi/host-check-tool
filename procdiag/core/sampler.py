@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
+from .result import Capability
+
 if TYPE_CHECKING:
     from ..config import ProcdiagConfig
 
@@ -78,15 +80,20 @@ class RunContext:
         self.config = config
         self.proc_root = proc_root
         self.cgroup_root = cgroup_root
-        # Capability flags filled in by each sampler's setup():
-        #   "psi"       — /proc/pressure/* readable
-        #   "cgroup_v2" — unified cgroup hierarchy present
-        #   "root"      — process is running as root (uid 0)
+        # Capability flags filled in by each sampler's setup() (Capability values).
         self.capabilities: Dict[str, bool] = {}
-        # Demotion notes transcribed into ObservationQuality.notes at report time.
+        # What this session cannot observe and why; the recorder keeps it in
+        # the DB so ``check`` reports the rules that needed it as not evaluated.
+        self.unobserved: Dict[Capability, str] = {}
+        # Collect failures, kept in the DB by the recorder.
         self.notes: List[str] = []
         # SelfMeter instance attached by the recorder; T1 sampler reads it.
         self.selfmeter: Any = None  # SelfMeter | None
+
+    def lacks(self, capability: Capability, reason: str) -> None:
+        """Record that this session cannot observe *capability*; *reason* in Japanese."""
+        self.capabilities[capability.value] = False
+        self.unobserved[capability] = reason
 
 
 class Sampler:
@@ -110,8 +117,8 @@ class Sampler:
     def setup(self, ctx: RunContext) -> None:
         """One-time initialisation called before the first collect.
 
-        Subclasses probe capabilities (PSI, cgroup v2, root) and record
-        demotion reasons in ``ctx.notes``.  The base implementation does
+        Subclasses probe capabilities (PSI, cgroup v2, ...) and report what
+        they cannot observe with ``ctx.lacks``.  The base implementation does
         nothing; override only what the sampler actually needs.
         """
 
@@ -132,13 +139,11 @@ class Sampler:
         ``ctx.notes``, and an empty list is returned so the record loop
         continues uninterrupted.
 
-        ``ctx.notes`` is never drained during a record session, so under a
-        *persistent* failure (PSI vanished, recurring OSError) appending one
-        note per tick would grow it without bound — an unbounded resident-memory
-        leak that ``selfmeter`` cannot throttle (it watches CPU, not RSS).
-        Consecutive identical notes from the same sampler are therefore
-        de-duplicated; a successful collect resets the guard so a *new* failure
-        is still recorded once.
+        Under a *persistent* failure (PSI vanished, recurring OSError)
+        appending one note per tick would grow ``ctx.notes`` without bound
+        whenever nothing drains it.  Consecutive identical notes from the same
+        sampler are therefore de-duplicated; a successful collect resets the
+        guard so a *new* failure is still recorded once.
         """
         try:
             batches = self.collect(ctx)
