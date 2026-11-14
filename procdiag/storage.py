@@ -395,8 +395,19 @@ def _ts_column(table: str) -> Optional[str]:
     return "ts_min" if table in _ROLLUP_TABLES else "ts"
 
 
+def _expiry_cutoffs(raw: str, rollup: Optional[str]) -> Tuple[float, Optional[float]]:
+    """Timestamps before which raw and rollup rows expire (``None``: keep all)."""
+    now = time.time()
+    raw_cutoff = now - parse_duration(raw)
+    return raw_cutoff, None if rollup is None else now - parse_duration(rollup)
+
+
 # Headroom on the guard's post-VACUUM size estimate (see _size_after_vacuum).
 _VACUUM_ESTIMATE_MARGIN = 1.02
+
+# Share of the file the guard keeps reusable when it cannot VACUUM, so that
+# recording fills freed pages instead of extending the file.
+_GUARD_HOLD_SLACK = 0.05
 
 # Rungs of the DB size guard: (name, raw retention, rollup retention).  A
 # ``None`` rollup leaves the configured rollup retention alone, so only the last
@@ -725,22 +736,24 @@ class Storage:
 
         ``raw`` and ``rollup`` are duration strings accepted by
         :func:`~procdiag.core.util.parse_duration` (e.g. ``"48h"``, ``"90d"``).
-        ``rollup=None`` leaves the rollup tables alone.
+        ``rollup=None`` leaves the rollup tables alone.  Both are parsed before
+        the first delete, so a bad duration deletes nothing.
         Returns ``{"raw_deleted": n, "rollup_deleted": m}``.
         """
-        now = time.time()
-        raw_cutoff = now - parse_duration(raw)
-
+        cutoffs = _expiry_cutoffs(raw, rollup)
         with self.conn:
-            raw_deleted = self._delete_before(RAW_TABLES, raw_cutoff)
-        rollup_deleted = 0
-        if rollup is not None:
-            rollup_cutoff = now - parse_duration(rollup)
-            with self.conn:
-                rollup_deleted = self._delete_before(
-                    _ROLLUP_TABLES + _LONG_LIVED_TABLES, rollup_cutoff
-                )
+            return self._delete_expired(*cutoffs)
 
+    def _delete_expired(
+        self, raw_cutoff: float, rollup_cutoff: Optional[float]
+    ) -> Dict[str, int]:
+        """Delete rows older than the cutoffs, in the caller's transaction."""
+        raw_deleted = self._delete_before(RAW_TABLES, raw_cutoff)
+        rollup_deleted = 0
+        if rollup_cutoff is not None:
+            rollup_deleted = self._delete_before(
+                _ROLLUP_TABLES + _LONG_LIVED_TABLES, rollup_cutoff
+            )
         return {"raw_deleted": raw_deleted, "rollup_deleted": rollup_deleted}
 
     def _delete_before(self, tables: Iterable[str], cutoff: float) -> int:
@@ -753,15 +766,19 @@ class Storage:
             deleted += cur.rowcount
         return deleted
 
+    def _wal_bytes(self) -> int:
+        try:
+            return Path(str(self.path) + "-wal").stat().st_size
+        except OSError:
+            return 0
+
     def _disk_bytes(self) -> int:
         """Bytes the DB occupies on disk: the main file plus its ``-wal``."""
-        total = 0
-        for suffix in ("", "-wal"):
-            try:
-                total += Path(str(self.path) + suffix).stat().st_size
-            except OSError:
-                pass
-        return total
+        try:
+            main = self.path.stat().st_size
+        except OSError:
+            main = 0
+        return main + self._wal_bytes()
 
     def _size_after_vacuum(self) -> int:
         """Estimate the file size after a VACUUM: what the guard steers by.
@@ -858,6 +875,13 @@ class Storage:
         only the last two rungs shorten it, and never below what is configured
         (a longer cutoff than the configured one deletes nothing).
 
+        The rungs run in one transaction, so they can be taken back.  When free
+        space is the problem, a rung only counts if the disk can then hold the
+        VACUUM (about twice the result); if even the last rung cannot get
+        there, cutting returns no space, and the guard keeps only as many rungs
+        as leave ``_GUARD_HOLD_SLACK`` of the file reusable, enough that
+        recording stops extending the file.
+
         Parameters
         ----------
         max_bytes:
@@ -904,36 +928,64 @@ class Storage:
         if fits(self._disk_bytes()):
             return {"triggered": False}
 
-        steps: List[str] = []
-        result_size = self._size_after_vacuum()
-        for step_name, raw_arg, rollup_arg in _GUARD_LADDER:
-            if fits(result_size):
-                break
-            try:
-                self.retention(raw_arg, rollup_arg)
-            except (sqlite3.Error, OSError) as exc:
-                # Do not silently swallow: a recurring retention failure would
-                # otherwise let the DB grow unbounded with no trace.
-                logger.warning(
-                    "DBサイズガード: retention 失敗 (%s): %s", step_name, exc
-                )
-                self._guard_event(
-                    "db_guard_error", f"{step_name}: retention 失敗: {exc}"
-                )
-            steps.append(step_name)
-            result_size = self._size_after_vacuum()
+        low_disk = min_free_bytes is not None and free_bytes() < min_free_bytes
+
+        def can_vacuum(size: int) -> bool:
+            # The WAL the cuts grew is given back before the VACUUM runs.
+            return free_bytes() + self._wal_bytes() >= 2 * size
+
+        def goal(size: int) -> bool:
+            return fits(size) and (can_vacuum(size) or not low_disk)
+
+        file_bytes = self.path.stat().st_size
+        applied: List[str] = []
+        sizes: List[int] = []
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            sizes.append(self._size_after_vacuum())
+            for i, (step_name, raw_arg, rollup_arg) in enumerate(_GUARD_LADDER):
+                if goal(sizes[-1]):
+                    break
+                self.conn.execute(f"SAVEPOINT guard_{i}")
+                self._delete_expired(*_expiry_cutoffs(raw_arg, rollup_arg))
+                applied.append(step_name)
+                sizes.append(self._size_after_vacuum())
+            keep = len(applied)
+            if not goal(sizes[-1]) and not can_vacuum(sizes[-1]):
+                target = (1 - _GUARD_HOLD_SLACK) * file_bytes
+                keep = next((i for i, size in enumerate(sizes) if size <= target), keep)
+            if keep < len(applied):
+                self.conn.execute(f"ROLLBACK TO guard_{keep}")
+            self.conn.commit()
+        except (sqlite3.Error, OSError) as exc:
+            # Do not silently swallow: a recurring retention failure would
+            # otherwise let the DB grow unbounded with no trace.
+            self.conn.rollback()
+            logger.warning("DBサイズガード: retention 失敗: %s", exc)
+            applied, keep = [], 0
+            sizes = sizes[:1] or [self._size_after_vacuum()]
+            self._guard_event("db_guard_error", f"retention 失敗: {exc}")
+
+        steps = applied[:keep]
+        for step_name, size in zip(steps, sizes[1:]):
             self._guard_event(
                 "db_guard",
-                f"{step_name}: DB={result_size // MiB}MB (VACUUM 後の見込み)",
+                f"{step_name}: DB={size // MiB}MB (VACUUM 後の見込み)",
             )
 
-        vacuumed = self._vacuum(result_size)
         self._truncate_wal()
+        vacuumed = self._vacuum(sizes[keep])
+        wal_returned = self._truncate_wal()
         size_after = self._disk_bytes()
+        wal_note = (
+            "WAL 切り詰め済み"
+            if wal_returned
+            else f"WAL {self._wal_bytes() // MiB}MB は読み取り中のため次回に切り詰め"
+        )
         self._guard_event(
             "db_guard_reclaim",
             f"DB={size_before // MiB}MB -> {size_after // MiB}MB"
-            f" (VACUUM {'済み' if vacuumed else '未実行'})",
+            f" (VACUUM {'済み' if vacuumed else '未実行'}, {wal_note})",
         )
         return {
             "triggered": True,
