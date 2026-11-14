@@ -147,7 +147,8 @@ def read_events(
     if until is not None:
         args += ["--until", f"@{math.ceil(until)}"]
     out = run(args)
-    if out is None:
+    # journalctl exits 0 with no output when it may not read the system journal.
+    if out is None or (not out.strip() and not journal_readable()):
         return None, after_cursor
     events, cursor = parse_short_unix(out)
     return events, cursor or after_cursor
