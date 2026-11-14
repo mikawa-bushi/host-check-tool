@@ -29,6 +29,7 @@ import math
 from typing import TYPE_CHECKING
 
 from ..core import (
+    Capability,
     Confidence,
     Finding,
     GiB,
@@ -204,7 +205,8 @@ class IoBottleneckRule(Rule):
     title = "I/Oボトルネック"
     default_severity = Severity.WARNING
     min_observation_hours = 0.5
-    requires_rows = ("sys_samples",)
+    requires_rows = ("sys_samples", "sys_samples.psi_io_some10")
+    requires_observed = (Capability.PSI,)
     what = (
         "psi_io_some10 が閾値を超えていた秒が 1 分の半分以上を占める分を数え、"
         "それが 15分以上連続している場合に発火する。"
@@ -642,7 +644,7 @@ class DiskInodeRule(Rule):
     default_severity = Severity.WARNING
     min_observation_hours = 0.0  # the current usage alone is decisive
     requires_schema = ("disk_samples.inodes_total", "disk_samples.inodes_used")
-    requires_rows = ("disk_samples",)
+    requires_rows = ("disk_samples", "disk_samples.inodes_total")
     what = "disk_samples の inodes_used / inodes_total の最新値と増加傾向を確認する"
     why = (
         "小さなファイルが大量にあると、容量に空きがあっても inode が尽きて"
@@ -737,7 +739,7 @@ class FsReadOnlyRule(Rule):
     default_severity = Severity.CRITICAL
     min_observation_hours = 0.0
     requires_schema = ("disk_samples.read_only",)
-    requires_rows = ("disk_samples",)
+    requires_rows = ("disk_samples", "disk_samples.read_only")
     what = "disk_samples の read_only フラグが記録中に 0→1 へ変わったマウントを検出する"
     why = (
         "ファイルシステムはエラーを検出すると自動的に読み取り専用で再マウントされる。"

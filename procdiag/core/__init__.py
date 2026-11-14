@@ -7,6 +7,7 @@ that holds each name — mirrors netdiag's ``core/__init__.py``.
 from __future__ import annotations
 
 from .result import (
+    Capability,
     Confidence,
     CoverageGap,
     Diagnosis,
@@ -18,6 +19,7 @@ from .result import (
     Severity,
     SkippedRule,
     UncoveredRule,
+    Unobserved,
     Window,
     covers,
 )
@@ -64,6 +66,8 @@ __all__ = [
     "SkippedRule",
     "UncoveredRule",
     "CoverageGap",
+    "Capability",
+    "Unobserved",
     "Headline",
     "Observation",
     "Measurement",

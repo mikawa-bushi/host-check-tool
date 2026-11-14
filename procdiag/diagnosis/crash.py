@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 
 from .. import kernlog
 from ..core import (
+    Capability,
     Confidence,
     Finding,
     MiB,
@@ -416,6 +417,7 @@ class UncleanShutdownRule(Rule):
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
     requires_schema = ("sessions",)
+    requires_observed = (Capability.SESSIONS,)
     what = (
         "記録セッションの履歴 (sessions) で、正常停止せずに次の起動 (boot) へ"
         "移ったセッションを検出する"
@@ -528,6 +530,7 @@ class ServiceRestartRule(Rule):
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
     requires_schema = ("service_events",)
+    requires_observed = (Capability.SYSTEMD,)
     what = "systemd の自動再起動回数 (NRestarts) の増加と failed 遷移をユニットごとに集計する"
     why = (
         "クラッシュ→自動再起動を繰り返すサービスは、その時点では active に見えるため"
@@ -664,6 +667,7 @@ class KernelErrorRule(Rule):
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
     requires_schema = ("kernel_events",)
+    requires_observed = (Capability.KERNEL_LOG,)
     what = (
         "kernel_events (カーネルログから抽出した I/O エラー・FS エラー・ハングタスク・"
         "ハードウェアエラー・segfault・USB 切断) を種類別に集計する"

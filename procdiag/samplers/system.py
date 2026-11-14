@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 import psutil
 
+from ..core.result import Capability
 from ..core.sampler import (
     RunContext,
     SampleBatch,
@@ -156,19 +157,18 @@ class SystemSampler(Sampler):
     def setup(self, ctx: RunContext) -> None:
         """Detect PSI support and record the capability flag.
 
-        If ``/proc/pressure/cpu`` is absent or unreadable, ``ctx.capabilities["psi"]``
-        is set to ``False`` and a Japanese demotion note is appended to
-        ``ctx.notes``.
+        If ``/proc/pressure/cpu`` is absent or unreadable (PSI disabled reads
+        fail with EOPNOTSUPP), the session lacks :attr:`Capability.PSI`.
         """
         cpu_pressure = ctx.proc_root / "pressure" / "cpu"
         try:
             cpu_pressure.read_text()
-            ctx.capabilities["psi"] = True
-        except OSError:
-            ctx.capabilities["psi"] = False
-            ctx.notes.append(
-                "PSI(/proc/pressure)が読み取れないため、PSI列はNULLで記録されます。"
-                "カーネル4.20未満またはPSI無効でビルドされた可能性があります。"
+            ctx.capabilities[Capability.PSI.value] = True
+        except OSError as exc:
+            ctx.lacks(
+                Capability.PSI,
+                f"PSI (/proc/pressure) を読めないため、CPU・メモリ・I/O の圧迫を記録していません"
+                f" ({exc.strerror or exc})。カーネル 4.20 より前か、PSI が無効です",
             )
 
     def collect(self, ctx: RunContext) -> List[SampleBatch]:

@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .. import kernlog
+from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
@@ -57,11 +58,12 @@ class KernelLogSampler(Sampler):
         newest = kernlog.newest_cursor()
         self._enabled = newest is not None
         self._cursor = self._cursor or newest
-        ctx.capabilities["kernel_log"] = self._enabled
+        ctx.capabilities[Capability.KERNEL_LOG.value] = self._enabled
         if not self._enabled:
-            ctx.notes.append(
+            ctx.lacks(
+                Capability.KERNEL_LOG,
                 "kernel_log: カーネルログを読めません (root または systemd-journal/adm "
-                "グループが必要) — カーネル異常の記録をスキップします"
+                "グループが必要) — カーネル異常の記録をスキップします",
             )
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:

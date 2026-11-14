@@ -25,7 +25,15 @@ from typing import (
     Union,
 )
 
-from .result import Finding, Headline, Measurement, Observation, Severity, Window
+from .result import (
+    Capability,
+    Finding,
+    Headline,
+    Measurement,
+    Observation,
+    Severity,
+    Window,
+)
 
 if TYPE_CHECKING:
     # Avoid circular imports at runtime; both are only referenced in type hints.
@@ -56,8 +64,12 @@ class Rule:
     #   cannot fire.  Never event tables (empty is their normal state) and
     #   never tables read only to attribute a finding.  Tables listed here must
     #   exist as well.
+    #   A "table.column" entry needs a non-NULL value of that column there.
+    # requires_observed: what the recorder must have been able to observe; a
+    #   window in which no recording could is not evaluated.
     requires_schema: tuple[str, ...] = ()
     requires_rows: tuple[str, ...] = ()
+    requires_observed: tuple[Capability, ...] = ()
 
     @classmethod
     def tunables(cls) -> Dict[str, Union[int, float]]:
