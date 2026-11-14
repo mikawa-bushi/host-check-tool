@@ -364,6 +364,195 @@ class TestServiceSampler:
         assert kinds == [("restart", 2, "exit-code"), ("failed", 0, "exit-code")]
         assert sampler.collect(ctx) == []  # manual reset + still failed: no new event
 
+    def test_unit_failures_reads_the_failed_with_result_lines_after_since(
+        self, monkeypatch
+    ):
+        from procdiag import systemd
+
+        out = (
+            '{"UNIT":"a.service","UNIT_RESULT":"exit-code",'
+            '"__REALTIME_TIMESTAMP":"1700000000500000"}\n'
+            '{"UNIT":"a.service","UNIT_RESULT":"signal",'
+            '"__REALTIME_TIMESTAMP":"1700000100000000"}\n'
+            '{"UNIT":"b.service","UNIT_RESULT":"core-dump",'
+            '"__REALTIME_TIMESTAMP":"1700000200000000"}\n'
+        )
+        monkeypatch.setattr(systemd, "run", lambda args: out)
+
+        assert systemd.unit_failures(1700000000.5) == {
+            "a.service": ["signal"],
+            "b.service": ["core-dump"],
+        }
+
+
+_POLL = 300.0
+
+
+def _unit(
+    n_restarts, *, restart="on-failure", force="", state="active", result="success"
+):
+    return {
+        "NRestarts": str(n_restarts),
+        "Restart": restart,
+        "RestartForceExitStatus": force,
+        "ActiveState": state,
+        "Result": result,
+    }
+
+
+def _record_session(store, monkeypatch, polls, *, start, journal=None):
+    """*journal* maps a unit to the (ts, UNIT_RESULT) of its "Failed with
+    result" lines; None means the journal is unreadable."""
+    from test_sampler_cgroup_process import _make_ctx
+
+    from procdiag import kernlog
+    from procdiag.samplers import service as svc_mod
+
+    answers = iter(polls)
+    monkeypatch.setattr(kernlog, "journal_readable", lambda: journal is not None)
+    monkeypatch.setattr(
+        svc_mod.systemd,
+        "unit_failures",
+        lambda since: {
+            unit: [r for ts, r in lines if since < ts <= svc_mod.time.time()]
+            for unit, lines in (journal or {}).items()
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(svc_mod.systemd, "available", lambda: True)
+    monkeypatch.setattr(svc_mod.systemd, "list_service_units", lambda: sorted(polls[0]))
+    monkeypatch.setattr(
+        svc_mod.systemd,
+        "show_units",
+        lambda units, *a, **k: {u: {"Id": u, **p} for u, p in next(answers).items()},
+    )
+    sampler = svc_mod.ServiceSampler()
+    ctx = _make_ctx()
+    sampler.setup(ctx)
+    for k in range(len(polls)):
+        with monkeypatch.context() as m:
+            m.setattr(svc_mod.time, "time", lambda ts=start + k * _POLL: ts)
+            batches = sampler.collect(ctx)
+        for batch in batches:
+            store.buffer(batch.table, batch.rows)
+
+
+def _diagnose(store):
+    store.flush()
+    diag = Engine(ProcdiagConfig()).run(store, only=["SERVICE-RESTART-01"])
+    store.close()
+    return {f.subject: f for f in diag.findings}
+
+
+class TestServiceRestartFromPolls:
+    @pytest.mark.parametrize(
+        ("counts", "restarts"),
+        [([10, 3, 3, 3], 3), ([10, 4, 8, 12], 12)],
+        ids=["3-after-reset", "12-after-reset"],
+    )
+    def test_restarts_after_a_manual_restart_reset_the_counter_are_counted(
+        self, tmp_path, monkeypatch, counts, restarts
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        _record_session(
+            store,
+            monkeypatch,
+            [{"plc-gw.service": _unit(n)} for n in counts],
+            start=start,
+        )
+
+        f = _diagnose(store)["plc-gw.service"]
+
+        assert (f.severity, f.evidence["restarts"]) == (Severity.CRITICAL, restarts)
+
+    @pytest.mark.parametrize(
+        ("policy", "force", "journal", "severity", "confidence"),
+        [
+            ("always", "", "no-failures", Severity.WARNING, Confidence.LOW),
+            ("on-failure", "75", "no-failures", Severity.WARNING, Confidence.LOW),
+            ("on-success", "", None, Severity.WARNING, Confidence.LOW),
+            ("always", "", "a-failure-per-restart", Severity.CRITICAL, Confidence.HIGH),
+            ("always", "", None, Severity.CRITICAL, Confidence.MEDIUM),
+            ("on-failure", "", None, Severity.CRITICAL, Confidence.HIGH),
+        ],
+        ids=[
+            "always-clean-exits",
+            "forced-exit-status-clean",
+            "on-success",
+            "always-crashes",
+            "always-journal-unreadable",
+            "on-failure",
+        ],
+    )
+    def test_restarts_after_a_clean_exit_are_no_crash_loop(
+        self, tmp_path, monkeypatch, policy, force, journal, severity, confidence
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        restarted_at = [start + k * _POLL - 60 for k in range(4, 33, 4)]
+        lines = {
+            None: None,
+            "no-failures": {},
+            "a-failure-per-restart": {
+                "collector.service": [(ts, "exit-code") for ts in restarted_at]
+            },
+        }[journal]
+        _record_session(
+            store,
+            monkeypatch,
+            [
+                {"collector.service": _unit(k // 4, restart=policy, force=force)}
+                for k in range(33)
+            ],
+            start=start,
+            journal=lines,
+        )
+
+        f = _diagnose(store)["collector.service"]
+
+        assert (f.severity, f.confidence) == (severity, confidence)
+        assert f.evidence["crash_loop"] is (severity == Severity.CRITICAL)
+        if confidence == Confidence.LOW:
+            assert "正常に終了" in f.proposal
+
+    def test_a_unit_failed_before_recording_is_not_a_failed_transition_per_start(
+        self, tmp_path, monkeypatch
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        failed = {"legacy-sync.service": _unit(0, state="failed", result="exit-code")}
+        for session in range(3):
+            _record_session(
+                store, monkeypatch, [failed, failed], start=start + session * _HOUR
+            )
+
+        f = _diagnose(store)["legacy-sync.service"]
+
+        assert f.severity == Severity.WARNING
+        assert f.evidence["failed_count"] == 0
+        assert f.evidence["failed_at_start"] is True
+
+    def test_failed_transitions_seen_while_recording_are_each_counted(
+        self, tmp_path, monkeypatch
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        active = {"db.service": _unit(0)}
+        failed = {"db.service": _unit(0, state="failed", result="exit-code")}
+        for session in range(3):
+            _record_session(
+                store, monkeypatch, [active, failed], start=start + session * _HOUR
+            )
+
+        f = _diagnose(store)["db.service"]
+
+        assert f.evidence["failed_count"] == 3
+
 
 # ---------------------------------------------------------------------------
 # KERNEL-ERROR-01 + kernlog + KernelLogSampler
