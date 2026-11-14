@@ -463,15 +463,18 @@ class Engine:
             if key not in cache:
                 table, _, column = name.partition(".")
                 if column:
-                    cache[key] = store.has_values(
+                    found = store.has_values(
                         table, column, window.start_ts, window.end_ts
                     )
                 else:
-                    inside = store.time_bounds(table, window.start_ts, window.end_ts)
-                    cache[key] = inside is not None or (
-                        table in OPTIONAL_SAMPLER_TABLES
-                        and store.time_bounds(table) is None
+                    found = (
+                        store.time_bounds(table, window.start_ts, window.end_ts)
+                        is not None
                     )
+                cache[key] = found or (
+                    table in OPTIONAL_SAMPLER_TABLES
+                    and store.time_bounds(table) is None
+                )
             return cache[key]
 
         needed = dict.fromkeys((*rule.requires_schema, *rule.requires_rows))
