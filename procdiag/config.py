@@ -355,7 +355,8 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
 
     namespace: dict[str, Any] = {}
     try:
-        source = Path(path).read_text(encoding="utf-8")
+        # Bytes: Python then honours a BOM or a "coding:" line, as for any .py.
+        source = Path(path).read_bytes()
         exec(compile(source, str(path), "exec"), namespace)  # noqa: S102
     except Exception as e:
         raise ValueError(f"設定ファイルの読み込みに失敗しました: {path}\n{e}") from e

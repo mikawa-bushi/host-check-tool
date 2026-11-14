@@ -45,6 +45,7 @@ from ..core import (
     all_rules,
     configure_rule,
     covers,
+    rule_id_problems,
 )
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
@@ -146,12 +147,31 @@ class Engine:
     ) -> list[type[Rule]]:
         """Return the rule classes that will be run.
 
-        Applies ``config.rules.disabled`` first, then *only* / *skip*.
+        Loads ``config.rules.extra_rules`` so their IDs are known, then
+        applies ``config.rules.disabled``, then *only* / *skip*.
         Returns rule class objects (not instances) so the caller can inspect
         class attributes before deciding to instantiate them.
+
+        Raises :class:`ValueError` (one problem per line) when a rule ID in
+        ``rules.disabled`` / *only* / *skip* is not registered, when *only*
+        names a disabled rule, or when no rule is left to run, so a mistake
+        never quietly changes which rules a "no problem" verdict covers.
         """
+        self._load_extra_rules([])
         disabled = set(self.config.rules.disabled)
         registry = all_rules()  # {rule_id: RuleClass}
+        problems = [
+            *rule_id_problems("rules.disabled", self.config.rules.disabled),
+            *rule_id_problems("--only", only or []),
+            *rule_id_problems("--skip", skip or []),
+            *(
+                f"--only: {rule_id} は rules.disabled で無効にしているため実行できません"
+                for rule_id in only or []
+                if rule_id in disabled
+            ),
+        ]
+        if problems:
+            raise ValueError("\n".join(problems))
 
         candidates: list[type[Rule]] = [
             cls for rule_id, cls in registry.items() if rule_id not in disabled
@@ -162,7 +182,11 @@ class Engine:
         if skip:
             skip_set = set(skip)
             candidates = [c for c in candidates if c.rule_id not in skip_set]
-
+        if not candidates:
+            raise ValueError(
+                "実行するルールがありません (rules.disabled と --only / --skip で"
+                "すべて除外されています)"
+            )
         return candidates
 
     def required_hours(
@@ -170,7 +194,6 @@ class Engine:
         only: Optional[list[str]] = None,
         skip: Optional[list[str]] = None,
     ) -> float:
-        self._load_extra_rules([])
         return max(
             (
                 configure_rule(cls, self.config)[0].min_observation_hours

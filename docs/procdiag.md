@@ -105,6 +105,8 @@ procdiag check -o report.html
 --verbose                 # 推論過程を表示
 ```
 
+`--only` / `--skip` (`compare` も同じ) と `config.rules.disabled` のルール ID は、`procdiag explain` の一覧どおり大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に書いたとき、実行するルールが 1 つも残らないときは、診断せずに終了コード `4` で終わる。
+
 ### 終了コード (check)
 
 | コード | 意味 |
