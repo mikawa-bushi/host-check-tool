@@ -169,9 +169,9 @@ class TestHelpAndVersion:
         assert f"procdiag {args[0]} は削除されました" in result.output
         assert replacement in result.output
 
-    def test_unknown_command_still_fails_normally(self, runner):
+    def test_unknown_command_is_a_precondition_error(self, runner):
         result = runner.invoke(cli, ["no-such-command"])
-        assert result.exit_code == 2
+        assert result.exit_code == 4
         assert "削除されました" not in result.output
 
     def test_version(self, runner):
