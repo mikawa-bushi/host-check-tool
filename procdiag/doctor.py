@@ -17,8 +17,7 @@ Key design choices:
 * Each check body only returns ``(status, detail)``; the ``@_doctor_check``
   decorator attaches its name/label and turns an unexpected exception into a
   result, so one failing check never terminates the doctor run.
-* No external dependencies beyond psutil and stdlib; the check for
-  ``io_counters`` walks real processes so it is bounded by ``_IO_SAMPLE_MAX``.
+* No external dependencies beyond psutil and stdlib.
 """
 
 from __future__ import annotations
@@ -32,12 +31,9 @@ from typing import Callable, Optional
 
 import psutil
 
+from . import kernlog
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig
 from .core.util import GiB, MiB
-
-# Maximum number of processes to sample when probing io_counters read-rate.
-_IO_SAMPLE_MAX = 80
-
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -127,12 +123,10 @@ def _check_root() -> _Outcome:
 
 @_doctor_check("io_counters", "プロセス I/O カウンタ", what="I/O カウンタ")
 def _check_io_counters() -> _Outcome:
-    """Sample up to _IO_SAMPLE_MAX processes and measure io_counters read rate."""
+    """Measure the io_counters read rate over every process."""
     total = 0
     success = 0
     for proc in psutil.process_iter(["pid"]):
-        if total >= _IO_SAMPLE_MAX:
-            break
         total += 1
         try:
             proc.io_counters()
@@ -152,7 +146,8 @@ def _check_io_counters() -> _Outcome:
     miss_pct = round((1.0 - rate) * 100)
     return (
         "degraded",
-        f"I/O 欠損率 約 {miss_pct}% — IO-BOTTLENECK-01 の"
+        f"I/O 欠損率 約 {miss_pct}% (読めないプロセス {total - success}/{total})"
+        " — IO-BOTTLENECK-01 の"
         " 確証度が下がります (cgroup 統計で部分代替)",
     )
 
@@ -169,16 +164,17 @@ def _check_smaps(proc_root: Path) -> _Outcome:
 
 @_doctor_check("journal", "systemd journal", what="journal ")
 def _check_journal() -> _Outcome:
-    """Check whether /var/log/journal is readable."""
-    journal_path = Path("/var/log/journal")
-    if journal_path.exists() and os.access(str(journal_path), os.R_OK):
+    """Check whether kernel messages can be read from the journal."""
+    if kernlog.journal_readable():
         return (
             "ok",
-            "journal 読取可能 — OOM 確証度昇格と DISK-JOURNAL-01 が有効です",
+            "カーネルログを読めます — KERNEL-ERROR-01 の記録と"
+            " OOM-KILL-01 の確証度昇格が有効です",
         )
     return (
         "degraded",
-        "journal 読取不可 — DISK-JOURNAL-01 と OOM 確証度昇格が制限されます",
+        "カーネルログを読めません (root または systemd-journal/adm グループが必要)"
+        " — KERNEL-ERROR-01 は記録されず、OOM-KILL-01 の確証度昇格も無効になります",
     )
 
 
@@ -193,26 +189,42 @@ def _check_sensors() -> _Outcome:
     )
 
 
-@_doctor_check("db_disk", "DB 置き場の空き容量", what="ディスク容量")
+@_doctor_check("db_disk", "記録 DB の置き場", what="DB 置き場")
 def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
-    """Check free space on the partition that will hold the recording DB."""
+    """Check that ``record`` can write the DB and has room for it."""
     db_path = Path(config.db_path)
-    parent = db_path.parent
+    folder = db_path.parent
+    while not os.path.exists(folder):
+        folder = folder.parent
 
-    # Ensure the parent directory exists so statvfs can be called.
-    parent.mkdir(parents=True, exist_ok=True)
-    free_gb = shutil.disk_usage(str(parent)).free / GiB
+    fix = (
+        "このままでは record は記録できません。"
+        "書き込める場所を --db か config.py の db_path で指定してください"
+    )
+    if not os.access(folder, os.W_OK | os.X_OK):
+        return "degraded", f"{folder} に書き込めません — {fix}"
+    if db_path.exists() and not os.access(db_path, os.R_OK | os.W_OK):
+        return "degraded", f"{db_path} に書き込めません — {fix}"
+
+    free = shutil.disk_usage(folder).free
+    min_free_mb = config.retention.min_free_disk_mb
 
     db_size_str = ""
     if db_path.exists():
         db_size_str = f"  (既存 DB サイズ: {db_path.stat().st_size / MiB:.1f} MB)"
 
-    if free_gb < 1.0:
+    if free < min_free_mb * MiB:
         return (
             "degraded",
-            f"記録 DB の置き場が逼迫しています (空き {free_gb:.2f} GB){db_size_str}",
+            f"記録 DB の置き場が逼迫しています (空き {free / GiB:.2f} GB、最低空き容量"
+            f" {min_free_mb:.0f} MB 未満) — record は保持期間より早く古い記録を"
+            f"削除します{db_size_str}",
         )
-    return "ok", f"空き {free_gb:.1f} GB — 記録に十分な容量があります{db_size_str}"
+    return (
+        "ok",
+        f"空き {free / GiB:.1f} GB — 記録できます (空きが {min_free_mb:.0f} MB を"
+        f"下回ると古い記録から削除します){db_size_str}",
+    )
 
 
 @_doctor_check(
