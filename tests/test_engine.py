@@ -332,7 +332,7 @@ class TestCpuSinglecore:
         core_pct: float = 98.0,
         cpu_avg: float = 30.0,
     ) -> None:
-        """Insert sys_rollup_1m rows simulating a singlecore saturation episode."""
+        """Insert sys_samples rows simulating a singlecore saturation episode."""
         rows = []
         for i in range(duration_minutes):
             ts = start_ts + i * 60.0
@@ -340,18 +340,25 @@ class TestCpuSinglecore:
                 (
                     ts,
                     cpu_avg,
-                    cpu_avg + 5,
-                    cpu_avg + 8,
                     core_pct,
                     int(2 * _GB),
-                    int(2.1 * _GB),
+                    int(6 * _GB),
+                    0,
+                    0,
+                    0,
+                    0.1,
+                    0.0,
+                    0.0,
                     0.0,
                     0.0,
                     0.0,
                     0,
+                    0,
+                    0.1,
+                    int(50 * _MB),
                 )
             )
-        store.buffer("sys_rollup_1m", rows)
+        store.buffer("sys_samples", rows)
         store.flush(reason="synth")
 
     def test_singlecore_detected(self, tmp_path):
