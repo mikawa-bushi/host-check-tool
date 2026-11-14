@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import typing
@@ -135,6 +136,45 @@ def test_a_cwd_config_in_a_shared_directory_needs_the_sticky_bit(
         assert result.exit_code == 0, result.output
 
 
+@pytest.mark.parametrize("linked_from_shared", [False, True], ids=["to", "from"])
+def test_a_cwd_config_linked_to_or_from_a_shared_directory_is_not_executed(
+    tmp_path, monkeypatch, linked_from_shared
+):
+    shared = tmp_path / "shared"
+    mine = tmp_path / "mine"
+    shared.mkdir()
+    mine.mkdir()
+    link, target = (shared, mine) if linked_from_shared else (mine, shared)
+    (target / "config.py").write_text(PLANTED, encoding="utf-8")
+    (link / "config.py").symlink_to(target / "config.py")
+    shared.chmod(0o777)
+    monkeypatch.chdir(link)
+
+    result = CliRunner().invoke(cli, ["status"])
+
+    assert result.exit_code == 4, result.output
+    assert "sticky" in result.output
+    assert not (link / "PWNED").exists()
+
+
+@NOT_ROOT
+def test_a_sticky_shared_directory_must_belong_to_the_user_or_root(
+    tmp_path, monkeypatch, someone_else
+):
+    # Under someone_else this folder is another user's, who may replace any file
+    # in it despite the sticky bit; /etc/passwd stands for a file root owns.
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+    (shared / "config.py").symlink_to("/etc/passwd")
+    monkeypatch.chdir(shared)
+
+    result = CliRunner().invoke(cli, ["status"])
+
+    assert result.exit_code == 4, result.output
+    assert "sticky" in result.output
+
+
 @NOT_ROOT
 def test_doctor_reports_what_the_loader_refuses(tmp_path, monkeypatch, someone_else):
     monkeypatch.chdir(tmp_path)
@@ -194,6 +234,41 @@ def test_a_relative_db_path_is_relative_to_the_config_file(tmp_path, monkeypatch
     assert cfg.db_path == str(site.resolve() / "data" / "procdiag.db")
     assert status.exit_code == 0, status.output
     assert list(elsewhere.iterdir()) == []
+
+
+def test_a_database_left_at_the_old_place_is_still_used_with_a_warning(
+    tmp_path, monkeypatch
+):
+    config = _write_config(tmp_path / "etc" / "config.py", "./procdiag.db")
+    old = _make_db(tmp_path / "home" / "procdiag.db")
+    monkeypatch.chdir(old.parent)
+
+    result = CliRunner().invoke(
+        cli, ["doctor", "--config", str(config), "--format", "json"]
+    )
+
+    (db_check,) = [c for c in json.loads(result.stdout) if c["name"] == "db_disk"]
+    assert result.exit_code == 2, result.output
+    assert db_check["status"] == "degraded"
+    for detail in (db_check["detail"], result.stderr):
+        assert str(old) in detail
+        assert str(tmp_path / "etc" / "procdiag.db") in detail
+    assert not (tmp_path / "etc" / "procdiag.db").exists()
+
+
+def test_a_database_next_to_the_config_file_wins_over_the_old_place(
+    tmp_path, monkeypatch
+):
+    config = _write_config(tmp_path / "etc" / "config.py", "./procdiag.db")
+    new = _make_db(tmp_path / "etc" / "procdiag.db")
+    old = _make_db(tmp_path / "home" / "procdiag.db")
+    monkeypatch.chdir(old.parent)
+
+    result = CliRunner().invoke(cli, ["status", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert f"DB: {new}" in result.stdout
+    assert str(old) not in result.output
 
 
 def test_without_a_config_file_the_default_db_is_in_the_cwd(tmp_path, monkeypatch):

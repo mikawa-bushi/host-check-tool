@@ -18,6 +18,9 @@ import pytest
 from click.testing import CliRunner
 
 from procdiag.cli import cli
+from procdiag.storage import Storage
+
+NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
 
 _ESCAPES = {
     "a": "\a",
@@ -262,6 +265,93 @@ def test_a_config_mistake_exits_with_a_code_the_unit_does_not_restart_on(tmp_pat
 
     assert str(done.returncode) in prevented.split(), done.stdout + done.stderr
     assert "設定ファイルが見つかりません" in done.stderr
+
+
+def _sessions(db: Path) -> int:
+    with Storage(db, read_only=True) as store:
+        return len(store.sessions())
+
+
+@NOT_ROOT
+def test_a_database_folder_that_is_not_there_yet_is_retried(tmp_path):
+    mnt = tmp_path / "mnt"
+    mnt.mkdir()
+    db = mnt / "usb" / "procdiag.db"
+    unit = _print("--db", str(db), "--duration", "1s")
+    (prevented,) = _field(unit, "RestartPreventExitStatus")
+
+    mnt.chmod(0o555)
+    try:
+        before_mount = _run_exec_start(unit, tmp_path)
+    finally:
+        mnt.chmod(0o755)
+    after_mount = _run_exec_start(unit, tmp_path)
+
+    assert before_mount.returncode == 1, before_mount.stdout + before_mount.stderr
+    assert "1" not in prevented.split()
+    assert str(db) in before_mount.stderr
+    assert after_mount.returncode == 0, after_mount.stdout + after_mount.stderr
+    assert _sessions(db) == 1
+
+
+# The README used to set units up with ``--config /etc/procdiag/config.py`` and
+# a relative ``db_path``, which procdiag then read from the unit's working
+# folder: $HOME for a user unit, / for a system unit.
+OLD_README_CONFIG = (
+    "from procdiag.config import ProcdiagConfig\n"
+    'config = ProcdiagConfig(db_path="./procdiag.db")\n'
+)
+
+
+def _one_notice(stderr: str, used: Path, unused: Path) -> str:
+    (line,) = [ln for ln in stderr.splitlines() if str(used) in ln]
+    assert str(unused) in line
+    assert "絶対パス" in line
+    return line
+
+
+@NOT_ROOT
+def test_an_upgraded_user_unit_keeps_recording_into_its_database(tmp_path):
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "config.py").write_text(OLD_README_CONFIG, encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    Storage(home / "procdiag.db").close()
+    unit = _print("--config", str(etc / "config.py"), "--duration", "1s")
+
+    etc.chmod(0o555)
+    try:
+        done = _run_exec_start(unit, home)
+    finally:
+        etc.chmod(0o755)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _sessions(home / "procdiag.db") == 1
+    assert [p.name for p in etc.iterdir()] == ["config.py"]
+    _one_notice(done.stderr, used=home / "procdiag.db", unused=etc / "procdiag.db")
+
+
+def test_an_upgraded_system_unit_keeps_one_history(tmp_path, monkeypatch):
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    config = etc / "config.py"
+    config.write_text(OLD_README_CONFIG, encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    Storage(root / "procdiag.db").close()
+    unit = _print("--system", "--config", str(config), "--duration", "1s")
+
+    done = _run_exec_start(unit, root)
+    monkeypatch.chdir(root)
+    status = CliRunner().invoke(cli, ["status", "--config", str(config)])
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _sessions(root / "procdiag.db") == 1
+    assert [p.name for p in etc.iterdir()] == ["config.py"]
+    _one_notice(done.stderr, used=root / "procdiag.db", unused=etc / "procdiag.db")
+    assert status.exit_code == 0, status.output
+    assert f"DB: {root / 'procdiag.db'}" in status.stdout
 
 
 def test_install_writes_the_same_absolute_quoted_unit(tmp_path, monkeypatch):

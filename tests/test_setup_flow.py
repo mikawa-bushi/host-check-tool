@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -134,3 +137,26 @@ def test_an_empty_period_bound_is_an_error_not_the_default_period(tmp_path, args
 
     assert result.exit_code == 4, result.output
     assert "時刻の形式が不正です" in result.output
+
+
+def test_an_empty_record_duration_is_an_error_not_forever(tmp_path):
+    db = tmp_path / "p.db"
+    # Coverage stays off in the child: pytest-cov cannot combine its data.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("COV_CORE", "COVERAGE_"))
+    }
+
+    done = subprocess.run(
+        [sys.executable, "-m", "procdiag.cli", "record", "--duration", "", "--db", db],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**env, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert done.returncode == 4, done.stdout + done.stderr
+    assert "期間の形式が不正です" in done.stderr
+    assert not db.exists()
