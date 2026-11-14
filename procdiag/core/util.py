@@ -117,6 +117,10 @@ def humanize_duration(sec: float) -> str:
     return "".join(parts) if parts else "0秒"
 
 
+# Characters of a command line kept as its display sample.
+CMDLINE_SAMPLE_CHARS = 200
+
+
 def normalize_cmdline(
     cmdline: list[str], *, replace_digits: bool = True
 ) -> tuple[str, str]:
@@ -144,7 +148,7 @@ def normalize_cmdline(
     hash12 = hashlib.sha1(normalised.encode("utf-8", errors="replace")).hexdigest()[:12]
 
     # Keep the display sample short but recognisable.
-    display = raw_text[:200] if len(raw_text) > 200 else raw_text
+    display = raw_text[:CMDLINE_SAMPLE_CHARS]
 
     return hash12, display
 

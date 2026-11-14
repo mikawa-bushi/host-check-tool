@@ -15,12 +15,13 @@ import math
 import statistics
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence
 
-from ..core import Confidence, Observation, covers
+from ..core import Confidence, Finding, Measurement, Observation, covers
+from ..core.util import CMDLINE_SAMPLE_CHARS
 
 if TYPE_CHECKING:
     from ..storage import ProcIdentity
@@ -306,7 +307,8 @@ def proc_trend_observations(
                     "proc_id": instance.proc_id,
                     "pid": instance.pid,
                     "pids": instance.pids,
-                    "cmdline": identity.cmdline if identity else None,
+                    "last_seen": instance.last_ts,
+                    "script": script_label(identity.cmdline) if identity else None,
                     "r2": fit.r2,
                     "n": fit.n,
                     "span_hours": fit.span_hours,
@@ -323,15 +325,101 @@ def proc_details(obs: Observation) -> dict[str, Any]:
     return {
         "proc_id": ev["proc_id"],
         "process_name": obs.subject,
+        "script": ev["script"],
         "pid": ev["pid"],
         "pids": ev["pids"],
-        "cmdline": ev["cmdline"],
+        "last_seen": ev["last_seen"],
     }
 
 
-def proc_label(name: str, pid: Optional[int]) -> str:
-    """``name (PID n)``, or the name alone when the PID was not recorded."""
-    return name if pid is None else f"{name} (PID {pid})"
+# What a command-line argument must end in to be shown as the script a program
+# runs.  Nothing else of the command line is shown: it may carry passwords.
+_SCRIPT_SUFFIXES = (
+    ".py",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".rb",
+    ".pl",
+    ".php",
+    ".sh",
+    ".jar",
+)
+
+
+def script_label(cmdline: Optional[str]) -> Optional[str]:
+    """The file name of the script *cmdline* runs, when it is safe to show.
+
+    Only an argument that is a path (with a ``/``) to a file with a script
+    extension counts, never one with ``=``, ``:`` or ``@`` in it, and only a
+    file name without digits: *cmdline* is the first process's, and another
+    process of the program may differ from it in digits.
+    """
+    if not cmdline:
+        return None
+    args = cmdline.split()
+    if len(cmdline) >= CMDLINE_SAMPLE_CHARS:
+        args = args[:-1]  # possibly cut short
+    for arg in args:
+        name = arg.rsplit("/", 1)[-1]
+        if (
+            "/" in arg
+            and name.endswith(_SCRIPT_SUFFIXES)
+            and not any(c in "=:@" for c in arg)
+            and not any(c.isdigit() for c in name)
+        ):
+            return name
+    return None
+
+
+def proc_label(name: str, script: Optional[str], pid: Optional[int]) -> str:
+    """``python3 uploader.py (PID 2102)``, as far as the script and PID are known."""
+    label = f"{name} {script}" if script else name
+    return label if pid is None else f"{label} (PID {pid})"
+
+
+# PIDs a finding lists of the other processes of its program that matched too.
+_OTHER_PIDS_SHOWN = 5
+
+
+def one_per_program(findings: Iterable[Finding]) -> list[Finding]:
+    """The first finding of each program in *findings*, which come worst first.
+
+    A program is ``evidence["proc_id"]``: the processes of one program (a pool
+    of workers, an hourly batch) are judged one by one but reported as one
+    finding, which counts the others and lists a few of their PIDs.
+    """
+    by_program: dict[int, list[Finding]] = {}
+    for finding in findings:
+        by_program.setdefault(finding.evidence["proc_id"], []).append(finding)
+    kept = []
+    for worst, *others in by_program.values():
+        if others:
+            pids = [f.evidence["pid"] for f in others if f.evidence["pid"] is not None]
+            shown = pids[:_OTHER_PIDS_SHOWN]
+            listed = ", ".join(map(str, shown)) + (
+                " ほか" if len(others) > len(shown) else ""
+            )
+            worst = replace(
+                worst,
+                summary=f"{worst.summary}。他 {len(others)} プロセスも同様 (PID {listed})",
+                evidence={
+                    **worst.evidence,
+                    "other_processes": len(others),
+                    "other_pids": shown,
+                },
+            )
+        kept.append(worst)
+    return kept
+
+
+def worst_process_per_program(measured: Iterable[Measurement]) -> list[Finding]:
+    """The findings of per-process *measured*, one per program (see
+    :func:`one_per_program`): its process with the largest measured value."""
+    firing = [(m.observation.value, m.finding) for m in measured if m.finding]
+    firing.sort(key=lambda pair: pair[0], reverse=True)
+    return one_per_program(finding for _, finding in firing)
 
 
 def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:

@@ -4,7 +4,8 @@ Currently implements:
 
 - **MEM-LEAK-01**: Detect monotonically growing RSS in a process over the
   observation window using linear regression, each process of a program on
-  its own and followed across restarts (``trend.proc_instances``).
+  its own and followed across restarts (``trend.proc_instances``), reported
+  once per program (``trend.worst_process_per_program``).
   Fires WARNING when slope > 1 MB/h and R² > 0.9; CRITICAL when the slope
   exceeds the critical threshold.  Confidence is derived from R² and
   observation time.
@@ -33,6 +34,7 @@ from ..core import (
     Finding,
     Headline,
     MeasuredRule,
+    Measurement,
     MiB,
     Observation,
     Rule,
@@ -52,6 +54,7 @@ from .trend import (
     proc_instances,
     proc_label,
     proc_trend_observations,
+    worst_process_per_program,
 )
 
 if TYPE_CHECKING:
@@ -167,6 +170,9 @@ class MemLeakRule(MeasuredRule):
             holes=window.holes,
         )
 
+    def report(self, measured: list[Measurement]) -> list[Finding]:
+        return worst_process_per_program(measured)
+
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
@@ -227,7 +233,7 @@ class MemLeakRule(MeasuredRule):
                     confidence = Confidence.HIGH
 
         summary = (
-            f"{proc_label(process_name, obs.evidence['pid'])}:"
+            f"{proc_label(process_name, obs.evidence['script'], obs.evidence['pid'])}:"
             f" RSS +{slope_mb_h:.1f} MB/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )

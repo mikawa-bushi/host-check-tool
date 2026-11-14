@@ -259,10 +259,12 @@ class CpuSinglecoreRule(Rule):
                     cpu_by_proc[key] = cpu_by_proc.get(key, 0.0) + row["cpu_avg"]
 
             top_procs = sorted(cpu_by_proc, key=lambda p: cpu_by_proc[p], reverse=True)
+            # A pool of workers is listed once, where its busiest process ranks.
+            top_programs = list(dict.fromkeys(proc_id for proc_id, _pid in top_procs))
 
             top_process_names: list[str] = []
             has_python = False
-            for proc_id, _pid in top_procs[:5]:
+            for proc_id in top_programs[:5]:
                 name = store.proc_name(proc_id)
                 top_process_names.append(name)
                 if "python" in name.lower():

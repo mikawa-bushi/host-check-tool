@@ -31,6 +31,7 @@ from ..core import (
     Finding,
     Headline,
     MeasuredRule,
+    Measurement,
     Observation,
     Severity,
     Window,
@@ -44,6 +45,7 @@ from .trend import (
     proc_details,
     proc_label,
     proc_trend_observations,
+    worst_process_per_program,
 )
 
 if TYPE_CHECKING:
@@ -126,6 +128,9 @@ class FdLeakRule(MeasuredRule):
             holes=window.holes,
         )
 
+    def report(self, measured: list[Measurement]) -> list[Finding]:
+        return worst_process_per_program(measured)
+
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
@@ -161,7 +166,7 @@ class FdLeakRule(MeasuredRule):
         }
 
         summary = (
-            f"{proc_label(process_name, obs.evidence['pid'])}:"
+            f"{proc_label(process_name, obs.evidence['script'], obs.evidence['pid'])}:"
             f" FD数 +{slope_fd_h:.1f}/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )
@@ -235,6 +240,9 @@ class ThreadLeakRule(MeasuredRule):
             holes=window.holes,
         )
 
+    def report(self, measured: list[Measurement]) -> list[Finding]:
+        return worst_process_per_program(measured)
+
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
@@ -267,7 +275,7 @@ class ThreadLeakRule(MeasuredRule):
         }
 
         summary = (
-            f"{proc_label(process_name, obs.evidence['pid'])}:"
+            f"{proc_label(process_name, obs.evidence['script'], obs.evidence['pid'])}:"
             f" スレッド数 +{slope_h:.1f}/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )

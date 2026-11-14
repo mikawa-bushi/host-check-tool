@@ -1,11 +1,11 @@
 """Crash diagnostic rules.
 
-- **OOM-KILL-01**: Detect OOM-killed processes by correlating process
-  disappearance with memory crisis indicators in ``sys_samples``.  The rule
-  operates entirely on the recorded DB so it works offline without any
-  privilege escalation.  An optional ``journalctl`` probe can elevate
-  confidence to HIGH when an OOM-kill log line matching the process name or
-  PID is found.
+- **OOM-KILL-01**: Detect OOM-killed processes from the kernel's OOM lines
+  recorded in ``kernel_events``, or by correlating process disappearance with
+  memory crisis indicators in ``sys_samples``.  The rule operates entirely on
+  the recorded DB so it works offline without any privilege escalation.  An
+  optional ``journalctl`` probe can elevate confidence to HIGH when an
+  OOM-kill log line matching the process name or PID is found.
 - **UNCLEAN-SHUTDOWN-01**: Recording sessions that ended without a clean stop
   and were followed by a new boot (power loss, panic, hard reset).
 - **SERVICE-RESTART-01**: systemd services in a crash/restart loop or failed.
@@ -30,8 +30,10 @@ OOM-KILL-01 design:
    ``psi_mem_full10 >= 1.0`` OR ``swap_out > 0`` OR
    ``mem_available < 5% of mem_total``, the process is flagged.
 5. All four conditions met → Finding(WARNING, MEDIUM, subject=process name).
-6. If multiple candidates, cap at 5: kernel-confirmed first, then by last
-   RSS descending.
+6. Each kernel-confirmed kill is a finding of its own.  The other candidates
+   of one program (an hourly batch, a pool of workers) are one finding: the
+   one with the largest last RSS, counting the others.  Cap at 5:
+   kernel-confirmed first, then by last RSS descending.
 7. Optional journal probe: calls ``_read_oom_journal`` (monkeypatchable),
    searches for process name / PID in OOM-kill log lines, elevates
    confidence to HIGH.
@@ -56,6 +58,7 @@ from ..core import (
     Window,
     register,
 )
+from .trend import one_per_program, proc_label, script_label
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -125,12 +128,13 @@ def _oom_line_pid(line: str) -> Optional[int]:
 
 @register
 class OomKillRule(Rule):
-    """Detect OOM-killed processes via process disappearance + memory-crisis correlation.
+    """Detect OOM-killed processes from the kernel's line or a memory crisis.
 
-    Queries ``proc_samples`` to find processes whose last recorded sample is
-    significantly earlier than the window end (indicating the process exited
-    while recording continued), then checks ``sys_samples`` for memory-crisis
-    indicators in a window around the disappearance time.
+    Queries ``proc_samples`` to find processes (PIDs) whose last recorded
+    sample is significantly earlier than the window end (indicating the
+    process exited while recording continued).  A recorded kernel OOM line
+    naming the PID confirms the kill; without one, ``sys_samples`` must show
+    memory-crisis indicators in a window around the disappearance time.
 
     An optional ``journalctl`` probe (``_read_oom_journal``) can elevate
     confidence from MEDIUM to HIGH when a matching OOM-kill log line is found.
@@ -150,7 +154,9 @@ class OomKillRule(Rule):
     min_observation_hours = 0.0  # instantaneous — runs on any recording length
     requires_rows = ("proc_samples", "sys_samples")
     what = (
-        "プロセスの消滅タイミングと sys_samples のメモリ危機指標"
+        "プロセス (PID) ごとに消滅を見る。記録したカーネルログの OOM の行"
+        " (Killed process <PID> / pid=<PID>) がその PID を名指ししていれば OOM kill"
+        " とする。その行が無いときは、消滅タイミングと sys_samples のメモリ危機指標"
         "(psi_mem_full10 / swap_out / mem_available 急減)の相関で OOM kill を検出する"
     )
     why = (
@@ -276,7 +282,7 @@ class OomKillRule(Rule):
                 "proc_id": proc_id,
                 "process_name": process_name,
                 "pid": pid,
-                "cmdline": identity.cmdline if identity else None,
+                "script": script_label(identity.cmdline) if identity else None,
                 "last_seen": last_ts,
                 "last_rss_bytes": last_rss,
                 "last_rss_mb": round(last_rss / MiB, 1),
@@ -287,7 +293,7 @@ class OomKillRule(Rule):
                 "crisis_value": crisis["value"] if crisis else None,
                 "crisis_ts": crisis["ts"] if crisis else None,
             }
-            label = f"{process_name} (PID {pid})"
+            label = proc_label(process_name, evidence["script"], pid)
             if kernel_line is not None:
                 evidence["kernel_line"] = kernel_line
                 summary = (
@@ -320,12 +326,15 @@ class OomKillRule(Rule):
         if not findings:
             return []
 
-        # --- Step 5: cap at max_findings, the kernel's own kills first ---
+        # --- Step 5: one finding per program unless the kernel named the PID,
+        # the kernel's own kills first, cap at max_findings ---
         findings.sort(
             key=lambda f: ("kernel_line" in f.evidence, f.evidence["last_rss_bytes"]),
             reverse=True,
         )
-        findings = findings[: self.max_findings]
+        confirmed = [f for f in findings if "kernel_line" in f.evidence]
+        suspected = [f for f in findings if "kernel_line" not in f.evidence]
+        findings = (confirmed + one_per_program(suspected))[: self.max_findings]
 
         # --- Optional: journal probe to elevate confidence ---
         for finding in findings:
