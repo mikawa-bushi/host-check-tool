@@ -25,7 +25,7 @@ Capability-gated: without systemd the sampler records nothing.
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 from .. import kernlog, systemd
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
@@ -35,6 +35,12 @@ from ..storage import make_row
 # None: clean and abnormal exits alike, so the journal has to tell.  Policies
 # not listed restart only after an abnormal exit.
 _RESTART_KIND = {"always": None, "on-success": "restart_clean"}
+# systemd counts a restart RestartUSec after logging the failure that caused
+# it; the margin covers timer slack and a slow start on a loaded host.
+_FAILURE_MARGIN_SEC = 10.0
+# LogLevelMax= below this (syslog "warning") also drops systemd's own
+# "Failed with result" line about the unit.
+_WARNING_LEVEL = 4
 
 
 @register_sampler
@@ -62,6 +68,7 @@ class ServiceSampler(Sampler):
         self._restarts: Dict[str, int] = {}  # unit -> last seen NRestarts
         self._failed: Dict[str, bool] = {}  # unit -> was failed at last poll
         self._last_poll: Optional[float] = None
+        self._matched: Dict[str, float] = {}  # unit -> last failure line matched
 
     def setup(self, ctx: RunContext) -> None:
         """Enable only on systemd hosts."""
@@ -85,7 +92,7 @@ class ServiceSampler(Sampler):
         ts = time.time()
         since, self._last_poll = self._last_poll, ts
         rows: list[tuple] = []
-        unclassified: list[tuple[str, int, Optional[str]]] = []
+        unclassified: Dict[str, tuple[int, float, Optional[str]]] = {}
         for unit, props in info.items():
             result = props.get("Result") or None
             n_restarts = systemd.n_restarts(props)
@@ -101,8 +108,15 @@ class ServiceSampler(Sampler):
                 )
                 if new and kind:
                     rows.append(self._event(ts, unit, kind, new, result))
+                elif new and _log_level(props) < _WARNING_LEVEL:
+                    rows.append(
+                        self._event(ts, unit, "restart_maybe_clean", new, result)
+                    )
                 elif new:
-                    unclassified.append((unit, new, result))
+                    delay = systemd.timespan_sec(props.get("RestartUSec")) or 0.0
+                    lo = since - delay - _FAILURE_MARGIN_SEC
+                    lo = max(lo, self._matched.get(unit, lo))
+                    unclassified[unit] = (new, lo, result)
                 self._restarts[unit] = n_restarts
             failed = props.get("ActiveState") == "failed"
             if failed and not self._failed.get(unit, False):
@@ -111,19 +125,23 @@ class ServiceSampler(Sampler):
             self._failed[unit] = failed
 
         failures = None
-        if unclassified and since is not None and self._journal:
-            failures = systemd.unit_failures(since)
-        for unit, new, result in unclassified:
+        if unclassified and self._journal:
+            failures = systemd.unit_failures(
+                unclassified, min(lo for _, lo, _ in unclassified.values())
+            )
+        for unit, (new, lo, result) in unclassified.items():
             if failures is None:
                 rows.append(self._event(ts, unit, "restart_maybe_clean", new, result))
                 continue
-            results = failures.get(unit, [])
-            crashes = min(new, len(results))
-            if crashes:
-                rows.append(self._event(ts, unit, "restart", crashes, results[-1]))
-            if new > crashes:
+            caused = [f for f in failures.get(unit, []) if lo < f[0] <= ts][:new]
+            if caused:
+                self._matched[unit] = caused[-1][0]
                 rows.append(
-                    self._event(ts, unit, "restart_clean", new - crashes, result)
+                    self._event(ts, unit, "restart", len(caused), caused[-1][1])
+                )
+            if new > len(caused):
+                rows.append(
+                    self._event(ts, unit, "restart_clean", new - len(caused), None)
                 )
 
         return [SampleBatch(table="service_events", rows=rows)] if rows else []
@@ -133,3 +151,12 @@ class ServiceSampler(Sampler):
         return make_row(
             "service_events", ts=ts, unit=unit, kind=kind, n_restarts=n, result=result
         )
+
+
+def _log_level(props: Mapping[str, str]) -> int:
+    """The unit's LogLevelMax= as a syslog level; 7 (debug) when unset."""
+    try:
+        level = int(props.get("LogLevelMax") or -1)
+    except ValueError:
+        return 7
+    return 7 if level < 0 else level

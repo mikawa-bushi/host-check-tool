@@ -299,10 +299,12 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
   下がった後の値をその間の再起動回数として数える。0 に戻った後に前回の値以上まで増えると、
   増えた分しか数えられない。
   `Restart=always`、`RestartForceExitStatus=` のあるユニットは正常終了の後も再起動されるため、
-  systemd がジャーナルに残す「Failed with result」の行で見分け、異常終了の後の再起動を
-  `kind=restart`、それ以外を `kind=restart_clean` として記録する (`Restart=on-success` は常に
-  `restart_clean`)。ジャーナルを読めない (root または systemd-journal / adm グループが必要) ときは
-  `kind=restart_maybe_clean` として記録する。最初の確認で既に failed のユニットは遷移として数えず、
+  systemd がジャーナルに残す「Failed with result」の行 (systemd 240 より前は MESSAGE_ID の無い
+  同じ文の行) で見分け、異常終了の後の再起動を `kind=restart`、それ以外を `kind=restart_clean`
+  として記録する (`Restart=on-success` は常に `restart_clean`)。行は再起動より `RestartSec=` だけ前に
+  出るので、前回の確認より前の行もさかのぼって照らし合わせる。ジャーナルを読めない
+  (root または systemd-journal / adm グループが必要) とき、`LogLevelMax=` が warning より低く
+  この行が出ないときは `kind=restart_maybe_clean` として記録する。最初の確認で既に failed のユニットは遷移として数えず、
   `kind=failed_at_start` として記録する。
 - `KernelLogSampler`: `journalctl -k` を前回の続き (cursor) から読み、I/O エラー・FS エラー・
   ハングタスク・MCE・segfault・USB 切断・温度制限の行だけを `kernel_events` に記録する。
