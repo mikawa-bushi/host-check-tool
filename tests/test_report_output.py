@@ -620,21 +620,23 @@ class TestSnapshotNonUtf8:
         )
 
     def test_quick_reaches_the_report(self, tmp_path):
+        config = tmp_path / "config.py"
+        config.write_text(
+            "from procdiag.config import ProcdiagConfig\nconfig = ProcdiagConfig()\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "q"
         code = (
-            "import sys\n"
-            "from types import SimpleNamespace\n"
             "from procdiag import snapshot as snap\n"
             "snap._sample_processes = lambda sec: ([5.0], [{'pid': 1, "
             f"'name': {SJIS_NAME!r}, 'status': 'running', 'cpu': 90.0, 'rss': 1}}])\n"
             "from procdiag.cli import cli\n"
-            "cli(['quick', '--duration', '2s', '--out', 'q'])\n"
+            f"cli(['quick', '--duration', '2s', '--config', {str(config)!r}, "
+            f"'--out', {str(out)!r}])\n"
         )
         run = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=tmp_path,
-            capture_output=True,
-            timeout=120,
+            [sys.executable, "-c", code], capture_output=True, timeout=120
         )
         assert b"UnicodeEncodeError" not in run.stderr, run.stderr.decode()
-        assert (tmp_path / "q" / "report.html").exists()
+        assert (out / "report.html").exists()
         assert "[3/3]".encode() in run.stdout
