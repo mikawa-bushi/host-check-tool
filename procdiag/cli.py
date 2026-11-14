@@ -640,7 +640,10 @@ def record(
             _fail(str(exc))
 
     with _db_guard(cfg.db_path):
-        recorder = Recorder(cfg, duration=duration_sec)
+        try:
+            recorder = Recorder(cfg, duration=duration_sec)
+        except OSError as exc:
+            _fail(f"DB を使えません: {cfg.db_path} ({_reason(exc)})")
     click.echo("記録を開始します。停止するには Ctrl-C を押してください。")
     sys.exit(recorder.run())
 
