@@ -1140,6 +1140,11 @@ def render_comparison_terminal(
         for name, state in ((SideName.BEFORE, row.before), (SideName.AFTER, row.after)):
             if isinstance(state, Unknown):
                 lines.append(f"      {name.label}: {state.detail}")
+        if row.paired_by_name:
+            lines.append(
+                f"      修正後: 修正前と同じコマンドラインの {row.subject} がありません。"
+                f"値は名前だけで突き合わせた、コマンドラインの違う {row.subject} のものです"
+            )
         if verbose and isinstance(row.after, Detected) and row.after.finding.proposal:
             lines += [f"      {p}" for p in row.after.finding.proposal.splitlines()]
     if cmp.rows:

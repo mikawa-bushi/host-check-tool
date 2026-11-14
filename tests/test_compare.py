@@ -143,8 +143,17 @@ class TestMeasuredRows:
         assert row.label == "改善 (しきい値未満)"
 
     def test_declined_but_still_steep_is_not_an_improvement(self):
-        (row,) = _leak_cmp([_leak("myapp", 38.0)], [_leak("myapp", 60.0, r2=0.3)]).rows
+        cmp = _leak_cmp([_leak("myapp", 38.0)], [_leak("myapp", 60.0, r2=0.3)])
+        (row,) = cmp.rows
         assert row.verdict is Verdict.WORSE and row.why is Why.VALUE_WORSE
+        assert exit_code(cmp) == 1
+
+    def test_declined_far_above_the_threshold_is_not_below_it(self):
+        cmp = _leak_cmp([_leak("myapp", 38.0)], [_leak("myapp", 5.8, r2=0.78)])
+        (row,) = cmp.rows
+        assert row.verdict is Verdict.IMPROVED and row.why is Why.ABOVE_THRESHOLD
+        assert row.label == "改善 (しきい値以上)"
+        assert exit_code(cmp) == 1
 
     def test_threshold_comes_from_the_configured_rule(self):
         cfg = ProcdiagConfig.model_validate(
@@ -235,11 +244,21 @@ class TestIdentityMatching:
         assert by_identity["h1"].before.value == 38.0
         assert by_identity["h2"].verdict is Verdict.NEW
 
-    def test_a_changed_cmdline_matches_by_name_when_unambiguous(self):
+    def test_a_changed_cmdline_is_paired_by_name_but_not_judged(self):
         cmp = _leak_cmp(
             [_leak("myapp", 38.0, identity="v1")], [_leak("myapp", 0.1, identity="v2")]
         )
-        assert cmp.rows[0].verdict is Verdict.RESOLVED
+        (row,) = cmp.rows
+        assert row.verdict is Verdict.NOT_EVALUABLE and row.why is Why.PAIRED_BY_NAME
+        assert isinstance(row.after, Clear) and row.after.value == 0.1
+        assert exit_code(cmp) == 3
+
+    def test_a_leak_in_the_name_paired_process_still_exits_1(self):
+        cmp = _leak_cmp(
+            [_leak("myapp", 38.0, identity="v1")], [_leak("myapp", 30.0, identity="v2")]
+        )
+        assert cmp.rows[0].why is Why.PAIRED_BY_NAME
+        assert exit_code(cmp) == 1
 
     def test_ambiguous_names_are_not_guessed(self):
         cmp = _leak_cmp(

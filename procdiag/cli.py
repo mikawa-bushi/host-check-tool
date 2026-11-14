@@ -1286,9 +1286,16 @@ def doctor(
 
         click.echo("")
         if degraded_count:
+            db_degraded = any(
+                c.name == "db_disk" and c.status == "degraded" for c in checks
+            )
             click.echo(
                 f"{symbols['degraded']} {degraded_count} 件の降格があります。"
-                "記録は可能ですが該当データは欠損します"
+                + (
+                    "記録 DB の置き場を先に確認してください"
+                    if db_degraded
+                    else "記録は可能ですが該当データは欠損します"
+                )
             )
         else:
             click.echo(f"{symbols['ok']} すべての観測能力が利用可能です")

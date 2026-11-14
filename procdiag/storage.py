@@ -536,7 +536,7 @@ class Storage:
         raise a cryptic SQLite error at flush.  Reject the mismatch here with a
         clear, table-named message instead (issue v0.3 §2-6); combined with
         ``test_table_columns_match_schema`` (§2-2) this fences the write path
-        against schema/sampler drift.
+        against schema/sampler drift.  Text is stored as :func:`_storable_text`.
         """
         cols = TABLE_COLUMNS.get(table)
         if cols is not None:
@@ -547,7 +547,7 @@ class Storage:
                         f"{table}: 行の列数 {len(row)} が TABLE_COLUMNS の "
                         f"{width} 列と一致しません"
                     )
-        self._buffer[table].extend(rows)
+        self._buffer[table].extend(_storable_row(row) for row in rows)
 
     def flush(self, *, reason: str = "interval") -> int:
         """Write all buffered rows to SQLite in a single transaction.
@@ -1079,8 +1079,11 @@ class Storage:
         Uses an in-memory cache so repeated calls for the same
         ``(name, cmdline_hash)`` within a session cost no SQL round-trips.
         ``last_seen`` is updated in the DB every call (but the cache avoids
-        re-reading the ID each time).
+        re-reading the ID each time).  ``name`` and ``cmdline_sample`` are
+        stored as :func:`_storable_text`.
         """
+        name = _storable_text(name)
+        cmdline_sample = _storable_text(cmdline_sample)
         key = (name, cmdline_hash)
         if key in self._proc_cache:
             # Update last_seen in DB (infrequent; acceptable cost)
@@ -1112,6 +1115,7 @@ class Storage:
         ``_CG_LAST_SEEN_THROTTLE_SEC`` seconds per unit to bound the write rate
         on long recordings (the column is metadata that nothing reads for logic).
         """
+        unit_path = _storable_text(unit_path)
         if unit_path in self._cg_cache:
             # Throttle the last_seen rewrite: it is metadata nothing reads for
             # logic, so there is no need to UPDATE on every tick for every unit.
@@ -1341,6 +1345,28 @@ class Storage:
 # ---------------------------------------------------------------------------
 # Module-level pure helpers
 # ---------------------------------------------------------------------------
+
+
+def _storable_text(text: str) -> str:
+    r"""Return *text* in a form SQLite stores, with non-UTF-8 bytes as ``\xNN``.
+
+    psutil and ``os`` decode host names and paths with ``surrogateescape``, so
+    a Shift_JIS argv or a UTF-8 name the kernel cut at 15 bytes arrives with
+    lone surrogates, which SQLite's UTF-8 encoder rejects.  Escaping keeps two
+    such names distinct, so they never share one ``proc_id``.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "surrogateescape").decode(
+            "utf-8", "backslashreplace"
+        )
+    return text
+
+
+def _storable_row(row: tuple) -> tuple:
+    """Return *row* with every text value passed through :func:`_storable_text`."""
+    return tuple(_storable_text(v) if isinstance(v, str) else v for v in row)
 
 
 def _non_null(rows: List[sqlite3.Row], col: str) -> List[Any]:

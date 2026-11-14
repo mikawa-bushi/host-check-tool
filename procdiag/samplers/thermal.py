@@ -21,10 +21,20 @@ import psutil
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
+# psutil groups readings by hwmon driver / thermal-zone name ("-" becomes "_"
+# in hwmon names).  Drive (nvme, drivetemp), GPU and Wi-Fi chips are never
+# the CPU, however hot they run.
+_CPU_CHIPS = frozenset(
+    {"coretemp", "k10temp", "k8temp", "zenpower", "via_cputemp", "x86_pkg_temp"}
+)
+# Whole-system zones the firmware cools through the CPU; read only when no
+# CPU sensor exists (ACPI on PCs, the SoC zone on ARM boards).
+_FALLBACK_CHIPS = frozenset({"acpitz", "soc_thermal"})
+
 
 @register_sampler
 class ThermalSampler(Sampler):
-    """Tier-3 sampler: hottest core temperature and current/max CPU frequency."""
+    """Tier-3 sampler: hottest CPU temperature and current/max CPU frequency."""
 
     name = "thermal"
     title = "CPU温度・クロック (サーマルスロットリング検出)"
@@ -68,7 +78,12 @@ class ThermalSampler(Sampler):
 
     @staticmethod
     def _read_temp() -> Optional[float]:
-        """Return the hottest reported core temperature in °C, or None."""
+        """Return the hottest CPU temperature in °C, or None.
+
+        Reads the CPU's own sensors (coretemp, k10temp, cpu_thermal ...).
+        Without one, falls back to the ACPI / SoC thermal zone; other chips
+        are ignored.
+        """
         fn = getattr(psutil, "sensors_temperatures", None)
         if fn is None:
             return None
@@ -76,13 +91,15 @@ class ThermalSampler(Sampler):
             temps = fn()
         except Exception:
             return None
-        best: Optional[float] = None
-        for entries in (temps or {}).values():
-            for entry in entries:
-                cur = getattr(entry, "current", None)
-                if cur is not None and (best is None or cur > best):
-                    best = float(cur)
-        return best
+        readings = [
+            (name.lower().replace("-", "_"), float(entry.current))
+            for name, entries in (temps or {}).items()
+            for entry in entries
+            if getattr(entry, "current", None) is not None
+        ]
+        cpu = [t for name, t in readings if name in _CPU_CHIPS or "cpu" in name]
+        zone = [t for name, t in readings if name in _FALLBACK_CHIPS]
+        return max(cpu or zone, default=None)
 
     @staticmethod
     def _read_freq() -> Tuple[Optional[float], Optional[float]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import namedtuple
 
 import pytest
@@ -29,6 +30,20 @@ def _pressure_root(tmp_path, resource: str, avg60: float):
         f"full avg10=0.00 avg60={avg60:.2f} avg300=0.00 total=1\n"
     )
     return tmp_path
+
+
+def _fake_command(tmp_path, monkeypatch, name: str, script: str) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    path = bindir / name
+    path.write_text("#!/bin/sh\n" + script)
+    path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+
+def _snapshot(tmp_path):
+    cfg = ProcdiagConfig(db_path=str(tmp_path / "none.db"))
+    return {i.name: i for i in snap.run_snapshot(cfg, sample_sec=0.0)}
 
 
 class TestChecks:
@@ -130,6 +145,87 @@ class TestChecks:
         monkeypatch.setattr(snap.systemd, "ntp_synchronized", boom)
         (item,) = snap._check_time_sync()
         assert item.status == "info" and "no timedatectl" in item.detail
+
+
+class TestChecksThatCannotRun:
+    def test_unreadable_journal_is_not_reported_as_clean(self, tmp_path, monkeypatch):
+        # A user outside systemd-journal/adm who has a user journal gets no output, exit 0.
+        _fake_command(tmp_path, monkeypatch, "journalctl", "exit 0\n")
+        item = _snapshot(tmp_path)["kernel_log"]
+        assert item.status == "info"
+        assert "読み取れません" in item.detail
+
+    def test_readable_journal_without_anomalies_is_clean(self, tmp_path, monkeypatch):
+        _fake_command(
+            tmp_path,
+            monkeypatch,
+            "journalctl",
+            'echo "1700000000.000000 host kernel: usb 1-1: new high-speed USB device"\n',
+        )
+        item = _snapshot(tmp_path)["kernel_log"]
+        assert (item.status, item.detail) == ("ok", "異常なし")
+
+    @pytest.mark.parametrize(
+        "lines, status",
+        [
+            (["CPU0: Core temperature above threshold, cpu clock throttled"], "info"),
+            (
+                [
+                    "CPU0: Core temperature above threshold, cpu clock throttled",
+                    "app[42]: segfault at 0 ip 0 sp 0 error 4",
+                ],
+                "warning",
+            ),
+            (
+                [
+                    "CPU0: Core temperature above threshold, cpu clock throttled",
+                    "blk_update_request: I/O error, dev sda, sector 4096",
+                ],
+                "critical",
+            ),
+        ],
+    )
+    def test_kernel_log_grades_like_kernel_error_rule(
+        self, tmp_path, monkeypatch, lines, status
+    ):
+        script = "".join(f'echo "1700000000.000000 host kernel: {m}"\n' for m in lines)
+        _fake_command(tmp_path, monkeypatch, "journalctl", script)
+        item = _snapshot(tmp_path)["kernel_log"]
+        assert item.status == status
+        assert snap.exit_code([item]) == (0 if status == "info" else 1)
+
+    def test_services_unknown_when_systemctl_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(snap.systemd, "available", lambda: True)
+        _fake_command(
+            tmp_path,
+            monkeypatch,
+            "systemctl",
+            'echo "Failed to connect to bus: Connection refused" >&2\nexit 1\n',
+        )
+        items = _snapshot(tmp_path)
+        for name in ("failed_units", "restarted_units"):
+            assert items[name].status == "info", name
+            assert "確認できません" in items[name].detail, name
+
+    def test_restart_counts_unknown_when_only_show_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(snap.systemd, "available", lambda: True)
+        _fake_command(
+            tmp_path,
+            monkeypatch,
+            "systemctl",
+            'case "$*" in\n'
+            "  *--failed*) ;;\n"
+            '  list-units*) echo "app.service loaded active running App";;\n'
+            "  show*) exit 1;;\n"
+            "esac\n",
+        )
+        items = _snapshot(tmp_path)
+        assert (items["failed_units"].status, items["failed_units"].detail) == (
+            "ok",
+            "なし",
+        )
+        assert items["restarted_units"].status == "info"
+        assert "確認できません" in items["restarted_units"].detail
 
 
 class TestRunAndCli:
