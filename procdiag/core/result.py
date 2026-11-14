@@ -251,21 +251,25 @@ class Unobserved:
         return None
 
 
-def unobserved_seconds(periods: Iterable[Unobserved]) -> float:
-    """Seconds covered by *periods*, overlaps counted once."""
-    total, reached = 0.0, -math.inf
+def unobserved_hours(periods: Iterable[Unobserved], window: Window) -> float:
+    """Recorded hours of *window* that *periods* cover, overlaps counted once.
+
+    The window's holes are not recorded time, so a period spanning one only
+    counts the hours around it.
+    """
+    hours, reached = 0.0, -math.inf
     for p in sorted(periods, key=lambda p: p.start_ts):
         lo = max(p.start_ts, reached)
         if p.end_ts > lo:
-            total += p.end_ts - lo
+            hours += window.observed_hours_between(lo, p.end_ts)
         reached = max(reached, p.end_ts)
-    return total
+    return hours
 
 
 def blind_throughout(periods: list[Unobserved], window: Window) -> bool:
     """Whether *periods* (already cut to *window*) leave none of it observed."""
     return bool(periods) and (
-        unobserved_seconds(periods) >= window.end_ts - window.start_ts - 1e-6
+        unobserved_hours(periods, window) >= window.observed_hours - 1e-9
     )
 
 

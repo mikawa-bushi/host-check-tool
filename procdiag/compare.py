@@ -20,7 +20,7 @@ from .core import (
     configure_rule,
     get_rule,
 )
-from .core.result import CoverageGap, Unobserved, covers, unobserved_seconds
+from .core.result import CoverageGap, Unobserved, covers, unobserved_hours
 from .diagnosis import Engine
 from .storage import RAW_TABLES, Storage, StorageVersionError
 
@@ -544,7 +544,10 @@ def _blind(side: Side, rule_id: str) -> list[Unobserved]:
 
 
 def _observed_hours(side: Side, rule_id: str) -> float:
-    return _span_hours(side) - unobserved_seconds(_blind(side, rule_id)) / 3600.0
+    if side.result is None:
+        return 0.0
+    blind = unobserved_hours(_blind(side, rule_id), side.result.window)
+    return _span_hours(side) - blind
 
 
 def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:

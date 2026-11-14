@@ -50,7 +50,7 @@ from ..core import (
     covers,
     rule_id_problems,
 )
-from ..core.result import blind_throughout, unobserved_seconds
+from ..core.result import blind_throughout, unobserved_hours
 from ..core.util import humanize_bytes, is_unit_name, neutralize, shell_quote
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
@@ -666,7 +666,7 @@ def _unobserved_notes(unobserved: list[Unobserved], window: Window) -> list[str]
             continue
         start = min(p.start_ts for p in periods)
         end = max(p.end_ts for p in periods)
-        hours = unobserved_seconds(periods) / 3600.0
+        hours = unobserved_hours(periods, window)
         notes.append(
             f"{reason} (診断した期間のうち {_local_minute(start)} 〜"
             f" {_local_minute(end)} の {hours:.1f} 時間)"

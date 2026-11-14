@@ -994,14 +994,17 @@ def _coverage_html(diag: Diagnosis) -> str:
             "<th>必要な観測時間</th><th>残り</th></tr></thead>\n"
             f"  <tbody>{rows}</tbody>\n</table>\n"
         )
-    if diag.uncovered_rules:
+    for blind, label in ((False, "記録なしで未評価"), (True, "観測できず未評価")):
+        rules = _uncovered(diag, blind=blind)
+        if not rules:
+            continue
         rows = "".join(
             f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(r.title)}</td>"
             f"<td>{_esc(r.detail)}</td></tr>"
-            for r in diag.uncovered_rules
+            for r in rules
         )
         html += (
-            "<table>\n  <thead><tr><th>記録なしで未評価</th><th>内容</th>"
+            f"<table>\n  <thead><tr><th>{label}</th><th>内容</th>"
             "<th>理由</th></tr></thead>\n"
             f"  <tbody>{rows}</tbody>\n</table>\n"
         )
