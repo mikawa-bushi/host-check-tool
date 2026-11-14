@@ -20,14 +20,17 @@ from __future__ import annotations
 import errno
 import json
 import os
+import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, NoReturn, Optional
 
 import click
 
 from . import __version__
+from .output import atomic_output
 from .plugins import load_plugins
 
 if TYPE_CHECKING:
@@ -40,17 +43,103 @@ if TYPE_CHECKING:
 # Shared command helpers
 # ---------------------------------------------------------------------------
 
-# Exit code for usage / precondition errors (missing DB, unreadable config),
-# kept distinct from the diagnosis-result codes (0/1/2/3) so automation can
-# tell a broken observation pipeline (no DB = record never ran) from an
+# Exit code for usage / precondition errors (missing or unusable DB, unreadable
+# config, an output path that cannot be written, a mistake on the command
+# line), kept distinct from the diagnosis-result codes (0/1/2/3) so automation
+# can tell a broken observation pipeline (no DB = record never ran) from an
 # unhealthy host.
 _EXIT_NO_DATA = 3
 _EXIT_USAGE = 4
+# What the shell reports for a process killed by SIGPIPE (128 + 13): the reader
+# of stdout went away, e.g. ``procdiag export | head``.
+_EXIT_CLOSED_PIPE = 141
 
 _DB_MISSING_MSG = (
     "エラー: DB ファイルが見つかりません: {db}\n"
     "先に procdiag record を実行してください。"
 )
+
+
+def _fail(message: str) -> NoReturn:
+    """Print ``エラー: <message>`` and exit with the precondition-error code."""
+    click.echo(f"エラー: {message}", err=True)
+    sys.exit(_EXIT_USAGE)
+
+
+def _reason(exc: OSError) -> str:
+    """The cause of an ``OSError`` without the errno prefix, with its path."""
+    reason = exc.strerror or str(exc)
+    return f"{reason}: {exc.filename}" if exc.filename else reason
+
+
+@contextmanager
+def _db_guard(*dbs: object) -> Iterator[None]:
+    """Exit with a one-line error when a DB cannot be used.
+
+    That is a DB written by a newer procdiag, one that is damaged or not SQLite,
+    or a directory.  Without this each of them is a traceback and exit code 1,
+    which reads as "problems found" to a cron job or CI step.
+    """
+    from .storage import StorageVersionError
+
+    shown = ", ".join(str(db) for db in dbs)
+    try:
+        yield
+    except StorageVersionError as exc:
+        _fail(f"{shown}: {exc}")
+    except sqlite3.DatabaseError as exc:
+        for db in dbs:
+            if Path(str(db)).is_dir():
+                _fail(
+                    f"DB を使えません: {db} (ディレクトリです。DB ファイルを指定してください)"
+                )
+        hint = (
+            " DB のあるフォルダに書き込めないため、記録が動いている間は読めません。"
+            "記録と同じユーザーで実行してください。"
+            if "readonly" in str(exc)
+            else ""
+        )
+        _fail(f"DB を使えません: {shown} ({exc}){hint}")
+
+
+def _output_problem(path: Path, *, make_parents: bool = False) -> Optional[str]:
+    """Why a file cannot be written at *path*, or ``None`` when it can.
+
+    With *make_parents* a folder that does not exist yet is fine as long as the
+    nearest one that does can be written.
+    """
+    if path.is_dir():
+        return "ディレクトリです。ファイル名まで指定してください"
+    if path.exists():
+        return None if os.access(path, os.W_OK) else "書き込めません"
+    folder = path.parent
+    while make_parents and not folder.exists():
+        folder = folder.parent
+    if not folder.is_dir():
+        return f"フォルダ {folder} がありません"
+    if not os.access(folder, os.W_OK | os.X_OK):
+        return f"フォルダ {folder} に書き込めません"
+    return None
+
+
+def _output_failed(path: object, reason: str) -> NoReturn:
+    _fail(f"出力先を使えません: {path} ({reason})")
+
+
+def _require_output(path: str) -> None:
+    """Exit (code 4) before the work starts when *path* cannot be written."""
+    problem = _output_problem(Path(path))
+    if problem:
+        _output_failed(path, problem)
+
+
+def _write_output(path: str, text: str) -> None:
+    """Write the report to *path* whole, or exit (code 4) and leave nothing."""
+    try:
+        with atomic_output(path, encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        _output_failed(path, _reason(exc))
 
 
 def _db_option(help_text: str) -> Callable:
@@ -286,7 +375,7 @@ def _diagnose(
     charts = None
     meta_hostname = None
     chosen = since is not None or until is not None
-    with Storage(db, read_only=True) as store:
+    with _db_guard(db), Storage(db, read_only=True) as store:
         window = None
         if chosen:
             bounds = store.system_bounds(since, before=until)
@@ -378,6 +467,32 @@ _REMOVED_COMMANDS = {
 
 
 class _ProcdiagGroup(click.Group):
+    # A mistake on the command line is a precondition error (4), not click's 2:
+    # check and compare document 2 as "info only", so a wrapper would read a
+    # mistyped option as a pass.
+    def make_context(self, *args: Any, **kwargs: Any) -> click.Context:
+        try:
+            return super().make_context(*args, **kwargs)
+        except click.UsageError as exc:
+            exc.exit_code = _EXIT_USAGE
+            raise
+
+    def invoke(self, ctx: click.Context) -> Any:
+        try:
+            try:
+                return super().invoke(ctx)
+            finally:
+                # Flush here so a reader that left is noticed now: the flush at
+                # interpreter exit prints "Exception ignored" and exits 120.
+                if sys.stdout is not None:
+                    sys.stdout.flush()
+        except BrokenPipeError:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            sys.exit(_EXIT_CLOSED_PIPE)
+        except click.UsageError as exc:
+            exc.exit_code = _EXIT_USAGE
+            raise
+
     def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
         replacement = _REMOVED_COMMANDS.get(cmd_name)
         if replacement is not None:
@@ -415,20 +530,28 @@ def init(dir: str) -> None:
     from .config import CONFIG_TEMPLATE
 
     target = Path(dir)
-    target.mkdir(parents=True, exist_ok=True)
     config_path = target / "config.py"
     data_dir = target / "data"
+    if target.exists() and not target.is_dir():
+        _fail(f"作成先がディレクトリではありません: {target}")
 
-    if config_path.exists():
-        click.echo(
-            f"警告: {config_path} はすでに存在します。上書きしません。", err=True
-        )
-    else:
-        config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
-        click.echo(f"config.py を生成しました: {config_path}")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if config_path.exists():
+            click.echo(
+                f"警告: {config_path} はすでに存在します。上書きしません。", err=True
+            )
+        else:
+            config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+            click.echo(f"config.py を生成しました: {config_path}")
 
-    data_dir.mkdir(exist_ok=True)
-    click.echo(f"data/ ディレクトリを生成しました: {data_dir}")
+        if data_dir.is_dir():
+            click.echo(f"data/ ディレクトリはすでに存在します: {data_dir}")
+        else:
+            data_dir.mkdir()
+            click.echo(f"data/ ディレクトリを生成しました: {data_dir}")
+    except OSError as exc:
+        _fail(f"{target} に作成できません: {_reason(exc)}")
     click.echo(
         "\n次のステップ:\n"
         "  1. config.py を必要に応じて編集してください\n"
@@ -514,11 +637,14 @@ def record(
         try:
             duration_sec = parse_duration(duration)
         except ValueError as exc:
-            click.echo(f"エラー: {exc}", err=True)
-            sys.exit(2)
+            _fail(str(exc))
 
+    with _db_guard(cfg.db_path):
+        try:
+            recorder = Recorder(cfg, duration=duration_sec)
+        except OSError as exc:
+            _fail(f"DB を使えません: {cfg.db_path} ({_reason(exc)})")
     click.echo("記録を開始します。停止するには Ctrl-C を押してください。")
-    recorder = Recorder(cfg, duration=duration_sec)
     sys.exit(recorder.run())
 
 
@@ -578,7 +704,8 @@ def check(
 
     終了コード: 0=問題なし / 1=critical・warning あり / 2=info のみ /
     3=観測データなし（DB にサンプルが1件もない＝記録が回っていない、
-    または指定した期間に記録がない）/ 4=前提条件エラー（DB ファイルが無い等）
+    または指定した期間に記録がない）/ 4=前提条件エラー（DB ファイルが無い・
+    開けない、出力先に書けない、コマンドラインの誤り等）
     """
     from . import report as report_mod
     from .core.util import should_use_color
@@ -588,6 +715,8 @@ def check(
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     only_ids, skip_ids = _split_ids(only), _split_ids(skip)
     _validate_rules(cfg, only_ids, skip_ids)
+    if output:
+        _require_output(output)
     diag, charts, meta_hostname = _diagnose(
         cfg,
         resolved_db,
@@ -608,7 +737,7 @@ def check(
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
 
     if output:
-        Path(output).write_text(text, encoding="utf-8")
+        _write_output(output, text)
         if not _is_quiet(quiet):
             click.echo(f"レポートを書き出しました: {output}")
     else:
@@ -834,6 +963,8 @@ def compare(
     cfg = _load_config(config_path, db_path)
     only_ids, skip_ids = _split_ids(only), _split_ids(skip)
     _validate_rules(cfg, only_ids, skip_ids)
+    if output:
+        _require_output(output)
     try:
         request = plan_request(
             dbs=dbs, default_db=cfg.db_path, at=at, before=before_spec, after=after_spec
@@ -847,9 +978,10 @@ def compare(
             if not path.exists():
                 click.echo(_DB_MISSING_MSG.format(db=path), err=True)
                 sys.exit(_EXIT_USAGE)
-        result = run_compare(
-            cfg, request, only=only_ids, skip=skip_ids, verbose=verbose
-        )
+        with _db_guard(*paths):
+            result = run_compare(
+                cfg, request, only=only_ids, skip=skip_ids, verbose=verbose
+            )
     except CompareError as exc:
         click.echo(f"エラー: {exc}", err=True)
         sys.exit(_EXIT_USAGE)
@@ -862,7 +994,7 @@ def compare(
         )
 
     if output:
-        Path(output).write_text(text, encoding="utf-8")
+        _write_output(output, text)
         if not _is_quiet(quiet):
             click.echo(f"比較結果を書き出しました: {output}")
     else:
@@ -893,7 +1025,7 @@ def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None
     from .storage import Storage
 
     _cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
-    with Storage(resolved_db, read_only=True) as store:
+    with _db_guard(resolved_db), Storage(resolved_db, read_only=True) as store:
         info = collect_status(store)
 
     if fmt == "json":
@@ -943,7 +1075,7 @@ def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None
     "out_path",
     default=None,
     type=click.Path(),
-    help="出力先 (既定: procdiag-bundle-<ホスト名>-<日時>.tar.gz)。",
+    help="出力先のファイル (既定: procdiag-bundle-<ホスト名>-<日時>.tar.gz)。",
 )
 @click.option(
     "--keep-cmdline",
@@ -963,16 +1095,23 @@ def bundle(
     記録中でも実行できます。DB が無い場合も、その場の状態 (snapshot) と
     観測能力 (doctor) だけを収録したバンドルを作成します。
     """
-    from .bundle import create_bundle
+    import socket
+
+    from .bundle import create_bundle, default_bundle_name
     from .core.util import humanize_bytes
 
     cfg = _load_config(config_path, db_path)
-    result = create_bundle(
-        cfg,
-        config_path=config_path,
-        out=Path(out_path) if out_path else None,
-        keep_cmdline=keep_cmdline,
-    )
+    out = Path(out_path or default_bundle_name(socket.gethostname()))
+    problem = _output_problem(out, make_parents=True)
+    if problem:
+        _output_failed(out, problem)
+    with _db_guard(cfg.db_path):
+        try:
+            result = create_bundle(
+                cfg, config_path=config_path, out=out, keep_cmdline=keep_cmdline
+            )
+        except OSError as exc:
+            _fail(f"バンドルを作成できません: {_reason(exc)}")
     if not _is_quiet(quiet):
         size = humanize_bytes(result.path.stat().st_size)
         click.echo(f"バンドルを作成しました: {result.path} ({size})")
@@ -1116,15 +1255,20 @@ def export(
 
     _cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     table = "sys_samples" if rollup == "raw" else "sys_rollup_1m"
+    if out_path != "-":
+        _require_output(out_path)
 
-    with Storage(resolved_db, read_only=True) as store:
+    with _db_guard(resolved_db), Storage(resolved_db, read_only=True) as store:
         if out_path == "-":
             export_rows(store, table=table, fmt=fmt, out=sys.stdout)
-        else:
-            with open(out_path, "w", encoding="utf-8", newline="") as fh:
+            return
+        try:
+            with atomic_output(out_path, encoding="utf-8", newline="") as fh:
                 count = export_rows(store, table=table, fmt=fmt, out=fh)
-            if not _is_quiet(quiet):
-                click.echo(f"{count} 行を書き出しました: {out_path}", err=True)
+        except OSError as exc:
+            _output_failed(out_path, _reason(exc))
+    if not _is_quiet(quiet):
+        click.echo(f"{count} 行を書き出しました: {out_path}", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1156,13 +1300,22 @@ def prune(
     quiet: bool,
 ) -> None:
     """期限切れのサンプルを削除します (保持ポリシーの手動実行)。"""
+    from .core.util import parse_duration
     from .storage import Storage
 
     cfg, resolved_db = _ensure_db_and_config(config_path, db_path)
     raw = raw_retention or cfg.retention.raw
     rollup = rollup_retention or cfg.retention.rollup
+    for label, value in (
+        ("--raw" if raw_retention else "retention.raw", raw),
+        ("--rollup" if rollup_retention else "retention.rollup", rollup),
+    ):
+        try:
+            parse_duration(value)
+        except ValueError as exc:
+            _fail(f"{label}: {exc}")
 
-    with Storage(resolved_db) as store:
+    with _db_guard(resolved_db), Storage(resolved_db) as store:
         result = store.retention(raw=raw, rollup=rollup)
 
     if not _is_quiet(quiet):
