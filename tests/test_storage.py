@@ -538,7 +538,7 @@ def test_time_bounds_and_self_cpu_stats(tmp_db):
 
 
 def test_missing_io_ratio(tmp_db):
-    assert tmp_db.missing_io_ratio(0.0, 100.0) == 0.0
+    assert tmp_db.missing_io_ratio(0.0, 100.0) is None
     readable = _proc_row(1.0, pid=1)[:-2] + (10, 20)
     tmp_db.buffer("proc_samples", [readable, _proc_row(1.0, pid=2)])
     tmp_db.flush()

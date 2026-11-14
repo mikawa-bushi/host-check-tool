@@ -38,7 +38,7 @@ from typing import (
     Union,
 )
 
-from .core.util import MiB, parse_duration
+from .core.util import MiB, parse_duration, storable_text
 
 logger = logging.getLogger(__name__)
 
@@ -628,7 +628,7 @@ class Storage:
         raise a cryptic SQLite error at flush.  Reject the mismatch here with a
         clear, table-named message instead (issue v0.3 §2-6); combined with
         ``test_table_columns_match_schema`` (§2-2) this fences the write path
-        against schema/sampler drift.  Text is stored as :func:`_storable_text`.
+        against schema/sampler drift.  Text is stored as :func:`storable_text`.
         """
         cols = TABLE_COLUMNS.get(table)
         if cols is not None:
@@ -1310,12 +1310,12 @@ class Storage:
         row = self.conn.execute(q, params).fetchone()
         return row["avg"], row["max"]
 
-    def missing_io_ratio(self, since: float, until: float) -> float:
+    def missing_io_ratio(self, since: float, until: float) -> Optional[float]:
         """Fraction of ``proc_samples`` rows whose I/O counters were unreadable.
 
         Non-root recording cannot read other users' ``io_counters``; the ratio
-        tells the report how much the I/O rules can be trusted.  ``0.0`` when
-        there are no process samples in the range.
+        tells the report how much the I/O rules can be trusted.  ``None`` when
+        there are no process samples in the range (nothing was measured).
         """
         row = self.conn.execute(
             "SELECT COUNT(*) AS total, "
@@ -1324,7 +1324,7 @@ class Storage:
             (since, until),
         ).fetchone()
         if not row or not row["total"]:
-            return 0.0
+            return None
         return (row["missing"] or 0) / row["total"]
 
     def recent_events(self, limit: int) -> List[sqlite3.Row]:
@@ -1352,10 +1352,10 @@ class Storage:
         failed flush can never roll it back and hand the id to another
         program.  For a known identity (cached, no SQL) the next flush writes
         ``last_seen``.  ``name`` and ``cmdline_sample`` are stored as
-        :func:`_storable_text`.
+        :func:`storable_text`.
         """
-        name = _storable_text(name)
-        cmdline_sample = _storable_text(cmdline_sample)
+        name = storable_text(name)
+        cmdline_sample = storable_text(cmdline_sample)
         key = (name, cmdline_hash)
         proc_id = self._proc_cache.get(key)
         if proc_id is not None:
@@ -1381,7 +1381,7 @@ class Storage:
 
         Committed and cached like :meth:`proc_id_for`.
         """
-        unit_path = _storable_text(unit_path)
+        unit_path = storable_text(unit_path)
         cg_id = self._cg_cache.get(unit_path)
         if cg_id is not None:
             self._registry_updates[_SET_CG_LAST_SEEN][cg_id] = (ts,)
@@ -1642,26 +1642,9 @@ class Storage:
 # ---------------------------------------------------------------------------
 
 
-def _storable_text(text: str) -> str:
-    r"""Return *text* in a form SQLite stores, with non-UTF-8 bytes as ``\xNN``.
-
-    psutil and ``os`` decode host names and paths with ``surrogateescape``, so
-    a Shift_JIS argv or a UTF-8 name the kernel cut at 15 bytes arrives with
-    lone surrogates, which SQLite's UTF-8 encoder rejects.  Escaping keeps two
-    such names distinct, so they never share one ``proc_id``.
-    """
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return text.encode("utf-8", "surrogateescape").decode(
-            "utf-8", "backslashreplace"
-        )
-    return text
-
-
 def _storable_row(row: tuple) -> tuple:
-    """Return *row* with every text value passed through :func:`_storable_text`."""
-    return tuple(_storable_text(v) if isinstance(v, str) else v for v in row)
+    """Return *row* with every text value passed through :func:`storable_text`."""
+    return tuple(storable_text(v) if isinstance(v, str) else v for v in row)
 
 
 def _non_null(rows: List[sqlite3.Row], col: str) -> List[Any]:

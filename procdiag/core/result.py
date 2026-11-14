@@ -124,9 +124,10 @@ class ObservationQuality:
 
     span_hours: float = 0.0
     gap_seconds: float = 0.0  # total recorder gap (job-late) delay in seconds
-    missing_io_pct: float = 0.0  # fraction of proc rows where io_counters was NULL
-    self_cpu_avg: float = 0.0
-    self_cpu_max: float = 0.0
+    # None = not measured in the window (shown as 未計測, JSON null), never 0.
+    missing_io_pct: Optional[float] = None  # fraction of proc rows with no io_counters
+    self_cpu_avg: Optional[float] = None
+    self_cpu_max: Optional[float] = None
     throttle_events: int = 0
     notes: list[str] = field(default_factory=list)  # demotion reasons etc.
 

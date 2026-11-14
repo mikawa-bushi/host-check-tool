@@ -112,7 +112,13 @@ def create_bundle(
             result.cmdline_redacted = not keep_cmdline
             with Storage(db_copy, read_only=True) as store:
                 diag = Engine(config).run(store)
-                charts = build_charts(store, config=config)
+                shown = diag.window
+                charts = build_charts(
+                    store,
+                    since=shown.start_ts if shown else None,
+                    until=shown.end_ts if shown else None,
+                    config=config,
+                )
                 meta_hostname = store.meta().get("hostname")
                 write(
                     "status.json",
