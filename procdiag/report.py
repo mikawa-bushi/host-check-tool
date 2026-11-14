@@ -56,6 +56,7 @@ from procdiag.core import (
 )
 from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
+from procdiag.diagnosis.engine import holes_note
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -1178,17 +1179,20 @@ def _row_change(row: ComparisonRow) -> str:
     return text
 
 
-def _period_text(side: Side, *, show_db: bool) -> str:
+def _period_lines(side: Side, *, show_db: bool) -> List[str]:
     db = f"  [{side.db}]" if show_db else ""
     res = side.result
     if res is None:
-        return f"{side.name.label}: 期間内に記録がありません{db}"
+        return [f"{side.name.label}: 期間内に記録がありません{db}"]
     start = _local(res.window.start_ts).strftime("%Y-%m-%d %H:%M")
     end = _local(res.window.end_ts).strftime("%Y-%m-%d %H:%M")
-    return (
-        f"{side.name.label}: {start} 〜 {end}  {res.window.span_hours:.1f} 時間"
+    period = (
+        f"{side.name.label}: {start} 〜 {end}  {res.window.observed_hours:.1f} 時間"
         f" (うち生データ {res.raw_hours:.1f} 時間){db}"
     )
+    if not res.window.holes:
+        return [period]
+    return [period, f"  {holes_note(res.window.holes)}"]
 
 
 def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
@@ -1241,8 +1245,8 @@ def render_comparison_terminal(
     reset = _c(_RESET, color)
     warn = _c(_ANSI[Severity.WARNING], color)
     lines = [
-        _period_text(cmp.before, show_db=show_db),
-        _period_text(cmp.after, show_db=show_db),
+        *_period_lines(cmp.before, show_db=show_db),
+        *_period_lines(cmp.after, show_db=show_db),
         f"時刻はこのホストのローカルタイム ({zone})",
     ]
     lines += [f"{warn}注意: {n.message}{reset}" for n in cmp.notes]
@@ -1323,7 +1327,7 @@ def _side_dict(side: Side) -> dict:
             if res
             else None
         ),
-        "span_hours": res.window.span_hours if res else 0.0,
+        "span_hours": res.window.observed_hours if res else 0.0,
         "raw_hours": res.raw_hours if res else 0.0,
         "no_data": res is None,
         "evaluated_rules": list(diag.evaluated_rules),
