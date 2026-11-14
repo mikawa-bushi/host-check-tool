@@ -82,7 +82,7 @@ procdiag check -o report.html
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/カーネルログの読取/センサ/DB の置き場の書き込み権限と空き容量) を診断する。空き容量は `retention.min_free_disk_mb` と比べる。降格ありで exit 2 |
 | `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する。引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示する |
 | `procdiag export` | 記録データを CSV または JSON でエクスポートする |
-| `procdiag prune` | 保持ポリシーを手動実行する |
+| `procdiag prune` | 保持ポリシーを手動実行する。記録中にも実行できる |
 | `procdiag bundle` | 記録 DB・レポート・snapshot・doctor を 1 つの tar.gz にまとめる (持ち出し解析用) |
 | `procdiag service print` | systemd ユニットファイルを標準出力に表示する |
 | `procdiag service install` | user systemd ユニットを `~/.config/systemd/user/` に配置する |
@@ -94,6 +94,13 @@ procdiag check -o report.html
 --config FILE    # 設定ファイル (既定: ./config.py)
 --db FILE        # DB ファイルパス (config の db_path を上書き)
 ```
+
+DB に書き込めない間 (ディスク満杯・I/O エラー・読み取り専用の DB ファイル) は、書けるようになるまで
+記録をメモリに残す。残すのは新しい方から 5 万行 (約 14 MB、200 プロセスのホストで約 30 分) まで。
+それより古い記録は捨て、捨てた行数と期間を、次に書けたときに ops_events (`data_lost`) に残す。
+`check` の観測品質の備考と `status` の直近イベントに出る。書けない間も、保持ポリシーと DB サイズ
+ガードは毎時動く。記録を始めるときに DB に書き込めないとき、停止するときに残りの記録を書けなかった
+ときは、理由を表示して終了コード 1 で終わる。
 
 ### check の主要オプション
 

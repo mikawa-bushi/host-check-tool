@@ -19,13 +19,24 @@ Key design choices that mirror netdiag:
 
 from __future__ import annotations
 
+import heapq
 import logging
 import shutil
 import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from .core.util import MiB, parse_duration
 
@@ -88,10 +99,34 @@ class StorageVersionError(RuntimeError):
     """Raised when a DB's schema version is newer than this procdiag supports."""
 
 
-# Minimum seconds between ``last_seen`` rewrites for the same cgroup unit.
-# ``last_seen`` is metadata that nothing reads for logic, so the per-tick
-# UPDATE is throttled to bound the write rate during long recordings.
-_CG_LAST_SEEN_THROTTLE_SEC = 60.0
+# Samples kept in memory while the DB cannot be written (disk full, I/O error,
+# read-only file): about 14 MiB, or half an hour of a 200-process host.  Older
+# ones are dropped, and the loss is recorded as a ``data_lost`` ops_event.
+_MAX_UNSAVED_ROWS = 50_000
+
+# Registry columns that change while their row's id is in use.  The next flush
+# writes them, so a sighting needs no transaction of its own.
+_SET_PROC_LAST_SEEN = "UPDATE proc_registry SET last_seen=? WHERE proc_id=?"
+_SET_CG_LAST_SEEN = "UPDATE cgroup_registry SET last_seen=? WHERE cg_id=?"
+_SET_PROC_FD_LIMITS = (
+    "UPDATE proc_registry SET fd_soft_limit=?, fd_hard_limit=? WHERE proc_id=?"
+)
+
+
+class _Loss(NamedTuple):
+    """Samples dropped since the last successful flush."""
+
+    rows: int
+    since: float
+    until: float
+
+    def detail(self) -> str:
+        since, until = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            for ts in (self.since, self.until)
+        )
+        return f"DB に書けなかったため {self.rows} 行を捨てました ({since}〜{until} の記録)"
+
 
 # ---------------------------------------------------------------------------
 # DDL — verbatim from design doc §5.2
@@ -432,13 +467,12 @@ class Storage:
         # In-memory write buffer: table_name -> list[tuple]
         self._buffer: Dict[str, List[tuple]] = defaultdict(list)
 
-        # Registry caches to avoid per-tick SQL round-trips.
-        # key -> (id, last_seen_ts)
+        # Registry ids by identity, cached only once their row is committed.
         self._proc_cache: Dict[Tuple[str, str], int] = {}
         self._cg_cache: Dict[str, int] = {}
-        # Last ts at which each cgroup unit's last_seen was actually written
-        # (write path only) — used to throttle the per-tick UPDATE.
-        self._cg_last_seen_written: Dict[str, float] = {}
+        # Registry updates for the next flush: statement -> {row id: values}.
+        self._registry_updates: Dict[str, Dict[int, tuple]] = defaultdict(dict)
+        self._lost: Optional[_Loss] = None
 
         # Query result cache, enabled only for read-only sessions so multiple
         # rules over the same window share a single scan.  ``None`` disables it
@@ -557,31 +591,72 @@ class Storage:
         Returns the total number of rows written.  When ``reason`` is
         ``"spike"`` or ``"signal"`` an ops_event is also recorded so
         operators can see why a flush happened mid-interval.
+
+        When the write fails the rows stay buffered for the next flush, up to
+        ``_MAX_UNSAVED_ROWS`` samples; the oldest beyond that are dropped, and
+        the next successful flush records how many as a ``data_lost`` event.
         """
-        if not self._buffer:
+        if not self._buffer and not self._registry_updates:
             if reason in ("spike", "signal"):
                 self.record_event(reason, "バッファ空でフラッシュ")
             return 0
 
         total = 0
-        with self.conn:
-            for table, rows in self._buffer.items():
-                if not rows:
-                    continue
-                cols = TABLE_COLUMNS.get(table)
-                if cols is None:
-                    continue  # unknown table — silently skip
-                placeholders = ", ".join("?" * len(cols))
-                col_list = ", ".join(cols)
-                self.conn.executemany(
-                    f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})",
-                    rows,
-                )
-                total += len(rows)
-            if reason in ("spike", "signal"):
-                self._insert_event("flush", f"reason={reason}")
+        try:
+            with self.conn:
+                for table, rows in self._buffer.items():
+                    if not rows:
+                        continue
+                    cols = TABLE_COLUMNS.get(table)
+                    if cols is None:
+                        continue  # unknown table — silently skip
+                    placeholders = ", ".join("?" * len(cols))
+                    col_list = ", ".join(cols)
+                    self.conn.executemany(
+                        f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})",
+                        rows,
+                    )
+                    total += len(rows)
+                for sql, values in self._registry_updates.items():
+                    self.conn.executemany(
+                        sql, [(*row, row_id) for row_id, row in values.items()]
+                    )
+                if self._lost is not None:
+                    self._insert_event("data_lost", self._lost.detail())
+                if reason in ("spike", "signal"):
+                    self._insert_event("flush", f"reason={reason}")
+        except Exception:
+            self._drop_oldest_unsaved()
+            raise
         self._buffer.clear()
+        self._registry_updates.clear()
+        self._lost = None
         return total
+
+    def _drop_oldest_unsaved(self) -> None:
+        """Drop the oldest buffered samples beyond ``_MAX_UNSAVED_ROWS``.
+
+        Whole ticks go (every row of a timestamp), so no tick keeps only some of
+        its processes.  ``meta`` rows are keyed settings, not timed samples.
+        """
+        samples = [rows for table, rows in self._buffer.items() if table != "meta"]
+        excess = sum(map(len, samples)) - _MAX_UNSAVED_ROWS
+        if excess <= 0:
+            return
+        oldest = heapq.nsmallest(excess, (row[0] for rows in samples for row in rows))
+        dropped = 0
+        for rows in samples:
+            kept = [row for row in rows if row[0] > oldest[-1]]
+            dropped += len(rows) - len(kept)
+            rows[:] = kept
+        lost = self._lost or _Loss(0, oldest[0], oldest[0])
+        self._lost = _Loss(lost.rows + dropped, lost.since, oldest[-1])
+        logger.warning(
+            "記録 DB に書けないため、古い記録 %d 行を捨てました "
+            "(書けるまでメモリに残すのは %d 行まで)",
+            dropped,
+            _MAX_UNSAVED_ROWS,
+        )
 
     def rollup_incremental(self) -> None:
         """Aggregate completed minutes into rollup tables since last watermark.
@@ -605,12 +680,13 @@ class Storage:
             # normal `>= floor` guard below would skip every rolled-back minute
             # forever.  Reset the watermark to now and surface the event so the
             # observer can flag the affected window.
-            self.record_event(
-                "clock_skew",
-                f"rollup watermark {watermark:.0f} > 現在分 {current_minute_floor}"
-                " — 時計巻き戻しを検出し watermark を補正",
-            )
-            self.set_meta("rollup_watermark", str(current_minute_floor))
+            with self.conn:
+                self._insert_event(
+                    "clock_skew",
+                    f"rollup watermark {watermark:.0f} > 現在分 {current_minute_floor}"
+                    " — 時計巻き戻しを検出し watermark を補正",
+                )
+                self.set_meta("rollup_watermark", str(current_minute_floor))
             return
 
         if watermark >= current_minute_floor:
@@ -1078,70 +1154,56 @@ class Storage:
     ) -> int:
         """Upsert a process into ``proc_registry`` and return its ``proc_id``.
 
-        Uses an in-memory cache so repeated calls for the same
-        ``(name, cmdline_hash)`` within a session cost no SQL round-trips.
-        ``last_seen`` is updated in the DB every call (but the cache avoids
-        re-reading the ID each time).  ``name`` and ``cmdline_sample`` are
-        stored as :func:`_storable_text`.
+        A new identity's row is committed before its id is returned, so a
+        failed flush can never roll it back and hand the id to another
+        program.  For a known identity (cached, no SQL) the next flush writes
+        ``last_seen``.  ``name`` and ``cmdline_sample`` are stored as
+        :func:`_storable_text`.
         """
         name = _storable_text(name)
         cmdline_sample = _storable_text(cmdline_sample)
         key = (name, cmdline_hash)
-        if key in self._proc_cache:
-            # Update last_seen in DB (infrequent; acceptable cost)
-            self.conn.execute(
-                "UPDATE proc_registry SET last_seen=? WHERE name=? AND cmdline_hash=?",
-                (ts, name, cmdline_hash),
-            )
-            return self._proc_cache[key]
+        proc_id = self._proc_cache.get(key)
+        if proc_id is not None:
+            self._registry_updates[_SET_PROC_LAST_SEEN][proc_id] = (ts,)
+            return proc_id
 
-        # Try to insert; if the unique key already exists, update instead.
-        self.conn.execute(
-            "INSERT INTO proc_registry (name, cmdline_hash, cmdline_sample, "
-            "first_seen, last_seen) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(name, cmdline_hash) DO UPDATE SET last_seen=excluded.last_seen",
-            (name, cmdline_hash, cmdline_sample, ts, ts),
-        )
-        row = self.conn.execute(
-            "SELECT proc_id FROM proc_registry WHERE name=? AND cmdline_hash=?",
-            (name, cmdline_hash),
-        ).fetchone()
-        proc_id: int = row["proc_id"]
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO proc_registry (name, cmdline_hash, cmdline_sample, "
+                "first_seen, last_seen) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(name, cmdline_hash) DO UPDATE SET last_seen=excluded.last_seen",
+                (name, cmdline_hash, cmdline_sample, ts, ts),
+            )
+            proc_id = self.conn.execute(
+                "SELECT proc_id FROM proc_registry WHERE name=? AND cmdline_hash=?",
+                (name, cmdline_hash),
+            ).fetchone()["proc_id"]
         self._proc_cache[key] = proc_id
         return proc_id
 
     def cg_id_for(self, unit_path: str, ts: float) -> int:
         """Upsert a cgroup unit into ``cgroup_registry`` and return ``cg_id``.
 
-        ``last_seen`` is refreshed at most once per
-        ``_CG_LAST_SEEN_THROTTLE_SEC`` seconds per unit to bound the write rate
-        on long recordings (the column is metadata that nothing reads for logic).
+        Committed and cached like :meth:`proc_id_for`.
         """
         unit_path = _storable_text(unit_path)
-        if unit_path in self._cg_cache:
-            # Throttle the last_seen rewrite: it is metadata nothing reads for
-            # logic, so there is no need to UPDATE on every tick for every unit.
-            last_written = self._cg_last_seen_written.get(unit_path, 0.0)
-            if ts - last_written >= _CG_LAST_SEEN_THROTTLE_SEC:
-                self.conn.execute(
-                    "UPDATE cgroup_registry SET last_seen=? WHERE unit_path=?",
-                    (ts, unit_path),
-                )
-                self._cg_last_seen_written[unit_path] = ts
-            return self._cg_cache[unit_path]
+        cg_id = self._cg_cache.get(unit_path)
+        if cg_id is not None:
+            self._registry_updates[_SET_CG_LAST_SEEN][cg_id] = (ts,)
+            return cg_id
 
-        self.conn.execute(
-            "INSERT INTO cgroup_registry (unit_path, first_seen, last_seen) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(unit_path) DO UPDATE SET last_seen=excluded.last_seen",
-            (unit_path, ts, ts),
-        )
-        row = self.conn.execute(
-            "SELECT cg_id FROM cgroup_registry WHERE unit_path=?", (unit_path,)
-        ).fetchone()
-        cg_id: int = row["cg_id"]
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO cgroup_registry (unit_path, first_seen, last_seen) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(unit_path) DO UPDATE SET last_seen=excluded.last_seen",
+                (unit_path, ts, ts),
+            )
+            cg_id = self.conn.execute(
+                "SELECT cg_id FROM cgroup_registry WHERE unit_path=?", (unit_path,)
+            ).fetchone()["cg_id"]
         self._cg_cache[unit_path] = cg_id
-        self._cg_last_seen_written[unit_path] = ts
         return cg_id
 
     # ------------------------------------------------------------------
@@ -1248,12 +1310,8 @@ class Storage:
         return row["unit_path"] if row else str(cg_id)
 
     def set_proc_fd_limits(self, proc_id: int, soft: int, hard: int) -> None:
-        """Record a process identity's FD limits (caller's next flush commits)."""
-        self.conn.execute(
-            "UPDATE proc_registry SET fd_soft_limit=?, fd_hard_limit=? "
-            "WHERE proc_id=?",
-            (soft, hard, proc_id),
-        )
+        """Record a process identity's FD limits (the next flush writes them)."""
+        self._registry_updates[_SET_PROC_FD_LIMITS][proc_id] = (soft, hard)
 
     # ------------------------------------------------------------------
     # Recording sessions (unclean-shutdown detection)
@@ -1321,10 +1379,12 @@ class Storage:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Flush remaining buffer and close the connection."""
-        if not self._read_only:
-            self.flush(reason="close")
-        self.conn.close()
+        """Flush remaining buffer and close the connection, even when the flush fails."""
+        try:
+            if not self._read_only:
+                self.flush(reason="close")
+        finally:
+            self.conn.close()
 
     def __enter__(self) -> "Storage":
         return self

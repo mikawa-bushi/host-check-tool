@@ -77,7 +77,7 @@ procdiag bundle
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
 | `procdiag explain [RULE\|sampler]` | ルールまたはサンプラーの詳細を表示 (引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示) |
 | `procdiag export` | 記録データを CSV または JSON でエクスポート |
-| `procdiag prune` | 保持ポリシーの手動実行 |
+| `procdiag prune` | 保持ポリシーの手動実行 (記録中にも実行できる) |
 | `procdiag bundle` | 記録 DB・レポート・snapshot・doctor を 1 つの tar.gz に (コマンドラインは既定で削除) |
 | `procdiag service print` | systemd ユニットファイルを表示 |
 | `procdiag service install` | user systemd ユニットを配置 |
