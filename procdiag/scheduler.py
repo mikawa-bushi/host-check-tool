@@ -3,7 +3,9 @@
 Maps to netdiag's ``scheduler.py`` (Monitor._loop) but generalises to N
 named jobs each with an independent interval.  A single-thread approach is
 deliberate: procdiag samplers produce negligible I/O waits, so
-``threading.Thread`` overhead would exceed the benefit of parallelism.
+``threading.Thread`` overhead would exceed the benefit of parallelism.  The
+one long job, the watch-dir walk, runs on its own thread (the recorder starts
+it and waits at most a tenth of a second for it).
 
 Design goals:
 - Drift-free scheduling: each job's next fire time is updated as

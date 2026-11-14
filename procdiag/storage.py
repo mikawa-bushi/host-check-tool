@@ -519,7 +519,9 @@ class Storage:
             self.conn = connect_read_only(self.path)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(str(self.path))
+            # A Recorder opens its DB where it is built and may write from the
+            # thread that runs it; it never uses the connection from two at once.
+            self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
 
         self.conn.row_factory = sqlite3.Row
         try:

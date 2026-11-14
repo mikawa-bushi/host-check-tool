@@ -2,10 +2,11 @@
 
 Maps to design doc §4.8. The SelfMeter watches procdiag's own CPU usage over a
 60-second sliding window.  When the moving average exceeds
-``BudgetConfig.overhead_budget_pct``, it signals a throttle-down so the
-scheduler can widen the Tier-2b interval.  After 10 minutes of staying under
-budget, it signals a throttle-restore so the interval gradually returns to the
-configured baseline.
+``BudgetConfig.overhead_budget_pct``, it widens the Tier-2b interval by
+``throttle_factor`` and signals a throttle-down; while the average stays over
+budget it widens again once per window (the average then covers the slower
+scans), until the interval reaches ``throttle_max_interval``.  Each 10 minutes
+under budget takes one step back towards the configured interval.
 
 The first ``BudgetConfig.warmup_sec`` seconds are excluded from the average:
 start-up pays one-off costs (sampler setup, a ``psutil.Process`` object for
@@ -47,19 +48,20 @@ class SelfMeter:
 
     Usage::
 
-        meter = SelfMeter(config.budget)
-        # inside the Tier-1 collect loop:
-        cpu_pct, rss = meter.sample()
+        meter = SelfMeter(config.budget, process_interval=10.0)
+        # on every Tier-1 tick:
         event = meter.update(time.monotonic())
-        if event == "throttle_down":
-            scheduler.set_process_factor(meter.factor)
+        # the Tier-2b interval is process_interval * meter.factor
 
     Thread-safety: not thread-safe; intended for the single-threaded recorder
     loop.
     """
 
-    def __init__(self, cfg: "BudgetConfig") -> None:
+    def __init__(self, cfg: "BudgetConfig", *, process_interval: float) -> None:
         self._cfg = cfg
+        # The factor that widens process_interval to throttle_max_interval; a
+        # configured interval already that long is never widened.
+        self._max_factor = max(1.0, cfg.throttle_max_interval / process_interval)
         self._proc = psutil.Process(os.getpid())
         # Initialise cpu_percent once so the first call to sample() is valid.
         self._proc.cpu_percent(interval=None)
@@ -70,16 +72,12 @@ class SelfMeter:
         # Current throttle multiplier applied to the Tier-2b interval.
         self._factor: float = 1.0
 
-        # Monotonic timestamp when the CPU last went *over* budget.
-        # None means we are currently within budget (or never measured yet).
-        self._over_budget_since: Optional[float] = None
+        # Monotonic time of the last widening step.
+        self._widened_at: Optional[float] = None
 
-        # Monotonic timestamp when the CPU returned under budget after a
-        # throttle-down event.  Used to count the 10-minute patience period.
+        # Monotonic time since when the CPU has stayed under budget while
+        # throttled (restarted by each restore step).
         self._under_budget_since: Optional[float] = None
-
-        # Prevent re-emitting the same event on consecutive ticks.
-        self._throttled: bool = False
 
         # Cache for the tiny-interval floor (see _MIN_SAMPLE_INTERVAL_SEC).
         self._last_sample: Optional[Tuple[float, int]] = None
@@ -128,13 +126,11 @@ class SelfMeter:
         Returns
         -------
         ``"throttle_down"``
-            First tick where the 60-second moving average exceeds the overhead
-            budget.  The caller should widen the Tier-2b interval by
-            ``self.factor`` immediately after receiving this.
+            ``factor`` grew by ``throttle_factor``: the 60-second moving average
+            exceeds the budget, and the last step (if any) is a full window ago.
         ``"throttle_restore"``
-            First tick after 10 consecutive minutes of staying within budget
-            following a throttle-down.  The caller should restore the Tier-2b
-            interval to the baseline.
+            ``factor`` shrank by ``throttle_factor`` (not below 1.0) after 10
+            consecutive minutes within budget since the last step.
         ``None``
             No state change (always during the start-up warm-up); the caller
             need not act.
@@ -161,32 +157,21 @@ class SelfMeter:
 
         if over:
             self._under_budget_since = None
-            if not self._throttled:
-                # Ratchet up the throttle factor.  The 60-second *interval*
-                # ceiling (throttle_max_interval) is applied by the recorder
-                # where the base interval is known; the factor itself only
-                # grows once per throttle episode.
-                self._factor = self._factor * self._cfg.throttle_factor
-                self._throttled = True
-                self._over_budget_since = mono_now
+            if self._factor < self._max_factor and (
+                self._widened_at is None or mono_now - self._widened_at >= _WINDOW_SEC
+            ):
+                self._factor = min(
+                    self._factor * self._cfg.throttle_factor, self._max_factor
+                )
+                self._widened_at = mono_now
                 return "throttle_down"
-        else:
-            # Within budget.
-            if self._throttled:
-                # Start (or continue) counting patience time.
-                if self._under_budget_since is None:
-                    self._under_budget_since = mono_now
-                elapsed = mono_now - self._under_budget_since
-                if elapsed >= _RESTORE_PATIENCE_SEC:
-                    # Gradually restore: divide factor by throttle_factor (step
-                    # back towards 1.0 rather than snapping immediately).
-                    new_factor = self._factor / self._cfg.throttle_factor
-                    self._factor = max(1.0, new_factor)
-                    if self._factor <= 1.0:
-                        self._factor = 1.0
-                        self._throttled = False
-                        self._under_budget_since = None
-                    return "throttle_restore"
+        elif self._factor > 1.0:
+            if self._under_budget_since is None:
+                self._under_budget_since = mono_now
+            elif mono_now - self._under_budget_since >= _RESTORE_PATIENCE_SEC:
+                self._factor = max(1.0, self._factor / self._cfg.throttle_factor)
+                self._under_budget_since = mono_now
+                return "throttle_restore"
 
         return None
 

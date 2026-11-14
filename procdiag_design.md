@@ -131,7 +131,7 @@ procdiag export [--format csv|json] [--rollup 1min]
 - `psutil.Process` オブジェクトを **PIDキャッシュとして保持**し、同一インスタンスを再利用する
   - 理由: `cpu_percent()` は前回呼び出しとの差分計測。使い捨てでは常に0が返る
   - 消えたPIDは `NoSuchProcess` 捕捉時にキャッシュから除去
-  - 新規PIDは走査時に追加(初回サンプルのcpu_percentは記録しない)
+  - 新規PIDは走査時に追加(差分の起点が無い初回サンプルのCPU使用率は、起動からのCPU時間÷経過時間)
 - `Process.oneshot()` コンテキストで属性をまとめ読み
 - 取得属性: name, cmdline, cpu_percent, memory_info(rss/vms), num_threads, num_fds, io_counters(可能なら), status, create_time
 - **プロセスの同一性**: 記録キーは `(name, sha1(cmdline正規化)[:12])`。プロセス台帳テーブルに正規化し、サンプル行は台帳IDのみ持つ
