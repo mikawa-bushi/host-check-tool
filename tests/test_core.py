@@ -160,8 +160,8 @@ def test_sampler_run_catches_exception_and_returns_empty():
     ctx = _make_ctx()
     result = sampler.run(ctx)
     assert result == []
-    assert any("_broken_test_sampler" in note for note in ctx.notes)
-    assert any("collect失敗" in note for note in ctx.notes)
+    assert any("_broken_test_sampler" in note.text for note in ctx.notes)
+    assert any("collect失敗" in note.text for note in ctx.notes)
 
 
 def test_sampler_run_returns_batches_on_success():

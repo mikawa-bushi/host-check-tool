@@ -38,7 +38,7 @@ from typing import Any, Optional, Tuple
 
 import psutil
 
-from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
+from ..core.sampler import Note, RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
 # Filesystem types that carry no persistent data and should be excluded from
@@ -159,12 +159,14 @@ class DiskSampler(Sampler):
     def _note_unreadable(self, ctx: RunContext, unreadable: list[str]) -> None:
         """Name each watch dir that cannot be read, once each time it becomes unreadable.
 
-        The recorder keeps one note per text before the first ``": "``, so the
-        path goes in front of it: a second directory that fails later is a new note.
+        The recorder keeps one note per key, so each directory has its own.
         """
         ctx.notes.extend(
-            f"disk_dirs {path}: 監視ディレクトリを読めないため、サイズを記録できません"
-            " (存在しない・権限がないなど)"
+            Note(
+                f"disk_dirs {path}",
+                f"disk_dirs {path}: 監視ディレクトリを読めないため、サイズを記録できません"
+                " (存在しない・権限がないなど)",
+            )
             for path in unreadable
             if path not in self._unreadable
         )

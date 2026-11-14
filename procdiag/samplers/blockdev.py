@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 from typing import Container, Iterable
-
-_PARTITION = re.compile(r"(.+?)p?\d+")
 
 
 def is_partition(name: str, names: Container[str]) -> bool:
@@ -15,10 +12,17 @@ def is_partition(name: str, names: Container[str]) -> bool:
 
     The kernel names a partition after its disk and its number, with a ``p``
     between them when the disk's name ends in a digit (``sda1``, ``nvme0n1p1``).
+    A disk's name can end in ``p`` itself (``sdp``, ``xvdp``), so ``sdp1`` is
+    read as that disk's first partition before it is read as ``sd`` plus ``p1``.
     A disk's counters already include its partitions.
     """
-    match = _PARTITION.fullmatch(name)
-    return match is not None and match.group(1) in names
+    stem = name.rstrip("0123456789")
+    if not stem or stem == name:
+        return False
+    if stem in names:
+        return True
+    disk = stem[:-1]
+    return stem.endswith("p") and disk[-1:].isdigit() and disk in names
 
 
 def _is_loop(dev_dir: Path) -> bool:

@@ -97,7 +97,7 @@ class TestUnreadableWatchDir:
         sampler.collect_dirs(ctx)
 
         assert len(ctx.notes) == 1
-        assert str(missing) in ctx.notes[0]
+        assert str(missing) in ctx.notes[0].text
 
 
 def _scan_into(store: Storage, *dirs: Path) -> None:
