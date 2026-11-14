@@ -257,7 +257,7 @@ def test_enforce_size_budget_records_retention_failure(tmp_path, monkeypatch):
         def _boom(*_a, **_k):
             raise sqlite3.OperationalError("retention boom")
 
-        monkeypatch.setattr(store, "retention", _boom)
+        monkeypatch.setattr(store, "_delete_before", _boom)
         # max_bytes=1 forces over-budget so the retention ladder runs.
         store.enforce_size_budget(max_bytes=1, min_free_bytes=None)
 
