@@ -801,11 +801,15 @@ class TestDiskIoDoesNotJumpWhenAListingIsEmptyForATick:
 
         assert _tick(sampler, ctx) == (0, 0)
 
-    def test_an_io_stat_with_no_device_for_one_tick_is_not_io(self, tmp_path):
+
+class TestCgroupIoOfACgroupCreatedAgain:
+    def test_its_first_io_is_counted_when_io_stat_was_empty_at_the_tick_before(
+        self, tmp_path
+    ):
         io = _CgroupIo(tmp_path, _fake_sysfs(tmp_path / "sys"))
-        stat = {"8:0": (10 * _GiB, 0), "252:0": (9 * _GiB, 0)}
-        io.tick(stat)
+        io.tick({"8:0": (10 * _GiB, 0)})
+        io.tick({"8:0": (10 * _GiB + 100 * _MiB, 0)})
 
         io.tick({})
 
-        assert io.tick(stat) == (0, 0)
+        assert io.tick({"8:0": (50 * _MiB, 0)}) == (50 * _MiB, 0)
