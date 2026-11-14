@@ -147,7 +147,8 @@ class Engine:
     ) -> list[type[Rule]]:
         """Return the rule classes that will be run.
 
-        Applies ``config.rules.disabled`` first, then *only* / *skip*.
+        Loads ``config.rules.extra_rules`` so their IDs are known, then
+        applies ``config.rules.disabled``, then *only* / *skip*.
         Returns rule class objects (not instances) so the caller can inspect
         class attributes before deciding to instantiate them.
 
@@ -156,6 +157,7 @@ class Engine:
         names a disabled rule, or when no rule is left to run, so a mistake
         never quietly changes which rules a "no problem" verdict covers.
         """
+        self._load_extra_rules([])
         disabled = set(self.config.rules.disabled)
         registry = all_rules()  # {rule_id: RuleClass}
         problems = [
@@ -192,7 +194,6 @@ class Engine:
         only: Optional[list[str]] = None,
         skip: Optional[list[str]] = None,
     ) -> float:
-        self._load_extra_rules([])
         return max(
             (
                 configure_rule(cls, self.config)[0].min_observation_hours

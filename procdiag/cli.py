@@ -131,14 +131,13 @@ def _validate_rules(
     """
     from .core import validate_rule_overrides
     from .diagnosis import Engine
-    from .plugins import load_extra_rules
 
-    load_extra_rules(cfg.rules.extra_rules)
-    problems = validate_rule_overrides(cfg.rules.overrides)
+    problems: list[str] = []
     try:
         Engine(cfg).select(only=only, skip=skip)
     except ValueError as exc:
-        problems.extend(str(exc).splitlines())
+        problems = str(exc).splitlines()
+    problems += validate_rule_overrides(cfg.rules.overrides)
     if problems:
         for msg in problems:
             click.echo(f"エラー: {msg}", err=True)
