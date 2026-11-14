@@ -229,6 +229,7 @@ class Recorder:
             {
                 "hostname": socket.gethostname(),
                 "kernel": platform.release(),
+                "cpu_count": str(psutil.cpu_count() or ""),
                 "boot_time": str(boot_time),
                 "procdiag_version": _VERSION,
                 "config": self._config.model_dump_json(),
