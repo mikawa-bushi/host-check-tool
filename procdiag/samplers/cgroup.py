@@ -18,6 +18,8 @@ Design choices:
   observation (clamped at 0 across unit restarts, see ``CounterDelta``).  The
   first collect after start (or after a new unit appears) skips those columns
   (``None``) because there is no baseline to diff against.
+* ``io.stat`` lists the disk and every LVM / dm-crypt / md device on it, each
+  with the same I/O; only devices no other device sits on are summed.
 * Any single file read failure (permission error, missing file) degrades only
   that column to ``None`` — the rest of the row is still emitted.  This is the
   "partial demotion" strategy described in design §2.1.
@@ -37,6 +39,7 @@ from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..core.util import CounterDelta
 from ..storage import make_row
+from .blockdev import is_stacked
 
 # How long to cache the unit enumeration result (seconds).
 _ENUM_CACHE_TTL = 300.0
@@ -62,12 +65,17 @@ def _parse_cpu_stat(path: Path) -> Optional[int]:
         return None
 
 
-def _parse_io_stat(path: Path) -> tuple[Optional[int], Optional[int]]:
-    """Return ``(rbytes_total, wbytes_total)`` aggregated across all devices.
+def _parse_io_stat(
+    path: Path, counted: Callable[[str], bool]
+) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(rbytes_total, wbytes_total)`` aggregated across the counted devices.
 
     Each line of ``io.stat`` has the form::
 
         8:0 rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N
+
+    A device for which ``counted("8:0")`` is false (LVM and the like, whose I/O
+    the disk below reports again) is left out.
 
     Returns ``(None, None)`` if the file is absent or unreadable.
     """
@@ -80,6 +88,8 @@ def _parse_io_stat(path: Path) -> tuple[Optional[int], Optional[int]]:
             if len(parts) < 2:
                 continue
             # parts[0] is the device major:minor; the rest are key=value pairs.
+            if not counted(parts[0]):
+                continue
             for kv in parts[1:]:
                 if kv.startswith("rbytes="):
                     rbytes += int(kv[7:])
@@ -179,10 +189,16 @@ class CgroupSampler(Sampler):
 
         ts = time.time()
         rows: list[tuple] = []
+        stacked: dict[str, bool] = {}
+
+        def counted(device: str) -> bool:
+            if device not in stacked:
+                stacked[device] = is_stacked(ctx.sys_root / "dev" / "block" / device)
+            return not stacked[device]
 
         for unit_path in self._units:
             unit_dir = ctx.cgroup_root / unit_path
-            rb_raw, wb_raw = _parse_io_stat(unit_dir / "io.stat")
+            rb_raw, wb_raw = _parse_io_stat(unit_dir / "io.stat", counted)
 
             # Rows are emitted even when the delta columns are still None (first
             # tick for a unit) so that memory/pids are captured from the start.

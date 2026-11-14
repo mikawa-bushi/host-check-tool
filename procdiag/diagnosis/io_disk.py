@@ -390,7 +390,7 @@ class DiskGrowthRule(Rule):
     title = "ディレクトリ急増"
     default_severity = Severity.INFO
     min_observation_hours = 1.0
-    requires_rows = ("dir_samples",)
+    requires_rows = ("dir_samples", "dir_samples.size_bytes")
     what = "dir_samples のパスごと増分を計算し、日次増分が閾値を超えたら発火する"
     why = (
         "急激なディレクトリ肥大はディスク満杯の前兆であることが多く、"
@@ -534,7 +534,7 @@ class DiskJournalRule(Rule):
     title = "journaldサイズ超過"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0  # single-point check; no trend needed
-    requires_rows = ("dir_samples",)
+    requires_rows = ("dir_samples", "dir_samples.size_bytes")
     what = (
         "dir_samples の /var/log/journal* パスの最新サイズが"
         " journal_size_warn_gb 閾値を超えているか確認する"
