@@ -82,8 +82,14 @@ Finding = tuple
 
 
 def _git(args: list[str]) -> str:
+    # errors="replace": a combined-diff hunk header can cut a multibyte
+    # character in half, which strict decoding turns into a crash.
     return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
+        ["git", *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
     ).stdout
 
 
