@@ -609,9 +609,11 @@ class Storage:
 
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(_SCHEMA)
-        self.conn.commit()
+        # One transaction with the version stamp, so that a kill in between
+        # cannot leave an older version with a newer version's tables.
+        self.conn.executescript("BEGIN;" + _SCHEMA)
         self._ensure_schema_version()
+        self.conn.commit()
 
     def _ensure_schema_version(self) -> None:
         """Read the stored schema version and migrate forward if needed.

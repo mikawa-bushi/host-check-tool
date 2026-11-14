@@ -13,12 +13,16 @@
 
 OOM-KILL-01 design:
 
-1. Identify processes (PIDs) whose last sample is significantly before the
-   window end (> ``GAP_THRESHOLD_S`` seconds) — the process disappeared while
-   recording continued, distinguishing it from machine-wide stops.  A victim
-   that its supervisor started again (same program, new PID) counts too.
-   A recorded kernel OOM line naming the PID (``kernel_events``) makes it a
-   finding with HIGH confidence; steps 2-4 apply only without one.
+1. Identify processes whose last sample is significantly before the window
+   end (> ``GAP_THRESHOLD_S`` seconds) — the process disappeared while
+   recording continued, distinguishing it from machine-wide stops.  A recorded
+   kernel OOM line naming the PID (``kernel_events``) makes it a finding with
+   HIGH confidence, also for a victim that its supervisor started again (same
+   program, new PID); steps 2-4 apply only without one.  Without that line a
+   program is judged as a whole, by its last process: a program that still
+   runs, or whose process was replaced by another, has not lost a process to
+   the OOM killer for all the samples can tell (a pool recycling its workers,
+   a service restarted on purpose).
 2. Exclude short-lived processes (lifetime < ``MIN_LIFETIME_S`` seconds),
    which are expected to exit.
 3. Exclude trivial consumers: the RSS of the last sample must be >= 1% of
@@ -30,10 +34,8 @@ OOM-KILL-01 design:
    ``psi_mem_full10 >= 1.0`` OR ``swap_out > 0`` OR
    ``mem_available < 5% of mem_total``, the process is flagged.
 5. All four conditions met → Finding(WARNING, MEDIUM, subject=process name).
-6. Each kernel-confirmed kill is a finding of its own.  The other candidates
-   of one program (an hourly batch, a pool of workers) are one finding: the
-   one with the largest last RSS, counting the others.  Cap at 5:
-   kernel-confirmed first, then by last RSS descending.
+6. Each kernel-confirmed kill is a finding of its own; a program is at most
+   one more.  Cap at 5: kernel-confirmed first, then by last RSS descending.
 7. Optional journal probe: calls ``_read_oom_journal`` (monkeypatchable),
    searches for process name / PID in OOM-kill log lines, elevates
    confidence to HIGH.
@@ -58,7 +60,7 @@ from ..core import (
     Window,
     register,
 )
-from .trend import one_per_program, proc_label, script_label
+from .trend import proc_label, script_label
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -130,11 +132,12 @@ def _oom_line_pid(line: str) -> Optional[int]:
 class OomKillRule(Rule):
     """Detect OOM-killed processes from the kernel's line or a memory crisis.
 
-    Queries ``proc_samples`` to find processes (PIDs) whose last recorded
-    sample is significantly earlier than the window end (indicating the
-    process exited while recording continued).  A recorded kernel OOM line
-    naming the PID confirms the kill; without one, ``sys_samples`` must show
-    memory-crisis indicators in a window around the disappearance time.
+    Queries ``proc_samples`` to find processes whose last recorded sample is
+    significantly earlier than the window end (indicating the process exited
+    while recording continued).  A recorded kernel OOM line naming the PID
+    confirms the kill; without one, the program must have no process left
+    and ``sys_samples`` must show memory-crisis indicators in a window around
+    the disappearance of its last one.
 
     An optional ``journalctl`` probe (``_read_oom_journal``) can elevate
     confidence from MEDIUM to HIGH when a matching OOM-kill log line is found.
@@ -154,9 +157,10 @@ class OomKillRule(Rule):
     min_observation_hours = 0.0  # instantaneous — runs on any recording length
     requires_rows = ("proc_samples", "sys_samples")
     what = (
-        "プロセス (PID) ごとに消滅を見る。記録したカーネルログの OOM の行"
-        " (Killed process <PID> / pid=<PID>) がその PID を名指ししていれば OOM kill"
-        " とする。その行が無いときは、消滅タイミングと sys_samples のメモリ危機指標"
+        "記録したカーネルログの OOM の行 (Killed process <PID> / pid=<PID>) が"
+        "消えたプロセスの PID を名指ししていれば、再起動されていても OOM kill とする。"
+        "その行が無いときはプログラムごとに見て、プロセスが 1 つも残っていなければ、"
+        "最後のプロセスの消滅タイミングと sys_samples のメモリ危機指標"
         "(psi_mem_full10 / swap_out / mem_available 急減)の相関で OOM kill を検出する"
     )
     why = (
@@ -184,8 +188,6 @@ class OomKillRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run OOM-KILL-01 against the observation window."""
-        # One group per process, not per program: a victim that its supervisor
-        # started again has gone even though its program goes on.
         proc_rows = store.conn.execute(
             "SELECT proc_id, pid, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
             "FROM proc_samples "
@@ -219,9 +221,24 @@ class OomKillRule(Rule):
             else []
         )
         identities = store.proc_identities()
-        findings: list[Finding] = []
 
+        # The kernel's line names the process it killed, also one its supervisor
+        # started again.  Without it, a program is judged by its last process:
+        # one that was replaced by another of its program was not, for all we
+        # know, killed.
+        by_program: dict[int, list] = {}
         for proc_row in proc_rows:
+            by_program.setdefault(proc_row["proc_id"], []).append(proc_row)
+        candidates: list[tuple] = []  # (proc_row, kernel_line)
+        for processes in by_program.values():
+            last = max(processes, key=lambda proc: proc["last_ts"])
+            for proc_row in processes:
+                kernel_line = self._kernel_line(oom_lines, proc_row)
+                if kernel_line is not None or proc_row is last:
+                    candidates.append((proc_row, kernel_line))
+
+        findings: list[Finding] = []
+        for proc_row, kernel_line in candidates:
             proc_id = proc_row["proc_id"]
             pid = proc_row["pid"]
             first_ts: float = proc_row["first_ts"]
@@ -231,20 +248,6 @@ class OomKillRule(Rule):
             gap = window.end_ts - last_ts
             if gap <= self.gap_threshold_s:
                 continue
-
-            # The kernel's own line naming this PID settles it; without one the
-            # remaining conditions have to point to an OOM kill.
-            kernel_line = next(
-                (
-                    row["message"]
-                    for row in oom_lines
-                    if last_ts - self.crisis_window_before_s
-                    <= row["ts"]
-                    <= last_ts + self.crisis_window_after_s
-                    and _oom_line_pid(row["message"]) == pid
-                ),
-                None,
-            )
 
             # --- Condition 2: process was not short-lived ---
             lifetime = last_ts - first_ts
@@ -326,15 +329,12 @@ class OomKillRule(Rule):
         if not findings:
             return []
 
-        # --- Step 5: one finding per program unless the kernel named the PID,
-        # the kernel's own kills first, cap at max_findings ---
+        # --- Step 5: the kernel's own kills first, cap at max_findings ---
         findings.sort(
             key=lambda f: ("kernel_line" in f.evidence, f.evidence["last_rss_bytes"]),
             reverse=True,
         )
-        confirmed = [f for f in findings if "kernel_line" in f.evidence]
-        suspected = [f for f in findings if "kernel_line" not in f.evidence]
-        findings = (confirmed + one_per_program(suspected))[: self.max_findings]
+        findings = findings[: self.max_findings]
 
         # --- Optional: journal probe to elevate confidence ---
         for finding in findings:
@@ -342,6 +342,21 @@ class OomKillRule(Rule):
                 self._try_elevate_confidence(finding)
 
         return findings
+
+    def _kernel_line(self, oom_lines: list, proc_row) -> Optional[str]:
+        """The recorded kernel OOM line naming *proc_row*'s PID around its end."""
+        last_ts = proc_row["last_ts"]
+        return next(
+            (
+                row["message"]
+                for row in oom_lines
+                if last_ts - self.crisis_window_before_s
+                <= row["ts"]
+                <= last_ts + self.crisis_window_after_s
+                and _oom_line_pid(row["message"]) == proc_row["pid"]
+            ),
+            None,
+        )
 
     @staticmethod
     def _last_rss(store: "Storage", proc_id: int, pid: int, last_ts: float) -> int:

@@ -383,43 +383,45 @@ def proc_label(name: str, script: Optional[str], pid: Optional[int]) -> str:
 _OTHER_PIDS_SHOWN = 5
 
 
-def one_per_program(findings: Iterable[Finding]) -> list[Finding]:
-    """The first finding of each program in *findings*, which come worst first.
+def worst_process_per_program(measured: Iterable[Measurement]) -> list[Finding]:
+    """The findings of per-process *measured*, one per program.
 
     A program is ``evidence["proc_id"]``: the processes of one program (a pool
-    of workers, an hourly batch) are judged one by one but reported as one
-    finding, which counts the others and lists a few of their PIDs.
+    of workers) are judged one by one but reported as one finding, that of the
+    process with the largest measured value.  It counts the other processes
+    that fired and lists a few of their PIDs.  Rows rolled up before procdiag
+    kept processes apart have no PID and are not counted.
     """
+    firing = [(m.observation.value, m.finding) for m in measured if m.finding]
+    firing.sort(key=lambda pair: pair[0], reverse=True)
     by_program: dict[int, list[Finding]] = {}
-    for finding in findings:
+    for _, finding in firing:
         by_program.setdefault(finding.evidence["proc_id"], []).append(finding)
     kept = []
     for worst, *others in by_program.values():
-        if others:
-            pids = [f.evidence["pid"] for f in others if f.evidence["pid"] is not None]
+        pids = list(
+            dict.fromkeys(
+                f.evidence["pid"]
+                for f in others
+                if f.evidence["pid"] not in (None, worst.evidence["pid"])
+            )
+        )
+        if pids:
             shown = pids[:_OTHER_PIDS_SHOWN]
             listed = ", ".join(map(str, shown)) + (
-                " ほか" if len(others) > len(shown) else ""
+                " ほか" if len(pids) > len(shown) else ""
             )
             worst = replace(
                 worst,
-                summary=f"{worst.summary}。他 {len(others)} プロセスも同様 (PID {listed})",
+                summary=f"{worst.summary}。他 {len(pids)} プロセスも同様 (PID {listed})",
                 evidence={
                     **worst.evidence,
-                    "other_processes": len(others),
+                    "other_processes": len(pids),
                     "other_pids": shown,
                 },
             )
         kept.append(worst)
     return kept
-
-
-def worst_process_per_program(measured: Iterable[Measurement]) -> list[Finding]:
-    """The findings of per-process *measured*, one per program (see
-    :func:`one_per_program`): its process with the largest measured value."""
-    firing = [(m.observation.value, m.finding) for m in measured if m.finding]
-    firing.sort(key=lambda pair: pair[0], reverse=True)
-    return one_per_program(finding for _, finding in firing)
 
 
 def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:

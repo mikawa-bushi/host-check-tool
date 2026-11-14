@@ -51,7 +51,7 @@ from ..core import (
     rule_id_problems,
 )
 from ..core.result import blind_throughout, unobserved_hours
-from ..core.util import humanize_bytes, is_unit_name, neutralize, shell_quote
+from ..core.util import humanize_bytes, neutralize, shell_quote
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
@@ -98,8 +98,7 @@ def _make_jinja_env() -> Environment:
 
     Names from the host (processes, units, mount points) reach the templates as
     evidence.  ``finalize`` keeps control characters and newlines out of the
-    proposal; ``shq`` quotes a value as one shell word, ``unit_name`` tells
-    whether ``systemctl restart <name>`` makes sense for it and ``local_minute``
+    proposal; ``shq`` quotes a value as one shell word and ``local_minute``
     shows a timestamp as the host's local time.
     """
     env = Environment(
@@ -111,7 +110,6 @@ def _make_jinja_env() -> Environment:
     env.filters["humanize_bytes"] = humanize_bytes
     env.filters["local_minute"] = _local_minute
     env.filters["shq"] = shell_quote
-    env.tests["unit_name"] = is_unit_name
     return env
 
 

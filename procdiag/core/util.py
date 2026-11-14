@@ -254,14 +254,6 @@ def shell_quote(value: object) -> str:
     return shlex.quote(str(value))
 
 
-_UNIT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]{0,254}")
-
-
-def is_unit_name(name: object) -> bool:
-    """Whether *name* could be a systemd unit name (so ``systemctl restart`` fits)."""
-    return isinstance(name, str) and _UNIT_NAME.fullmatch(name) is not None
-
-
 class CounterDelta:
     """Turn cumulative OS counters into per-tick deltas, keyed by any hashable.
 
