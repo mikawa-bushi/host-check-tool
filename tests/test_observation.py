@@ -17,14 +17,14 @@ from pathlib import Path
 import psutil
 import pytest
 from click.testing import CliRunner
-from synth import add_sys_baseline, make_db
+from synth import add_cpu_saturation_samples, add_sys_baseline, make_db
 from test_recorder import FakeClock, _AdvancingSleep
 from test_rules_v4 import _make_v3_db
 
 from procdiag import kernlog, systemd
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RulesConfig, SamplingConfig
-from procdiag.core import CoverageGap
+from procdiag.core import Capability, CoverageGap
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler
 from procdiag.diagnosis import Engine
 from procdiag.recorder import Recorder
@@ -347,3 +347,76 @@ class TestPeriodRecordedByOldVersion:
 
         assert data["evaluated_rules"] == ["KERNEL-ERROR-01"]
         assert any("0.3 以前" in n for n in data["quality"]["notes"])
+
+
+def _at(monkeypatch, ts, fn, *args, **kwargs):
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: ts)
+        return fn(*args, **kwargs)
+
+
+def _recording_without_psi_then_hole(path: Path, monkeypatch, t0: float) -> None:
+    """6 h without PSI, a 12 h hole, then 12 h with PSI: 12 h of PSI observed."""
+    store = Storage(path)
+    for start, hours in ((t0, 6), (t0 + 18 * _HOUR, 12)):
+        sid = _at(
+            monkeypatch,
+            start,
+            store.start_session,
+            boot_time=start - 600,
+            hostname="h",
+            procdiag_version="x",
+        )
+        if start == t0:
+            _at(
+                monkeypatch,
+                t0 + 1,
+                store.record_unobserved,
+                Capability.PSI,
+                "PSI (/proc/pressure) を読めません",
+            )
+        add_sys_baseline(store, hours=hours, start_ts=start + 30)
+        _at(monkeypatch, start + hours * _HOUR, store.end_session, sid)
+    for table, columns in (
+        ("sys_samples", ("psi_cpu_some10", "psi_mem_full10", "psi_io_some10")),
+        ("sys_rollup_1m", ("psi_cpu_max", "psi_mem_max", "psi_io_max")),
+    ):
+        ts = "ts_min" if table == "sys_rollup_1m" else "ts"
+        store.conn.execute(
+            f"UPDATE {table} SET {', '.join(f'{c}=NULL' for c in columns)}"
+            f" WHERE {ts} < ?",
+            (t0 + 7 * _HOUR,),
+        )
+    store.conn.commit()
+    store.close()
+
+
+class TestUnobservedSessionAcrossAHole:
+    def test_check_counts_the_unobserved_time_without_the_hole(
+        self, tmp_path, monkeypatch
+    ):
+        db = tmp_path / "holed.db"
+        _recording_without_psi_then_hole(db, monkeypatch, time.time() - 30 * _HOUR)
+
+        data = _check(db, ["CPU-SATURATION-01"])
+
+        assert data["evaluated_rules"] == ["CPU-SATURATION-01"]
+        (psi_note,) = [n for n in data["quality"]["notes"] if "PSI" in n]
+        assert "の 6.0 時間" in psi_note
+
+    def test_compare_counts_the_observed_time_once(self, tmp_path, monkeypatch):
+        now = time.time()
+        before = make_db(tmp_path / "before", hours=12)
+        add_sys_baseline(before, hours=11, start_ts=now - 80 * _HOUR)
+        add_cpu_saturation_samples(before, start_ts=now - 69 * _HOUR)
+        before_path = before.path
+        before.close()
+        after = tmp_path / "after.db"
+        _recording_without_psi_then_hole(after, monkeypatch, now - 30 * _HOUR)
+
+        code, data = _compare(before_path, after, "CPU-SATURATION-01")
+
+        (row,) = data["rows"]
+        assert row["before"]["state"] == "detected"
+        assert row["verdict"] == "resolved"
+        assert code == 0
