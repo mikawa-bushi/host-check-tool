@@ -347,7 +347,7 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 | `SWAP-THRASH-01` | memory | swap_in/out の同時発生 + psi_mem_full>0 のスラッシングを検出 (瞬時型) |
 | `CPU-SATURATION-01` | cpu | psi_cpu_some10>20 の継続を検出し、spike_events から犯人プロセスを列挙 |
 | `CPU-SINGLECORE-01` | cpu | cpu_max_core_max ≥ 95% かつ cpu_avg < 50% のボトルネックコアを検出 |
-| `CPU-PERIODIC-01` | cpu | spike_events を負荷の始まりごとにまとめ、日次・時次の定時処理をホストのローカル時刻で検出 (記録した日・時間の半分以上で同じ時刻 ±2 分に始まり、偶然の一致の確率が 1% 未満のときだけ。1 回の長い負荷は周期にしない) |
+| `CPU-PERIODIC-01` | cpu | spike_events を負荷の始まりごとにまとめ、日次・時次の定時処理をホストのローカル時刻で検出 (記録した日・時間の半分以上で同じ時刻 ±2 分に始まり、偶然の一致の確率が 1% 未満のときだけ。偶然の確率は、その時刻の前の 1 時間・後の 1 時間・全体のうち負荷の始まりがいちばん多い頻度で見積もるので、勤務時間や昼休みに偏る負荷も周期にしない。1 回の長い負荷も周期にしない) |
 | `IO-BOTTLENECK-01` | io_disk | psi_io_some10>30 の継続 + I/O 上位プロセス特定 (io 欠損時は cgroup で代替) |
 | `DISK-FULL-01` | io_disk | disk_samples を線形外挿し、容量到達までの残り日数を算出 |
 | `DISK-GROWTH-01` | io_disk | dir_samples の増分ランキングで増加源を特定 (DISK-FULL に折りたたみ) |

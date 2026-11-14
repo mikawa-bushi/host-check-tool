@@ -17,6 +17,7 @@ from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import accumulate
 from typing import Any, Hashable, Iterable, Iterator, Mapping, Optional
 
 from ..core import Confidence, Observation, covers
@@ -387,6 +388,11 @@ _EPISODE_GAP_SEC = 360.0
 # more than the few hours a daily job touches.
 _MIN_RECURRENCE = 0.5
 _MAX_CHANCE = 0.01
+# Random load is often confined to working hours or breaks, so the chance of
+# a start near a candidate time comes from the hour before or after it when
+# either rate is above the overall one.  One side alone still sees the busy
+# hour when the candidate sits at the edge of a shift or a break.
+_NEARBY_SEC = 3600.0
 
 
 def detect_periodicity(
@@ -404,8 +410,11 @@ def detect_periodicity(
     when episodes start within ±*tol_sec* of it in at least *min_events* days
     (hours), in at least half of the recorded days (hours) that include it,
     and when episode starts at random times would line up that well with
-    probability below 1 %.  Days and hours wrap: a start at 00:00:20 matches
-    an anchor of 23:59:40.
+    probability below 1 %.  That chance uses the highest of the start rates in
+    the hour before the candidate time, the hour after it, and overall.
+    Days and hours wrap: a start at 00:00:20 matches an anchor of 23:59:40.
+    *tol_sec* is kept between 1 second (the sampling step) and a third of
+    the day (hour), beyond which every start would match every time.
 
     *recorded_minutes* are the start times of the minutes the recorder ran;
     by default every minute from the first to the last event.
@@ -425,12 +434,10 @@ def detect_periodicity(
         span = int((ordered[-1] - ordered[0]) // 60)
         recorded_minutes = [ordered[0] + 60.0 * i for i in range(span + 1)]
     minutes = [int(_wall_clock(ts) // 60) for ts in recorded_minutes]
-    # Chance that one day (hour) holds an episode start inside a fixed window
-    # 3 * tol_sec wide, if starts fell at random times at the recorded rate.
-    p_window = min(1.0, len(starts) * 3 * tol_sec / (max(len(minutes), 1) * 60.0))
 
     for kind, cycle in (("hourly", 3600), ("daily", 86400)):
-        found = _recurring_time(starts, minutes, cycle, tol_sec, min_events, p_window)
+        tol = min(tol_sec, cycle / 3) if tol_sec >= 1.0 else 1.0
+        found = _recurring_time(starts, minutes, cycle, tol, min_events)
         if found is not None:
             phase, count, cycles, chance = found
             minute = int(phase // 60)
@@ -454,7 +461,6 @@ def _recurring_time(
     cycle: int,
     tol_sec: float,
     min_events: int,
-    p_window: float,
 ) -> Optional[tuple[float, int, int, float]]:
     """Find the time of *cycle* at which episode *starts* recur least by chance.
 
@@ -462,7 +468,20 @@ def _recurring_time(
     start's time of cycle is tried as a candidate.  Returns ``(phase, count,
     cycles, chance)`` with *phase* in seconds into the cycle, or ``None``.
     """
-    recorded = Counter(m % (cycle // 60) for m in minutes)
+    per_cycle = cycle // 60
+    recorded = Counter(m % per_cycle for m in minutes)
+    running = list(
+        accumulate((recorded[m % per_cycle] for m in range(3 * per_cycle)), initial=0)
+    )
+
+    def rate_between(lo: float, hi: float) -> float:
+        """Starts per recorded second at times of cycle in [lo, hi)."""
+        span = running[int(hi // 60) + per_cycle] - running[int(lo // 60) + per_cycle]
+        n = bisect_left(phases, hi) - bisect_left(phases, lo)
+        return n / (60.0 * span) if span > 0 else 0.0
+
+    overall_rate = len(starts) / (max(len(minutes), 1) * 60.0)
+    nearby = min(_NEARBY_SEC, cycle / 2)
     # Copies one cycle earlier and later let a window around 23:59 (:59) see
     # the starts just after 00:00 (:00).
     by_phase = sorted(
@@ -486,6 +505,16 @@ def _recurring_time(
         cycles = max(recorded[int(phase // 60)], count)
         if count < min_events or count < _MIN_RECURRENCE * cycles:
             continue
+        # The candidate's own starts are left out: a real job would otherwise
+        # raise the rate it is judged against.
+        rate = max(
+            overall_rate,
+            rate_between(phase - nearby, phase - tol_sec),
+            rate_between(phase + tol_sec, phase + nearby),
+        )
+        # Chance that one day (hour) holds a start inside a fixed window
+        # 3 * tol_sec wide, if starts fell at random times at that rate.
+        p_window = min(1.0, rate * 3 * tol_sec)
         chance = min(1.0, windows * _binomial_tail(cycles, p_window, count))
         if chance >= _MAX_CHANCE or (best is not None and chance >= best[3]):
             continue
@@ -497,8 +526,13 @@ def _recurring_time(
 
 
 def _binomial_tail(n: int, p: float, k: int) -> float:
-    """P(X >= k) for X ~ Binomial(n, p), 1 <= k <= n, p > 0, in log space."""
-    if p >= 1.0:
+    """P(X >= k) for X ~ Binomial(n, p), 1 <= k <= n, p > 0, in log space.
+
+    At or below the mean the result is at least about one half; 1.0 is
+    returned there, because summing up from pmf(k) underflows to 0 when k is
+    far below the mode.
+    """
+    if p >= 1.0 or k <= n * p:
         return 1.0
     pmf = math.exp(
         math.lgamma(n + 1)
