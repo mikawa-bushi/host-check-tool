@@ -241,24 +241,23 @@ class TestQuotedCommands:
             assert shlex.split(cmd)[-1] == EVIL_NAME
 
     def test_hostile_name_is_not_offered_to_systemctl(self, evil):
-        for f in evil.findings:
-            assert "systemctl restart" not in f.proposal
+        systemctl = [c for c in _commands(evil) if "systemctl" in c]
+        assert systemctl
+        assert not [c for c in systemctl if "myapp" in c or "curl" in c]
 
     def test_mount_point_with_a_space_is_one_argument(self, evil):
         du = [c for c in _commands(evil) if c.startswith("du -sh")]
         assert du
         assert shlex.split(du[0])[-1] == SPACED_MOUNT + "/*"
 
-    def test_plausible_unit_name_keeps_the_restart_advice(self, tmp_path):
+    def test_a_process_name_is_never_restarted_as_a_unit(self, tmp_path):
         diag = _diagnose(_leak_db(tmp_path, "myapp-worker"))
-        restarts = [
-            c for c in _commands(diag) if c.startswith("sudo systemctl restart")
-        ]
+        commands = _commands(diag)
+        restarts = [c for c in commands if c.startswith("sudo systemctl restart")]
         assert restarts
-        assert all(
-            shlex.split(c) == ["sudo", "systemctl", "restart", "myapp-worker"]
-            for c in restarts
-        )
+        assert set(restarts) == {"sudo systemctl restart <サービス名>"}
+        assert "systemctl status <PID>" in commands
+        assert "pgrep -a -- myapp-worker" in commands
 
     def test_name_that_looks_like_an_option_cannot_become_one(self, tmp_path):
         diag = _diagnose(_leak_db(tmp_path, "-rf"))

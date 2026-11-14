@@ -4,8 +4,9 @@ Each test records ``proc_samples`` the way the process sampler writes them (one
 row per PID), rolls them up with ``Storage.rollup_incremental`` and runs the
 rules through ``Engine.run``.  One leaking worker among identical workers, a
 leaking program that was restarted, and an OOM victim that its supervisor
-started again must each be reported, with the PID and command line that tell
-the user which process it is.
+started again (named by the kernel's OOM line) must each be reported, with the
+PID that tells the user which process it is.  A program that only replaced its
+processes is no OOM kill.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from click.testing import CliRunner
 from synth import add_sys_baseline, make_db
 from test_compare import _leak, _leak_cmp
 
+from procdiag import storage
 from procdiag.cli import cli
 from procdiag.compare import Clear, Detected, Verdict
 from procdiag.config import ProcdiagConfig
@@ -215,6 +217,43 @@ class TestEveryWorkerOfAPoolLeaks:
         assert select_pss_targets(rows) == [proc_id]
         store.close()
 
+    def test_rows_without_a_pid_are_not_counted_as_another_process(self, tmp_path):
+        start = _start(7)
+        store = make_db(tmp_path, hours=7)
+        add_sys_baseline(store, hours=7, start_ts=start)
+        proc_id = _register(store, "svc", "/opt/plc/svc", start)
+
+        def rollup(table, m, slope, **pid):
+            rss = int(100 * _MiB + slope * _MiB * m / 60)
+            return make_row(
+                table,
+                ts_min=start + m * 60,
+                proc_id=proc_id,
+                cpu_avg=1.0,
+                cpu_max=1.0,
+                rss_avg=rss,
+                rss_max=rss,
+                fds_max=40,
+                threads_max=10,
+                **pid,
+            )
+
+        store.buffer(
+            "proc_pid_rollup_1m",
+            [rollup("proc_pid_rollup_1m", m, 6, pid=4000) for m in range(400)],
+        )
+        store.buffer(
+            "proc_rollup_1m", [rollup("proc_rollup_1m", m, 3) for m in range(10, 390)]
+        )
+        store.flush(reason="synth")
+
+        (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        assert f.evidence["pid"] == 4000
+        assert "other_processes" not in f.evidence
+        assert "プロセスも同様" not in f.summary
+        store.close()
+
 
 class TestLeakingProgramRestarted:
     @pytest.mark.parametrize("restart_h", [0.6, 2.1, 4.1, 5.6, 7.6])
@@ -285,6 +324,26 @@ class TestLeakingProgramRestarted:
         assert _findings(store, ["MEM-LEAK-01"]) == []
         store.close()
 
+    def test_a_long_chain_of_restarts_shows_its_last_five_pids(self, tmp_path):
+        def processes(h):
+            if h < 4:
+                return [(0, 9000 + int(h * 6), 100 * _MiB, 40, 10)]
+            return [(0, 9999, 100 * _MiB + 5 * _MiB * (h - 4), 40, 10)]
+
+        store, _ = _recording(tmp_path, 12, [("svc", "/opt/plc/svc")], processes)
+
+        (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        (detected,) = [
+            line for line in f.proposal.splitlines() if line.startswith("[検出]")
+        ]
+        assert len(f.evidence["pids"]) == 25
+        assert "9020 → 9021 → 9022 → 9023 → 9999" in detected
+        assert "9019" not in detected
+        assert "25 プロセス" in detected
+        assert len(detected) < 300
+        store.close()
+
 
 class TestFindingsNameTheProcess:
     _SECRET = (
@@ -343,7 +402,10 @@ class TestFindingsNameTheProcess:
             "/usr/bin/python3 /opt/plc/uploader2.py",
             "/usr/bin/python3 uploader.py",
             "/usr/bin/python3 scp://plc@10.0.0.5/opt/uploader.py",
+            "/usr/bin/python3 https://example.com/uploader.py",
+            "/usr/bin/python3 /srv/plc@example.com/uploader.py",
             "/usr/bin/python3 /opt/plc/uploader.cfg",
+            "/usr/bin/python3 -" + "v" * 161 + " /opt/plc/uploader.py",
         ],
     )
     def test_no_script_name_unless_it_is_a_plain_script_path(self, tmp_path, cmdline):
@@ -386,10 +448,18 @@ class TestFindingsNameTheProcess:
             assert time.strftime("%Y-%m-%d %H:%M", time.localtime(last_minute)) in (
                 f.proposal
             )
+            assert "「python3 uploader.py」 (PID 2102)" in f.proposal
             assert "ps -p 2102 -o args=" in f.proposal
             assert "systemctl status 2102" in f.proposal
             assert "kill -TERM 2102" not in f.proposal
+            (permanent,) = [
+                line
+                for line in f.proposal.splitlines()
+                if line.startswith("[恒久対処]")
+            ]
+            assert "2102" not in permanent
         assert "kill -TERM <PID>" in found["MEM-LEAK-01"].proposal
+        assert "py-spy dump --pid <PID>" in found["MEM-LEAK-01"].proposal
         store.close()
 
 
@@ -485,13 +555,21 @@ class TestOomVictim:
         store.close()
 
     def test_a_kernel_line_about_another_pid_is_not_this_process(self, tmp_path):
-        store = self._oom(tmp_path, respawn=True, kernel_pid=999)
+        store = self._oom(tmp_path, respawn=False, kernel_pid=999)
 
         (f,) = self._run(store)
 
         assert f.evidence["pid"] == 1000
         assert "kernel_line" not in f.evidence
         assert f.confidence is Confidence.MEDIUM
+        store.close()
+
+    def test_a_victim_started_again_is_not_suspected_without_its_kernel_line(
+        self, tmp_path
+    ):
+        store = self._oom(tmp_path, respawn=True, kernel_pid=999)
+
+        assert self._run(store) == []
         store.close()
 
     def test_last_rss_is_the_last_sample_not_the_peak(self, tmp_path):
@@ -553,11 +631,9 @@ class TestOomFindingsPerProgram:
 
         (f,) = _oom_findings(store)
 
-        others = f.evidence["other_pids"]
-        assert f.evidence["other_processes"] == 5
-        assert sorted([f.evidence["pid"], *others]) == [pid for pid, _s, _e in runs]
-        assert "他 5 プロセスも同様" in f.summary
-        assert "他 5 プロセス" in f.proposal
+        assert f.evidence["pid"] == 5005
+        assert "other_processes" not in f.evidence
+        assert "プロセスも同様" not in f.summary
         store.close()
 
     def test_each_kill_the_kernel_reported_is_its_own_finding(self, tmp_path):
@@ -577,6 +653,61 @@ class TestOomFindingsPerProgram:
 
         assert f.evidence["pid"] == 7000
         assert f.evidence["lifetime_minutes"] == 3.0
+        store.close()
+
+
+class TestNoOomKillWhileTheProgramRuns:
+    @staticmethod
+    def _recorded(tmp_path, name, runs, swap_minutes):
+        """Twelve hours of an 8 GiB host with a 4 KiB swap-out in each of
+        *swap_minutes*.  *runs* are ``(pid, start_h, end_h)`` of the program
+        *name* (300 MiB, flat); a plc process runs throughout."""
+        t0 = time.time() // 60 * 60 - 13 * _HOUR
+        store = make_db(tmp_path, hours=12)
+        store.buffer(
+            "sys_samples",
+            [
+                _host(t0 + m * 60, swap_out=4096 if m in swap_minutes else 0)
+                for m in range(12 * 60)
+            ],
+        )
+        program = _register(store, name, f"/srv/{name}/app", t0)
+        plc = _register(store, "plc", "/opt/plc/plc", t0)
+        store.buffer(
+            "proc_samples",
+            [
+                _sample(t0 + k * 30, program, pid, rss=300 * _MiB)
+                for pid, start_h, end_h in runs
+                for k in range(int(start_h * 120), int(end_h * 120))
+            ]
+            + [_sample(t0 + k * 30, plc, 1, rss=100 * _MiB) for k in range(12 * 120)],
+        )
+        store.flush(reason="synth")
+        return store
+
+    @pytest.mark.parametrize("swap_every", [17, 47, 180])
+    def test_a_pool_that_recycles_its_workers_is_not_an_oom_kill(
+        self, tmp_path, swap_every
+    ):
+        runs = []
+        for slot in range(4):
+            start = -slot * 0.53
+            while start < 12:
+                if start + 2 > 0:
+                    runs.append((7000 + len(runs), max(start, 0), min(start + 2, 12)))
+                start += 2
+        store = self._recorded(
+            tmp_path, "gunicorn", runs, set(range(0, 12 * 60, swap_every))
+        )
+
+        assert _oom_findings(store) == []
+        store.close()
+
+    def test_a_planned_restart_is_not_an_oom_kill(self, tmp_path):
+        runs = [(3100, 0, 5), (3101, 5, 12)]
+        store = self._recorded(tmp_path, "plc-gateway", runs, {5 * 60 - 1})
+
+        assert _oom_findings(store) == []
         store.close()
 
 
@@ -641,6 +772,69 @@ class TestDatabaseFromBeforePids:
 
         assert f.evidence["pid"] is None
         assert f.summary.startswith("collector: RSS +5.0 MB/h")
+
+    def test_its_findings_do_not_restart_a_process_by_its_name(self, tmp_path):
+        path, _, _ = self._schema4_db(tmp_path)
+
+        with Storage(path, read_only=True) as store:
+            (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        assert "systemctl restart collector" not in f.proposal
+        assert "pgrep -a -- collector" in f.proposal
+        assert "systemctl status <PID>" in f.proposal
+
+    def test_a_migration_cut_short_leaves_the_database_as_it_was(
+        self, tmp_path, monkeypatch
+    ):
+        path, _, _ = self._schema4_db(tmp_path)
+
+        def killed(conn):
+            raise sqlite3.OperationalError("killed")
+
+        monkeypatch.setitem(storage._MIGRATIONS, 5, [*storage._MIGRATIONS[5], killed])
+        with pytest.raises(sqlite3.OperationalError):
+            Storage(path)
+        conn = sqlite3.connect(path)
+        (version,) = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        tables = {
+            name
+            for (name,) in conn.execute("SELECT name FROM sqlite_master")
+            if name.startswith("proc_")
+        }
+        conn.close()
+
+        assert version == "4"
+        assert "proc_pid_rollup_1m" not in tables
+
+    def test_rollups_of_both_tables_come_back_in_time_order(self, tmp_path):
+        path, start, proc_id = self._schema4_db(tmp_path, hours=1)
+
+        with Storage(path) as store:
+            store.buffer(
+                "proc_pid_rollup_1m",
+                [
+                    make_row(
+                        "proc_pid_rollup_1m",
+                        ts_min=start - m * 60,
+                        proc_id=proc_id,
+                        pid=777,
+                        cpu_avg=1.0,
+                        cpu_max=1.0,
+                        rss_avg=100 * _MiB,
+                        rss_max=100 * _MiB,
+                        fds_max=40,
+                        threads_max=10,
+                    )
+                    for m in range(1, 31)
+                ],
+            )
+            store.flush(reason="synth")
+            minutes = [row["ts_min"] for row in store.rows("proc_rollup_1m")]
+
+        assert len(minutes) == 90
+        assert minutes == sorted(minutes)
 
     def test_it_migrates_keeping_every_rollup_row(self, tmp_path):
         path, _, _ = self._schema4_db(tmp_path)
