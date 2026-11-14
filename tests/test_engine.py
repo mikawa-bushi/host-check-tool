@@ -920,12 +920,12 @@ class TestQualitySelfCpuAggregate:
         assert diag.quality.self_cpu_max == pytest.approx(4.0)
         store.close()
 
-    def test_self_cpu_defaults_to_zero_when_no_samples(self, tmp_path):
-        # AVG/MAX over zero rows return NULL → must fall back to 0.0.
+    def test_self_cpu_is_not_measured_when_no_samples(self, tmp_path):
+        # AVG/MAX over zero rows return NULL → unmeasured, never 0.0.
         store = make_db(tmp_path)  # empty: no sys_samples
         diag = Engine(_cfg(min_obs_hours=0.0)).run(store)
-        assert diag.quality.self_cpu_avg == 0.0
-        assert diag.quality.self_cpu_max == 0.0
+        assert diag.quality.self_cpu_avg is None
+        assert diag.quality.self_cpu_max is None
         store.close()
 
 
