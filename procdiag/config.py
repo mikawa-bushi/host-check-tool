@@ -20,7 +20,14 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from .core.util import parse_duration
 
@@ -261,12 +268,30 @@ class ProcdiagConfig(_Model):
     rules: RulesConfig = Field(default_factory=RulesConfig)
     report: ReportConfig = Field(default_factory=ReportConfig)
 
+    # (DB in use, config-relative path that had no DB), set by load_config.
+    _db_fallback: Optional[tuple[str, str]] = PrivateAttr(default=None)
+
     @field_validator("db_path")
     @classmethod
     def _expand_home(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("db_path が空です。DB ファイルのパスを指定してください")
         return os.path.expanduser(v)
+
+    def db_path_notice(self) -> Optional[str]:
+        """Why ``db_path`` is not where the config file says, or ``None``.
+
+        Only :func:`load_config` sets this up, when it used a DB at the place
+        procdiag looked before; overriding ``db_path`` clears it.
+        """
+        if self._db_fallback is None or self._db_fallback[0] != self.db_path:
+            return None
+        used, unused = self._db_fallback
+        return (
+            f"設定の db_path は {unused} を指しますが、そこに DB が無いため、"
+            f"以前の版の位置 (カレントフォルダから) にある {used} を使います。"
+            f"db_path を絶対パス {used} に書き換えるか、DB を {unused} に移してください"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +433,10 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
 
     A relative ``db_path`` read from a file is relative to that file's folder,
     so one config names one DB wherever procdiag runs; with no file it stays
-    relative to the current folder.
+    relative to the current folder.  When there is no DB there but there is one
+    at the same relative path from the current folder, where procdiag looked
+    before, that one is used so an existing unit keeps its history, and
+    :meth:`ProcdiagConfig.db_path_notice` says so.
 
     Raises :class:`ValueError` with a Japanese message on any loading error.
     """
@@ -464,5 +492,10 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
         )
     if not Path(cfg.db_path).is_absolute():
         db = Path(os.path.abspath(path)).parent / cfg.db_path
-        cfg = cfg.model_copy(update={"db_path": str(db)})
+        old = Path(os.path.abspath(cfg.db_path))
+        if not db.exists() and old.is_file():
+            cfg = cfg.model_copy(update={"db_path": str(old)})
+            cfg._db_fallback = (str(old), str(db))
+        else:
+            cfg = cfg.model_copy(update={"db_path": str(db)})
     return cfg

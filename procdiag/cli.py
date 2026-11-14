@@ -193,7 +193,9 @@ def _load_config(
 
     Exits with code 4 when the config file is missing or broken, or when an
     option is given as an empty string (an unset shell variable, say) instead
-    of being silently taken for "not given".
+    of being silently taken for "not given".  Warns on stderr when the DB is
+    the one an older procdiag kept in the current folder
+    (:meth:`~procdiag.config.ProcdiagConfig.db_path_notice`).
     """
     from .config import load_config
 
@@ -207,6 +209,9 @@ def _load_config(
         sys.exit(_EXIT_USAGE)
     if db_path is not None:
         cfg = cfg.model_copy(update={"db_path": os.path.expanduser(db_path)})
+    notice = cfg.db_path_notice()
+    if notice:
+        click.echo(f"警告: {notice}", err=True)
     if cfg.rules.overrides or cfg.rules.disabled:
         _validate_rules(cfg)
     return cfg
@@ -646,7 +651,7 @@ def record(
     cfg = _load_config(config_path, db_path)
 
     duration_sec: Optional[float] = None
-    if duration:
+    if duration is not None:
         try:
             duration_sec = parse_duration(duration)
         except ValueError as exc:
@@ -655,8 +660,14 @@ def record(
     with _db_guard(cfg.db_path):
         try:
             recorder = Recorder(cfg, duration=duration_sec)
-        except OSError as exc:
-            _fail(f"DB を使えません: {cfg.db_path} ({_reason(exc)})")
+        except (OSError, sqlite3.OperationalError) as exc:
+            if Path(cfg.db_path).is_dir():
+                raise
+            # 1, not 4: a DB folder that is missing or read-only now (a disk
+            # mounted late) can clear up, and the unit restarts on 1.
+            reason = _reason(exc) if isinstance(exc, OSError) else str(exc)
+            click.echo(f"エラー: DB を使えません: {cfg.db_path} ({reason})", err=True)
+            sys.exit(1)
     click.echo("記録を開始します。停止するには Ctrl-C を押してください。")
     sys.exit(recorder.run())
 

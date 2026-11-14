@@ -191,7 +191,14 @@ def _check_sensors() -> _Outcome:
 
 @_doctor_check("db_disk", "記録 DB の置き場", what="DB 置き場")
 def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
-    """Check that ``record`` can write the DB and has room for it."""
+    """Check that ``record`` can write the DB and has room for it.
+
+    Also warns when the DB is not where the config file says, but where an
+    older procdiag kept it (:meth:`ProcdiagConfig.db_path_notice`).
+    """
+    notice = config.db_path_notice()
+    if notice:
+        return "degraded", notice
     db_path = Path(config.db_path)
     folder = db_path.parent
     while not os.path.exists(folder):

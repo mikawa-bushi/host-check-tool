@@ -35,10 +35,11 @@ UNIT_NAME = "procdiag-record.service"
 SYSTEM_STATE_DIR = "procdiag"
 SYSTEM_DB = f"/var/lib/{SYSTEM_STATE_DIR}/procdiag.db"
 
-# ``procdiag record`` exits 4 for a precondition error: a broken config, an
-# unusable DB, a bad option.  Starting again cannot fix it, so the unit does not
-# restart on it.  Other failures (exit 1: the DB could not be written, e.g. a
-# full disk) can clear up, so they keep Restart=on-failure.
+# ``procdiag record`` exits 4 for a precondition error: a broken config, a bad
+# option, a DB file it cannot use (a directory, not a procdiag DB, a newer
+# one).  Starting again cannot fix it, so the unit does not restart on it.
+# Other failures can clear up, so they keep Restart=on-failure: exit 1 when the
+# DB cannot be opened, created or written (a disk mounted late, a full disk).
 PRECONDITION_EXIT_STATUS = 4
 
 _PLAIN_WORD = re.compile(r"[A-Za-z0-9_@+=:,./-]+")
@@ -130,7 +131,7 @@ Type=simple
 {state}ExecStart={exec_start}
 Restart=on-failure
 RestartSec=10
-# 設定・DB・引数の誤り (終了コード {PRECONDITION_EXIT_STATUS}) は、再起動しても直らないので再起動しない
+# 設定・引数・DB ファイルの誤り (終了コード {PRECONDITION_EXIT_STATUS}) は、再起動しても直らないので再起動しない
 RestartPreventExitStatus={PRECONDITION_EXIT_STATUS}
 KillSignal=SIGTERM
 TimeoutStopSec=30
