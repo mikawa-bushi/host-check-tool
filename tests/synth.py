@@ -226,7 +226,6 @@ def add_proc_series(
                 max(0, int(rss_max + noise)),
                 fds,
                 threads,
-                None,  # pid: a series per program, as rolled up before schema 5
             )
         )
 

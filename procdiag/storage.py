@@ -72,39 +72,17 @@ def _add_column(
     return step
 
 
-# One row per minute and process.  ``pid`` keeps the processes of one program
-# (same name and command line) apart: workers running side by side, or the
-# process before and after a restart.  Rows rolled up before schema 5 have
-# ``pid`` NULL and stand for every process of the program at that minute.
-_PROC_ROLLUP_1M = """(
-  ts_min REAL, proc_id INTEGER,
+# The 1-minute process rollup from schema 5 on: one row per minute and process
+# (PID), so the workers of one program and the processes before and after a
+# restart stay apart.  ``proc_rollup_1m`` keeps the rows rolled up before, one
+# per minute and program.
+_PROC_PID_ROLLUP_1M = """(
+  ts_min REAL, proc_id INTEGER, pid INTEGER,
   cpu_avg REAL, cpu_max REAL,
   rss_avg INTEGER, rss_max INTEGER,
   fds_max INTEGER, threads_max INTEGER,
-  pid INTEGER,
   PRIMARY KEY (ts_min, proc_id, pid)
 )"""
-
-
-def _rebuild_proc_rollup_with_pid(conn: sqlite3.Connection) -> None:
-    """Give ``proc_rollup_1m`` its ``pid`` column, keeping every rolled-up row.
-
-    The primary key changes, which SQLite can only do by copying the table.
-    The copy runs in a savepoint, so a crash leaves the old table whole and
-    the next open copies again.
-    """
-    if "pid" in _table_columns(conn, "proc_rollup_1m"):
-        return
-    cols = "ts_min, proc_id, cpu_avg, cpu_max, rss_avg, rss_max, fds_max, threads_max"
-    conn.execute("SAVEPOINT proc_rollup_pid")
-    conn.execute("DROP TABLE IF EXISTS proc_rollup_1m_v5")
-    conn.execute(f"CREATE TABLE proc_rollup_1m_v5 {_PROC_ROLLUP_1M}")
-    conn.execute(
-        f"INSERT INTO proc_rollup_1m_v5 ({cols}) SELECT {cols} FROM proc_rollup_1m"
-    )
-    conn.execute("DROP TABLE proc_rollup_1m")
-    conn.execute("ALTER TABLE proc_rollup_1m_v5 RENAME TO proc_rollup_1m")
-    conn.execute("RELEASE proc_rollup_pid")
 
 
 # Forward migrations keyed by the schema version they produce.  Each value is a
@@ -130,15 +108,19 @@ _MIGRATIONS: Dict[int, List[_Migration]] = {
         _add_column("proc_registry", "fd_soft_limit", "INTEGER"),
         _add_column("proc_registry", "fd_hard_limit", "INTEGER"),
     ],
-    5: [_rebuild_proc_rollup_with_pid],
+    # Only a new table: rows rolled up before stay in proc_rollup_1m as they
+    # are.  The version still rises, because an older procdiag would neither
+    # read the new table nor roll up into it.
+    5: [f"CREATE TABLE IF NOT EXISTS proc_pid_rollup_1m {_PROC_PID_ROLLUP_1M}"],
 }
 
 
 class ProcIdentity(NamedTuple):
     """A program as ``proc_registry`` knows it.
 
-    ``cmdline`` is the command line of the first process seen; processes of
-    the program may differ from it in their digits (``--id 2``).
+    ``cmdline`` is the command line of the first process seen, which may
+    differ from that of the program's other processes in its digits
+    (``--id 2``) and may carry secrets: findings never show it.
     """
 
     name: str
@@ -298,7 +280,14 @@ CREATE TABLE IF NOT EXISTS sys_rollup_1m (
   psi_cpu_max REAL, psi_mem_max REAL, psi_io_max REAL,
   swap_out_sum INTEGER
 );
-CREATE TABLE IF NOT EXISTS proc_rollup_1m {_PROC_ROLLUP_1M};
+CREATE TABLE IF NOT EXISTS proc_rollup_1m (
+  ts_min REAL, proc_id INTEGER,
+  cpu_avg REAL, cpu_max REAL,
+  rss_avg INTEGER, rss_max INTEGER,
+  fds_max INTEGER, threads_max INTEGER,
+  PRIMARY KEY (ts_min, proc_id)
+);
+CREATE TABLE IF NOT EXISTS proc_pid_rollup_1m {_PROC_PID_ROLLUP_1M};
 CREATE TABLE IF NOT EXISTS cg_rollup_1m (
   ts_min REAL, cg_id INTEGER,
   cpu_usec_sum INTEGER,
@@ -403,7 +392,17 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "rss_max",
         "fds_max",
         "threads_max",
+    ],
+    "proc_pid_rollup_1m": [
+        "ts_min",
+        "proc_id",
         "pid",
+        "cpu_avg",
+        "cpu_max",
+        "rss_avg",
+        "rss_max",
+        "fds_max",
+        "threads_max",
     ],
     "cg_rollup_1m": [
         "ts_min",
@@ -443,7 +442,12 @@ def make_row(table: str, **values: Any) -> tuple:
 # Raw high-frequency samples: kept for ``retention.raw`` (e.g. 48h).
 RAW_TABLES = ("sys_samples", "cg_samples", "proc_samples", "proc_counts")
 # 1-minute rollups: keyed by ``ts_min`` and kept for ``retention.rollup``.
-_ROLLUP_TABLES = ("sys_rollup_1m", "proc_rollup_1m", "cg_rollup_1m")
+_ROLLUP_TABLES = (
+    "sys_rollup_1m",
+    "proc_rollup_1m",
+    "proc_pid_rollup_1m",
+    "cg_rollup_1m",
+)
 # Low-frequency raw samples that are cheap enough to keep as long as rollups.
 _LONG_LIVED_TABLES = (
     "disk_samples",
@@ -654,9 +658,8 @@ class Storage:
         """Refuse a read-only DB written by a *newer* procdiag.
 
         Older DBs are tolerated silently: a read-only connection cannot migrate,
-        and past migrations only add indexes/columns that reads survive without
-        (``rows`` reads the ``proc_rollup_1m.pid`` of a DB before schema 5 as
-        NULL).
+        and past migrations only add tables, indexes and columns that reads
+        survive without.
         """
         try:
             row = self.conn.execute(
@@ -847,14 +850,14 @@ class Storage:
                     ),
                 )
 
-        # --- proc_rollup_1m (SQL aggregation) ---
+        # --- proc_pid_rollup_1m (SQL aggregation) ---
         # proc_samples is the dominant volume (processes × ticks); aggregate it
         # in SQLite (AVG/MAX) rather than pulling every row into Python.  No
         # percentile column here, so a single INSERT…SELECT…GROUP BY suffices.
         # AVG/MAX return NULL for an all-NULL group, matching the previous
         # Python ``_avg([]) -> None`` / ``max(...) if vals else None`` semantics.
         self.conn.execute(
-            "INSERT OR REPLACE INTO proc_rollup_1m "
+            "INSERT OR REPLACE INTO proc_pid_rollup_1m "
             "(ts_min, proc_id, pid, cpu_avg, cpu_max, rss_avg, rss_max, "
             " fds_max, threads_max) "
             "SELECT CAST(ts / 60 AS INTEGER) * 60.0 AS ts_min, proc_id, pid, "
@@ -1203,6 +1206,29 @@ class Storage:
         rows = self.conn.execute("SELECT key, value FROM meta").fetchall()
         return {r["key"]: r["value"] for r in rows}
 
+    def _selects(self, table: str) -> List[str]:
+        """The SELECTs whose rows together are what reading *table* returns.
+
+        ``proc_rollup_1m`` reads as the 1-minute process rollup with a ``pid``
+        column: its own rows, rolled up per program before schema 5 (``pid``
+        NULL), and the per-process rows of ``proc_pid_rollup_1m``.  A DB from
+        before schema 5 opened read-only has only the former.
+        """
+        if table != "proc_rollup_1m":
+            return [f"SELECT * FROM {table}"]
+        columns = TABLE_COLUMNS["proc_pid_rollup_1m"]
+        legacy = ", ".join("NULL AS pid" if c == "pid" else c for c in columns)
+        selects = [f"SELECT {legacy} FROM proc_rollup_1m"]
+        if self.has_table("proc_pid_rollup_1m"):
+            selects.append(f"SELECT {', '.join(columns)} FROM proc_pid_rollup_1m")
+        return selects
+
+    def _source(self, table: str) -> str:
+        """*table* for a FROM clause (see :meth:`_selects`)."""
+        if table != "proc_rollup_1m":
+            return table
+        return f"({' UNION ALL '.join(self._selects(table))})"
+
     def series(
         self,
         table: str,
@@ -1222,7 +1248,10 @@ class Storage:
         to rows where ``subject_col = subject``.
         """
         ts_col = _ts_column(table)
-        q = f"SELECT {ts_col}, {column} FROM {table} WHERE {column} IS NOT NULL"
+        q = (
+            f"SELECT {ts_col}, {column} FROM {self._source(table)}"
+            f" WHERE {column} IS NOT NULL"
+        )
         params: List[Any] = []
 
         if subject_col is not None and subject is not None:
@@ -1249,7 +1278,9 @@ class Storage:
     ) -> List[sqlite3.Row]:
         """Return raw rows from *table* with optional time and custom filters.
 
-        On a read-only Storage the result is cached by query arguments so that
+        ``proc_rollup_1m`` reads as the 1-minute process rollup of every schema
+        version, with a ``pid`` column (see :meth:`_selects`).  On a read-only
+        Storage the result is cached by query arguments so that
         several rules sharing the same window do not each re-scan the table.
         The returned list is a shared read-only view — callers must not mutate
         it (``sqlite3.Row`` itself is immutable).
@@ -1267,25 +1298,26 @@ class Storage:
             raise ValueError(
                 f"テーブル {table} には時刻列がないため since/until は使えません"
             )
-        columns = "*"
-        if table == "proc_rollup_1m" and not self.has_column(table, "pid"):
-            columns = "*, NULL AS pid"  # a DB from before schema 5, read as is
-        q = f"SELECT {columns} FROM {table} WHERE 1=1"
+        conditions = "1=1"
         p: List[Any] = []
 
         if since is not None:
-            q += f" AND {ts_col} >= ?"
+            conditions += f" AND {ts_col} >= ?"
             p.append(since)
         if until is not None:
-            q += f" AND {ts_col} <= ?"
+            conditions += f" AND {ts_col} <= ?"
             p.append(until)
         if where:
-            q += f" AND ({where})"
+            conditions += f" AND ({where})"
             p.extend(params)
+        # Each SELECT filtered on its own, so that SQLite merges their rows in
+        # time order from the indexes instead of sorting the whole window.
+        selects = self._selects(table)
+        q = " UNION ALL ".join(f"{select} WHERE {conditions}" for select in selects)
         if ts_col is not None:
             q += f" ORDER BY {ts_col}"
 
-        result = self.conn.execute(q, p).fetchall()
+        result = self.conn.execute(q, p * len(selects)).fetchall()
         if self._rows_cache is not None:
             self._rows_cache[cache_key] = result
         return result
@@ -1330,7 +1362,10 @@ class Storage:
         window detection) never materialise a long recording into Python.
         """
         ts_col = _ts_column(table)
-        q = f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi FROM {table} WHERE 1=1"
+        q = (
+            f"SELECT MIN({ts_col}) AS lo, MAX({ts_col}) AS hi"
+            f" FROM {self._source(table)} WHERE 1=1"
+        )
         params: List[Any] = []
         if since is not None:
             q += f" AND {ts_col} >= ?"
@@ -1473,7 +1508,7 @@ class Storage:
         ).fetchone()
         return row["name"] if row else f"proc_{proc_id}"
 
-    def proc_identities(self) -> Dict[int, "ProcIdentity"]:
+    def proc_identities(self) -> Dict[int, ProcIdentity]:
         """``{proc_id: ProcIdentity}`` for every registered process.
 
         ``(name, cmdline_hash)`` is ``proc_registry``'s UNIQUE key and is
@@ -1708,7 +1743,7 @@ class Storage:
         """Whether *table* has a non-NULL *column* in ``[since, until]``."""
         ts_col = _ts_column(table)
         row = self.conn.execute(
-            f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL"
+            f"SELECT 1 FROM {self._source(table)} WHERE {column} IS NOT NULL"
             f" AND {ts_col} >= ? AND {ts_col} <= ? LIMIT 1",
             (since, until),
         ).fetchone()

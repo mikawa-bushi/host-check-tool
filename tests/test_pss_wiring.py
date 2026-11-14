@@ -78,7 +78,6 @@ def _add_rollup_leak(
                 int(rss_avg * 1.05),  # rss_max
                 50,  # fds_max
                 8,  # threads_max
-                None,  # pid
             )
         )
     store.buffer("proc_rollup_1m", rows)

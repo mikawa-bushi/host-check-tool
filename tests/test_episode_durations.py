@@ -284,7 +284,6 @@ def _proc_rollup(ts_min, proc_id, *, avg, peak):
         rss_max=100 * _MiB,
         fds_max=4,
         threads_max=2,
-        pid=None,
     )
 
 
