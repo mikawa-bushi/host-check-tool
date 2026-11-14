@@ -7,6 +7,7 @@ the service / kernel-log samplers, session recording and the v3→v4 migration.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -364,61 +365,138 @@ class TestServiceSampler:
         assert kinds == [("restart", 2, "exit-code"), ("failed", 0, "exit-code")]
         assert sampler.collect(ctx) == []  # manual reset + still failed: no new event
 
-    def test_unit_failures_reads_the_failed_with_result_lines_after_since(
+    def test_unit_failures_asks_pid_1_about_the_units_and_reads_both_line_forms(
         self, monkeypatch
     ):
         from procdiag import systemd
 
-        out = (
-            '{"UNIT":"a.service","UNIT_RESULT":"exit-code",'
-            '"__REALTIME_TIMESTAMP":"1700000000500000"}\n'
-            '{"UNIT":"a.service","UNIT_RESULT":"signal",'
-            '"__REALTIME_TIMESTAMP":"1700000100000000"}\n'
-            '{"UNIT":"b.service","UNIT_RESULT":"core-dump",'
-            '"__REALTIME_TIMESTAMP":"1700000200000000"}\n'
-        )
-        monkeypatch.setattr(systemd, "run", lambda args: out)
+        def line(ts, unit, message, **fields):
+            entry = {"__REALTIME_TIMESTAMP": str(int(ts * 1e6)), "UNIT": unit}
+            return json.dumps({**entry, "MESSAGE": message, **fields})
 
-        assert systemd.unit_failures(1700000000.5) == {
-            "a.service": ["signal"],
-            "b.service": ["core-dump"],
+        calls = []
+        out = "\n".join(
+            [
+                line(
+                    1700000000.5,
+                    "a.service",
+                    "a.service: Failed with result 'exit-code'.",
+                    MESSAGE_ID="d9b373ed55a64feb8242e02dbe79a49c",
+                    UNIT_RESULT="exit-code",
+                ),
+                line(
+                    1700000100,
+                    "a.service",
+                    "a.service: Failed with result 'signal'.",
+                    MESSAGE_ID="d9b373ed55a64feb8242e02dbe79a49c",
+                    UNIT_RESULT="signal",
+                ),
+                line(
+                    1700000150,
+                    "a.service",
+                    "a.service: Scheduled restart job, restart counter is at 2.",
+                    MESSAGE_ID="5eb03494b6584870a536b337290809b3",
+                ),
+                line(
+                    1700000200,
+                    "b.service",
+                    "b.service: Failed with result 'core-dump'.",
+                ),
+            ]
+        )
+        monkeypatch.setattr(systemd, "run", lambda args: calls.append(args) or out)
+
+        failures = systemd.unit_failures(["a.service", "b.service"], 1700000000.5)
+
+        assert calls == [
+            [
+                "journalctl",
+                "-q",
+                "--no-pager",
+                "-o",
+                "json",
+                "--output-fields=MESSAGE_ID,UNIT,UNIT_RESULT,MESSAGE",
+                "--since",
+                "@1700000000",
+                "_PID=1",
+                "UNIT=a.service",
+                "UNIT=b.service",
+            ]
+        ]
+        assert failures == {
+            "a.service": [(1700000100.0, "signal")],
+            "b.service": [(1700000200.0, "core-dump")],
         }
+
+    @pytest.mark.parametrize(
+        ("value", "seconds"),
+        [
+            ("0", 0.0),
+            ("100ms", 0.1),
+            ("1min 30s", 90.0),
+            ("infinity", None),
+            ("x", None),
+        ],
+    )
+    def test_timespan_sec(self, value, seconds):
+        from procdiag import systemd
+
+        assert systemd.timespan_sec(value) == seconds
 
 
 _POLL = 300.0
 
 
-def _unit(
-    n_restarts, *, restart="on-failure", force="", state="active", result="success"
-):
+def _unit(n_restarts, *, restart="on-failure", state="active", **props):
     return {
         "NRestarts": str(n_restarts),
         "Restart": restart,
-        "RestartForceExitStatus": force,
+        "RestartForceExitStatus": "",
+        "RestartUSec": "100ms",
+        "LogLevelMax": "-1",
         "ActiveState": state,
-        "Result": result,
+        "Result": "success",
+        **props,
     }
 
 
+def _failure_line(ts, unit, result="exit-code", *, structured=True):
+    """systemd's "Failed with result" line; v233-v239 log it without
+    MESSAGE_ID and UNIT_RESULT."""
+    entry = {
+        "__REALTIME_TIMESTAMP": str(int(ts * 1e6)),
+        "UNIT": unit,
+        "MESSAGE": f"{unit}: Failed with result '{result}'.",
+    }
+    if structured:
+        entry |= {
+            "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c",
+            "UNIT_RESULT": result,
+        }
+    return entry
+
+
 def _record_session(store, monkeypatch, polls, *, start, journal=None):
-    """*journal* maps a unit to the (ts, UNIT_RESULT) of its "Failed with
-    result" lines; None means the journal is unreadable."""
+    """*journal* holds systemd's journal lines, filtered by ``--since`` and
+    ``UNIT=`` as journalctl does; None means the journal is unreadable."""
     from test_sampler_cgroup_process import _make_ctx
 
     from procdiag import kernlog
     from procdiag.samplers import service as svc_mod
 
+    def journalctl(args):
+        since = float(args[args.index("--since") + 1][1:])
+        units = {a[len("UNIT=") :] for a in args if a.startswith("UNIT=")}
+        return "".join(
+            json.dumps(e) + "\n"
+            for e in journal
+            if since <= int(e["__REALTIME_TIMESTAMP"]) / 1e6 <= svc_mod.time.time()
+            and e["UNIT"] in units
+        )
+
     answers = iter(polls)
     monkeypatch.setattr(kernlog, "journal_readable", lambda: journal is not None)
-    monkeypatch.setattr(
-        svc_mod.systemd,
-        "unit_failures",
-        lambda since: {
-            unit: [r for ts, r in lines if since < ts <= svc_mod.time.time()]
-            for unit, lines in (journal or {}).items()
-        },
-        raising=False,
-    )
+    monkeypatch.setattr(svc_mod.systemd, "run", journalctl)
     monkeypatch.setattr(svc_mod.systemd, "available", lambda: True)
     monkeypatch.setattr(svc_mod.systemd, "list_service_units", lambda: sorted(polls[0]))
     monkeypatch.setattr(
@@ -468,55 +546,95 @@ class TestServiceRestartFromPolls:
         assert (f.severity, f.evidence["restarts"]) == (Severity.CRITICAL, restarts)
 
     @pytest.mark.parametrize(
-        ("policy", "force", "journal", "severity", "confidence"),
+        ("scenario", "severity", "confidence"),
         [
-            ("always", "", "no-failures", Severity.WARNING, Confidence.LOW),
-            ("on-failure", "75", "no-failures", Severity.WARNING, Confidence.LOW),
-            ("on-success", "", None, Severity.WARNING, Confidence.LOW),
-            ("always", "", "a-failure-per-restart", Severity.CRITICAL, Confidence.HIGH),
-            ("always", "", None, Severity.CRITICAL, Confidence.MEDIUM),
-            ("on-failure", "", None, Severity.CRITICAL, Confidence.HIGH),
-        ],
-        ids=[
-            "always-clean-exits",
-            "forced-exit-status-clean",
-            "on-success",
-            "always-crashes",
-            "always-journal-unreadable",
-            "on-failure",
+            ("always-clean-exits", Severity.WARNING, Confidence.LOW),
+            ("forced-exit-status-clean", Severity.WARNING, Confidence.LOW),
+            ("on-success", Severity.WARNING, Confidence.LOW),
+            ("always-crashes", Severity.CRITICAL, Confidence.HIGH),
+            ("always-crashes-systemd-239", Severity.CRITICAL, Confidence.HIGH),
+            ("always-crash-line-before-the-poll", Severity.CRITICAL, Confidence.HIGH),
+            ("always-crashes-restart-sec-10min", Severity.CRITICAL, Confidence.HIGH),
+            ("always-log-level-max-err", Severity.CRITICAL, Confidence.MEDIUM),
+            ("always-journal-unreadable", Severity.CRITICAL, Confidence.MEDIUM),
+            ("on-failure", Severity.CRITICAL, Confidence.HIGH),
         ],
     )
     def test_restarts_after_a_clean_exit_are_no_crash_loop(
-        self, tmp_path, monkeypatch, policy, force, journal, severity, confidence
+        self, tmp_path, monkeypatch, scenario, severity, confidence
     ):
+        unit = "collector.service"
         start = time.time() - 3 * _HOUR
         store = make_db(tmp_path, hours=3)
         add_sys_baseline(store, hours=3, start_ts=start)
-        restarted_at = [start + k * _POLL - 60 for k in range(4, 33, 4)]
-        lines = {
-            None: None,
-            "no-failures": {},
-            "a-failure-per-restart": {
-                "collector.service": [(ts, "exit-code") for ts in restarted_at]
+        polls = [k * _POLL for k in range(33)]
+        counted_at = [start + t for t in polls[4::4]]
+        props = {
+            "always-clean-exits": {"restart": "always"},
+            "forced-exit-status-clean": {"RestartForceExitStatus": "75"},
+            "on-success": {"restart": "on-success"},
+            "always-crashes": {"restart": "always"},
+            "always-crashes-systemd-239": {"restart": "always"},
+            "always-crash-line-before-the-poll": {"restart": "always"},
+            "always-crashes-restart-sec-10min": {
+                "restart": "always",
+                "RestartUSec": "10min",
             },
-        }[journal]
+            "always-log-level-max-err": {"restart": "always", "LogLevelMax": "3"},
+            "always-journal-unreadable": {"restart": "always"},
+            "on-failure": {},
+        }[scenario]
+        journal = {
+            "always-crashes": [_failure_line(t - 60, unit) for t in counted_at],
+            "always-crashes-systemd-239": [
+                _failure_line(t - 60, unit, structured=False) for t in counted_at
+            ],
+            "always-crash-line-before-the-poll": [
+                _failure_line(t - _POLL - 0.05, unit) for t in counted_at
+            ],
+            "always-crashes-restart-sec-10min": [
+                _failure_line(t - 610, unit) for t in counted_at
+            ],
+            "always-journal-unreadable": None,
+            "on-success": None,
+            "on-failure": None,
+        }.get(scenario, [])
         _record_session(
             store,
             monkeypatch,
-            [
-                {"collector.service": _unit(k // 4, restart=policy, force=force)}
-                for k in range(33)
-            ],
+            [{unit: _unit(k // 4, **props)} for k in range(len(polls))],
             start=start,
-            journal=lines,
+            journal=journal,
         )
 
-        f = _diagnose(store)["collector.service"]
+        f = _diagnose(store)[unit]
 
         assert (f.severity, f.confidence) == (severity, confidence)
         assert f.evidence["crash_loop"] is (severity == Severity.CRITICAL)
         if confidence == Confidence.LOW:
             assert "正常に終了" in f.proposal
+
+    def test_restarts_after_a_clean_exit_carry_no_exit_reason(
+        self, tmp_path, monkeypatch
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        _record_session(
+            store,
+            monkeypatch,
+            [
+                {"getty@tty1.service": _unit(k, restart="always", Result="exit-code")}
+                for k in range(5)
+            ],
+            start=start,
+            journal=[],
+        )
+
+        f = _diagnose(store)["getty@tty1.service"]
+
+        assert f.evidence["restarts_clean"] == 4
+        assert f.evidence["results"] == []
 
     def test_a_unit_failed_before_recording_is_not_a_failed_transition_per_start(
         self, tmp_path, monkeypatch
