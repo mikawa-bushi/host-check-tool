@@ -41,7 +41,7 @@ from typing import (
 )
 
 from .core.result import Capability, Unobserved
-from .core.util import MiB, parse_duration
+from .core.util import MiB, parse_duration, storable_text
 
 logger = logging.getLogger(__name__)
 
@@ -439,6 +439,16 @@ def _ts_column(table: str) -> Optional[str]:
     return "ts_min" if table in _ROLLUP_TABLES else "ts"
 
 
+# No row can have been recorded later than now; a few minutes of slack keep a
+# DB read on a host whose clock is slightly behind the recorder's whole.
+_CLOCK_AHEAD_SLACK_SECONDS = 300.0
+
+
+def _clock_horizon() -> float:
+    """Rows stamped at or after this were written while the clock ran ahead."""
+    return time.time() + _CLOCK_AHEAD_SLACK_SECONDS
+
+
 def _expiry_cutoffs(raw: str, rollup: Optional[str]) -> Tuple[float, Optional[float]]:
     """Timestamps before which raw and rollup rows expire (``None``: keep all)."""
     now = time.time()
@@ -627,7 +637,7 @@ class Storage:
         raise a cryptic SQLite error at flush.  Reject the mismatch here with a
         clear, table-named message instead (issue v0.3 §2-6); combined with
         ``test_table_columns_match_schema`` (§2-2) this fences the write path
-        against schema/sampler drift.  Text is stored as :func:`_storable_text`.
+        against schema/sampler drift.  Text is stored as :func:`storable_text`.
         """
         cols = TABLE_COLUMNS.get(table)
         if cols is not None:
@@ -1309,12 +1319,12 @@ class Storage:
         row = self.conn.execute(q, params).fetchone()
         return row["avg"], row["max"]
 
-    def missing_io_ratio(self, since: float, until: float) -> float:
+    def missing_io_ratio(self, since: float, until: float) -> Optional[float]:
         """Fraction of ``proc_samples`` rows whose I/O counters were unreadable.
 
         Non-root recording cannot read other users' ``io_counters``; the ratio
-        tells the report how much the I/O rules can be trusted.  ``0.0`` when
-        there are no process samples in the range.
+        tells the report how much the I/O rules can be trusted.  ``None`` when
+        there are no process samples in the range (nothing was measured).
         """
         row = self.conn.execute(
             "SELECT COUNT(*) AS total, "
@@ -1323,7 +1333,7 @@ class Storage:
             (since, until),
         ).fetchone()
         if not row or not row["total"]:
-            return 0.0
+            return None
         return (row["missing"] or 0) / row["total"]
 
     def recent_events(self, limit: int) -> List[sqlite3.Row]:
@@ -1351,10 +1361,10 @@ class Storage:
         failed flush can never roll it back and hand the id to another
         program.  For a known identity (cached, no SQL) the next flush writes
         ``last_seen``.  ``name`` and ``cmdline_sample`` are stored as
-        :func:`_storable_text`.
+        :func:`storable_text`.
         """
-        name = _storable_text(name)
-        cmdline_sample = _storable_text(cmdline_sample)
+        name = storable_text(name)
+        cmdline_sample = storable_text(cmdline_sample)
         key = (name, cmdline_hash)
         proc_id = self._proc_cache.get(key)
         if proc_id is not None:
@@ -1380,7 +1390,7 @@ class Storage:
 
         Committed and cached like :meth:`proc_id_for`.
         """
-        unit_path = _storable_text(unit_path)
+        unit_path = storable_text(unit_path)
         cg_id = self._cg_cache.get(unit_path)
         if cg_id is not None:
             self._registry_updates[_SET_CG_LAST_SEEN][cg_id] = (ts,)
@@ -1443,12 +1453,14 @@ class Storage:
 
         Prefers raw ``sys_samples``; falls back to ``sys_rollup_1m`` (with the
         flag set) so diagnosis can derive its observation window without reaching
-        into ``Storage.conn`` directly.
+        into ``Storage.conn`` directly.  Rows stamped in the future are left
+        out (see :meth:`future_bounds`).
         """
-        bounds = self.time_bounds("sys_samples")
+        horizon = _clock_horizon()
+        bounds = self.time_bounds("sys_samples", before=horizon)
         if bounds is not None:
             return bounds[0], bounds[1], False
-        bounds = self.time_bounds("sys_rollup_1m")
+        bounds = self.time_bounds("sys_rollup_1m", before=horizon)
         if bounds is not None:
             return bounds[0], bounds[1], True
         return None
@@ -1463,8 +1475,11 @@ class Storage:
         """Return ``(min_ts, max_ts)`` over ``sys_samples`` and ``sys_rollup_1m``
         combined, or ``None`` when neither has a row in range.
 
-        Bounds as in :meth:`time_bounds`.
+        Bounds as in :meth:`time_bounds`.  Rows stamped in the future are left
+        out (see :meth:`future_bounds`).
         """
+        horizon = _clock_horizon()
+        before = horizon if before is None else min(before, horizon)
         found = [
             bounds
             for table in ("sys_samples", "sys_rollup_1m")
@@ -1474,6 +1489,40 @@ class Storage:
         if not found:
             return None
         return min(lo for lo, _ in found), max(hi for _, hi in found)
+
+    def future_bounds(self) -> Optional[Tuple[float, float]]:
+        """``(min_ts, max_ts)`` of the system rows stamped in the future.
+
+        They were written while the clock ran ahead and it has been set back
+        since (a real-time clock kept in local time, corrected by NTP after
+        boot), so no window includes them.
+        """
+        horizon = _clock_horizon()
+        found = [
+            bounds
+            for table in ("sys_samples", "sys_rollup_1m")
+            if (bounds := self.time_bounds(table, since=horizon)) is not None
+        ]
+        if not found:
+            return None
+        return min(lo for lo, _ in found), max(hi for _, hi in found)
+
+    def system_holes(
+        self, since: float, until: float, *, longer_than: float
+    ) -> List[Tuple[float, float]]:
+        """Stretches of ``[since, until]`` longer than *longer_than* seconds
+        with no row in ``sys_samples`` or ``sys_rollup_1m``, oldest first."""
+        rows = self.conn.execute(
+            "SELECT prev, ts FROM ("
+            " SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev FROM ("
+            "  SELECT :lo AS ts UNION ALL SELECT :hi"
+            "  UNION ALL SELECT ts FROM sys_samples WHERE ts BETWEEN :lo AND :hi"
+            "  UNION ALL SELECT ts_min FROM sys_rollup_1m"
+            "   WHERE ts_min BETWEEN :lo AND :hi))"
+            " WHERE ts - prev > :gap",
+            {"lo": since, "hi": until, "gap": longer_than},
+        ).fetchall()
+        return [(float(prev), float(ts)) for prev, ts in rows]
 
     def proc_fd_limits(self, proc_id: int) -> Optional[Tuple[int, int]]:
         """Return the recorded ``(soft, hard)`` RLIMIT_NOFILE for *proc_id*.
@@ -1669,26 +1718,9 @@ def _minute(ts: float) -> float:
     return int(ts / 60) * 60.0
 
 
-def _storable_text(text: str) -> str:
-    r"""Return *text* in a form SQLite stores, with non-UTF-8 bytes as ``\xNN``.
-
-    psutil and ``os`` decode host names and paths with ``surrogateescape``, so
-    a Shift_JIS argv or a UTF-8 name the kernel cut at 15 bytes arrives with
-    lone surrogates, which SQLite's UTF-8 encoder rejects.  Escaping keeps two
-    such names distinct, so they never share one ``proc_id``.
-    """
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return text.encode("utf-8", "surrogateescape").decode(
-            "utf-8", "backslashreplace"
-        )
-    return text
-
-
 def _storable_row(row: tuple) -> tuple:
-    """Return *row* with every text value passed through :func:`_storable_text`."""
-    return tuple(_storable_text(v) if isinstance(v, str) else v for v in row)
+    """Return *row* with every text value passed through :func:`storable_text`."""
+    return tuple(storable_text(v) if isinstance(v, str) else v for v in row)
 
 
 def _non_null(rows: List[sqlite3.Row], col: str) -> List[Any]:

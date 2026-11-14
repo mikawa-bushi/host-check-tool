@@ -395,10 +395,11 @@ def _diagnose(
         )
         diag.quality.notes.extend(_period_notes(store, diag, chosen=chosen))
         if with_charts:
+            shown = diag.window
             charts = build_charts(
                 store,
-                since=window.start_ts if window else None,
-                until=window.end_ts if window else None,
+                since=shown.start_ts if shown else None,
+                until=shown.end_ts if shown else None,
                 config=cfg,
             )
             meta_hostname = store.meta().get("hostname")
@@ -785,7 +786,12 @@ def quick(
     """
     from . import report as report_mod
     from . import snapshot as snapshot_mod
-    from .core.util import humanize_duration, parse_duration, should_use_color
+    from .core.util import (
+        humanize_duration,
+        neutralize,
+        parse_duration,
+        should_use_color,
+    )
     from .recorder import Recorder
 
     try:
@@ -868,9 +874,12 @@ def quick(
         )
         marks = {snapshot_mod.CRITICAL: "重大", snapshot_mod.WARNING: "警告"}
         for item in problems:
-            click.echo(f"  [{marks[item.status]}] {item.label}: {item.detail}")
+            click.echo(
+                f"  [{marks[item.status]}] {neutralize(item.label)}: "
+                f"{neutralize(item.detail)}"
+            )
             if item.hint:
-                click.echo(f"      → {item.hint}")
+                click.echo(f"      → {neutralize(item.hint)}")
 
     if report_error:
         click.echo(f"\n{report_error}", err=True)
@@ -1020,7 +1029,7 @@ def compare(
 )
 def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None:
     """記録済み DB の概況 (期間、サンプル数、自己負荷) を表示します。"""
-    from .core.util import humanize_bytes
+    from .core.util import humanize_bytes, neutralize
     from .status import TIME_FMT, collect_status
     from .storage import Storage
 
@@ -1052,7 +1061,8 @@ def status(db_path: Optional[str], config_path: Optional[str], fmt: str) -> None
         click.echo("\n直近イベント (最大5件):")
         for ev in info["recent_events"]:
             ts_str = time.strftime(TIME_FMT, time.localtime(ev["ts"]))
-            click.echo(f"  [{ts_str}] {ev['kind']}  {ev['detail'] or ''}")
+            kind, detail = neutralize(ev["kind"]), neutralize(ev["detail"] or "")
+            click.echo(f"  [{ts_str}] {kind}  {detail}")
 
     if not info["has_data"]:
         click.echo(

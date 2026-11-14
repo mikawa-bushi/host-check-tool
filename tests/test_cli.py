@@ -986,7 +986,7 @@ class TestCheckNoData:
         assert result.exit_code == 3, result.output
         data = json.loads(result.output)
         assert data["no_data"] is True
-        assert data["healthy"] is True
+        assert data["healthy"] is False  # no data is not a healthy host
 
 
 # ---------------------------------------------------------------------------

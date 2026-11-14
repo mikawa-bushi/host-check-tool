@@ -27,6 +27,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, List, Tuple
 
 import procdiag
@@ -56,7 +57,9 @@ from procdiag.core import (
     Window,
     configure_rule,
 )
+from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
+from procdiag.diagnosis.engine import holes_note
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -82,6 +85,20 @@ _GREEN = "\033[32m"
 def _c(code: str, color: bool) -> str:
     """Return the ANSI code only when colour output is requested."""
     return code if color else ""
+
+
+_OWN_SGR = (*_ANSI.values(), _RESET, _BOLD, _GREEN)
+
+
+def _finish(lines: List[str], color: bool) -> str:
+    """Join *lines* into the terminal text: the one place host text is neutralised.
+
+    Every item is one line.  Control characters and newlines inside it (a
+    process name, a mount point, a kernel line) are shown as escapes, so they
+    cannot clear the screen, hide the verdict or forge a line.  Only our own
+    colour codes pass through, and only when colour was asked for.
+    """
+    return neutralized_lines(lines, allow=_OWN_SGR if color else ())
 
 
 def _confidence_ja(conf: "Confidence | str") -> str:
@@ -111,7 +128,8 @@ class ChartData:
     its own chart row.
 
     ``spikes`` is a list of plain dicts (ts, trigger_type, psi_snapshot,
-    top_processes) used for the spike-event table in the HTML output.
+    top_processes) used for the spike-event table in the HTML output, at most
+    ``_SPIKE_TABLE_MAX`` of the newest; ``spike_total`` is how many existed.
     """
 
     cpu: List[Tuple[float, float]] = field(default_factory=list)
@@ -121,6 +139,8 @@ class ChartData:
     psi: List[Tuple[float, float, float, float]] = field(default_factory=list)
     mounts: dict[str, List[Tuple[float, float]]] = field(default_factory=dict)
     spikes: List[dict] = field(default_factory=list)
+    # How many spikes the period held; ``spikes`` keeps only the newest ones.
+    spike_total: int = 0
     # Decision boundaries drawn as guide lines (the rules' effective values).
     core_pct_threshold: float = CpuSinglecoreRule.core_pct_threshold
     psi_cpu_threshold: float = CpuSaturationRule.psi_threshold
@@ -181,6 +201,13 @@ _SYS_CHART_COLUMNS = {
 }
 
 
+# The spike table lists this many of the newest spikes of the period.
+_SPIKE_TABLE_MAX = 100
+# The 1-minute rollup is preferred (already aggregated) once it holds this many
+# points; a shorter period is drawn from whichever table has more points.
+_ROLLUP_MIN_POINTS = 60
+
+
 def build_charts(
     store: Storage,
     *,
@@ -191,9 +218,10 @@ def build_charts(
     """Build a ChartData from a Storage instance.
 
     Reads sys_rollup_1m first (preferred because it is already aggregated);
-    falls back to sys_samples when the rollup table is empty (e.g. the DB was
-    created just moments ago).  Reads disk_samples for per-mount series.
-    Reads spike_events for the spikes list.
+    a period too short for a useful rollup line (a recording of a minute or
+    two) is drawn from sys_samples instead.  Reads disk_samples for per-mount
+    series.  Reads spike_events for the spikes list.  *since* / *until* are the
+    diagnosed period (``Diagnosis.window``); without them the whole DB is read.
 
     Returns an empty ChartData (no exception) when the DB contains no data.
     With *config*, the threshold guide lines follow ``rules.overrides``.
@@ -210,6 +238,8 @@ def build_charts(
         charts.mounts = _mount_series(
             store.rows("disk_samples", since=since, until=until)
         )
+        spike_rows = store.rows("spike_events", since=since, until=until)
+        charts.spike_total = len(spike_rows)
         charts.spikes = [
             {
                 "ts": row["ts"],
@@ -217,7 +247,7 @@ def build_charts(
                 "psi_snapshot": row["psi_snapshot"],
                 "top_processes": culprits(row["top_processes"], store),
             }
-            for row in store.rows("spike_events", since=since, until=until)
+            for row in spike_rows[-_SPIKE_TABLE_MAX:]
         ]
     except (sqlite3.Error, OSError) as exc:
         # Expected DB/IO read error — return whatever was collected so far
@@ -233,15 +263,17 @@ def _fill_system_series(
 ) -> None:
     """Fill the cpu / max-core / mem / PSI series in a single pass.
 
-    Reads whichever sys table has data exactly once (rollup preferred) instead
-    of issuing one query per series; the column names differ between the
-    rollup and raw tables, so they are looked up for the table actually read.
+    Reads one sys table instead of issuing one query per series (rollup
+    preferred, raw samples when the period is too short for the rollup to draw
+    a line); the column names differ between the two, so they are looked up for
+    the table actually read.
     """
     table = "sys_rollup_1m"
     sys_rows = store.rows(table, since=since, until=until)
-    if not sys_rows:
-        table = "sys_samples"
-        sys_rows = store.rows(table, since=since, until=until)
+    if len(sys_rows) < _ROLLUP_MIN_POINTS:
+        raw_rows = store.rows("sys_samples", since=since, until=until)
+        if len(raw_rows) > len(sys_rows):
+            table, sys_rows = "sys_samples", raw_rows
     ts_key, cpu_key, core_key, mem_key, psi_keys = _SYS_CHART_COLUMNS[table]
 
     for row in sys_rows:
@@ -341,6 +373,44 @@ def _skipped_list(diag: Diagnosis) -> str:
 
 
 # ---------------------------------------------------------------------------
+# the verdict, said once for terminal and HTML
+# ---------------------------------------------------------------------------
+
+
+class _Outcome(Enum):
+    """What the report may say about the host, from the engine's own verdict."""
+
+    PROBLEMS = "problems"  # a warning / critical finding
+    INFO_ONLY = "info_only"  # findings, none of them warning / critical
+    NO_DATA = "no_data"  # nothing was recorded
+    NOT_EVALUATED = "not_evaluated"  # data, but no rule could judge it yet
+    PARTIAL = "partial"  # no findings, some rules did not run
+    CLEAR = "clear"  # no findings, every selected rule ran
+
+
+def _outcome(diag: Diagnosis) -> _Outcome:
+    if any(f.severity in (Severity.WARNING, Severity.CRITICAL) for f in diag.findings):
+        return _Outcome.PROBLEMS
+    if diag.findings:
+        return _Outcome.INFO_ONLY
+    if diag.no_data:
+        return _Outcome.NO_DATA
+    if not diag.healthy:
+        return _Outcome.NOT_EVALUATED
+    return _Outcome.CLEAR if diag.fully_evaluated else _Outcome.PARTIAL
+
+
+def _self_load_text(q: ObservationQuality) -> str:
+    if q.self_cpu_avg is None or q.self_cpu_max is None:
+        return "未計測"
+    return f"平均 {q.self_cpu_avg:.2f}%  最大 {q.self_cpu_max:.2f}%"
+
+
+def _missing_io_text(q: ObservationQuality) -> str:
+    return "未計測" if q.missing_io_pct is None else f"{q.missing_io_pct * 100:.1f}%"
+
+
+# ---------------------------------------------------------------------------
 # render_terminal
 # ---------------------------------------------------------------------------
 
@@ -352,7 +422,8 @@ def render_terminal(
 
     Layout mirrors netdiag render_terminal:
     1. Finding headline list (symbol + rule_id + subject + summary)
-    2. '診断: 問題は見つかりませんでした。' when healthy
+    2. '診断: 問題は見つかりませんでした。' only when the engine called the host
+       healthy (info-only, nothing evaluated and no data each say so instead)
     3. '━━━ 診断 (Diagnosis) ━━━' separator followed by numbered proposals
     4. Observation-quality summary block
     5. (verbose) '推論過程:' section
@@ -369,20 +440,34 @@ def render_terminal(
 
     lines.append("")
 
-    if diag.no_data and not diag.findings:
-        warn = _c(_ANSI.get(Severity.WARNING, ""), color)
+    outcome = _outcome(diag)
+    warn = _c(_ANSI.get(Severity.WARNING, ""), color)
+    if outcome is _Outcome.NO_DATA:
         lines.append(
             f"{_c(_BOLD, color)}{warn}"
             f"⚠ 観測データがありません。procdiag record でデータを記録してから "
             f"再度 check してください。{_c(_RESET, color)}"
         )
-    elif diag.healthy:
-        scope = "" if diag.fully_evaluated else "評価できた範囲では"
+    elif outcome is _Outcome.NOT_EVALUATED:
+        lines.append(
+            f"{_c(_BOLD, color)}{warn}"
+            f"診断: 評価できたルールがありません。問題がないとはまだ言えません。"
+            f"{_c(_RESET, color)}"
+        )
+    elif outcome in (_Outcome.CLEAR, _Outcome.PARTIAL):
+        scope = "" if outcome is _Outcome.CLEAR else "評価できた範囲では"
         lines.append(
             f"{_c(_BOLD, color)}{_c(_GREEN, color)}"
             f"診断: {scope}問題は見つかりませんでした。{_c(_RESET, color)}"
         )
     else:
+        if outcome is _Outcome.INFO_ONLY:
+            info = _c(_ANSI[Severity.INFO], color)
+            lines.append(
+                f"{_c(_BOLD, color)}{info}"
+                f"診断: critical / warning の問題はありません。"
+                f"info の検出が {len(diag.findings)} 件あります。{_c(_RESET, color)}"
+            )
         lines.append(f"{_c(_BOLD, color)}━━━ 診断 (Diagnosis) ━━━{_c(_RESET, color)}")
         for i, f in enumerate(diag.findings, 1):
             sev_col = _c(_ANSI.get(f.severity, ""), color)
@@ -405,7 +490,6 @@ def render_terminal(
         if diag.fully_evaluated:
             lines.append(coverage)
         else:
-            warn = _c(_ANSI.get(Severity.WARNING, ""), color)
             lines.append(f"{warn}⚠ {coverage}{_c(_RESET, color)}")
             if diag.skipped_rules:
                 lines.append(f"  未評価: {_skipped_list(diag)}")
@@ -425,10 +509,8 @@ def render_terminal(
         f"  観測期間      : {q.span_hours:.1f} 時間{_window_text(diag.window)}"
     )
     lines.append(f"  欠測 gap 合計 : {q.gap_seconds:.0f} 秒")
-    lines.append(
-        f"  自己負荷      : 平均 {q.self_cpu_avg:.2f}%  最大 {q.self_cpu_max:.2f}%"
-    )
-    lines.append(f"  I/O 欠損率    : {q.missing_io_pct * 100:.1f}%")
+    lines.append(f"  自己負荷      : {_self_load_text(q)}")
+    lines.append(f"  I/O 欠損率    : {_missing_io_text(q)}")
     lines.append(f"  減速イベント  : {q.throttle_events} 回")
     for note in q.notes:
         lines.append(f"  備考: {note}")
@@ -438,9 +520,9 @@ def render_terminal(
         lines.append("")
         lines.append(f"{_c(_BOLD, color)}推論過程:{_c(_RESET, color)}")
         for step in diag.reasoning:
-            lines.append(f"  {step}")
+            lines += [f"  {line}" for line in step.splitlines() or [""]]
 
-    return "\n".join(lines)
+    return _finish(lines, color)
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +534,12 @@ def render_json(diag: Diagnosis) -> str:
     """Render *diag* as a stable, machine-readable JSON string.
 
     Key names are fixed (never rename them) — external tools such as LLM
-    pipelines and ticket systems depend on this shape.
+    pipelines and ticket systems depend on this shape.  ``healthy`` is true only
+    when there is data, at least one rule ran and none found a warning or
+    critical problem (info findings do not clear it); a quality value that was
+    not measured is ``null``.
     """
-    return json.dumps(
+    return dumps_json(
         {
             "healthy": diag.healthy,
             "no_data": diag.no_data,
@@ -472,9 +557,7 @@ def render_json(diag: Diagnosis) -> str:
             "reasoning": list(diag.reasoning),
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "procdiag_version": procdiag.__version__,
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
 
 
@@ -548,13 +631,30 @@ class _Plot:
             1,
         )
 
+    def xy(self, ts: float, val: float) -> Tuple[float, float]:
+        span = max(self.ts_max - self.ts_min, 1)
+        x = round(_MARGIN_LEFT + (ts - self.ts_min) / span * self.chart_w, 1)
+        return x, self.y(val)
+
     def points(self, series: List[Tuple[float, float]]) -> str:
         """``x,y`` pairs for a ``<polyline points=…>`` attribute."""
-        span = max(self.ts_max - self.ts_min, 1)
-        return " ".join(
-            f"{round(_MARGIN_LEFT + (ts - self.ts_min) / span * self.chart_w, 1)},"
-            f"{self.y(v)}"
-            for ts, v in series
+        return " ".join("{},{}".format(*self.xy(ts, v)) for ts, v in series)
+
+    def line(
+        self, series: List[Tuple[float, float]], color: str, dash: str = ""
+    ) -> str:
+        """The series as a polyline, or one dot when it has a single point.
+
+        A one-point polyline draws nothing, so a series with one point (a
+        recording of a minute or two) would look like a missing chart.
+        """
+        if len(series) == 1:
+            x, y = self.xy(*series[0])
+            return f'<circle cx="{x}" cy="{y}" r="2.5" fill="{color}"/>'
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+        return (
+            f'<polyline points="{self.points(series)}" fill="none" stroke="{color}" '
+            f'stroke-width="1.5" stroke-linejoin="round"{dash_attr}/>'
         )
 
 
@@ -564,7 +664,7 @@ def _empty_svg(w: int, h: int, label: str) -> str:
         f'<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">'
         f'<rect width="{w}" height="{h}" fill="#f5f5f5" rx="4"/>'
         f'<text x="{w//2}" y="{h//2}" text-anchor="middle" '
-        f'font-size="12" fill="#999">データなし: {_html_lib.escape(label)}</text>'
+        f'font-size="12" fill="#999">データなし: {_esc(label)}</text>'
         f"</svg>"
     )
 
@@ -573,7 +673,7 @@ def _y_max_label_svg(text: str) -> str:
     """The y-axis maximum label in the top-left corner."""
     return (
         f'<text x="{_MARGIN_LEFT - 2}" y="{_MARGIN_TOP + 4}" '
-        f'text-anchor="end" font-size="10" fill="#666">{_html_lib.escape(text)}</text>'
+        f'text-anchor="end" font-size="10" fill="#666">{_esc(text)}</text>'
     )
 
 
@@ -586,21 +686,25 @@ def _threshold_svg(plot: _Plot, threshold: float | None, label: str) -> str:
         f'<line x1="{_MARGIN_LEFT}" y1="{ty}" x2="{plot.w - _MARGIN_RIGHT}" y2="{ty}" '
         f'stroke="#c0392b" stroke-width="1" stroke-dasharray="4 3" opacity="0.75"/>'
         f'<text x="{plot.w - _MARGIN_RIGHT}" y="{ty - 2}" text-anchor="end" '
-        f'font-size="9" fill="#c0392b">{_html_lib.escape(label)}</text>'
+        f'font-size="9" fill="#c0392b">{_esc(label)}</text>'
     )
 
 
 def _time_axis_svg(plot: _Plot, y: int) -> str:
-    """Start / end time labels (host-local HH:MM) along the x axis."""
-    fmt = "%H:%M"
-    t_start = datetime.fromtimestamp(plot.ts_min).strftime(fmt)
-    t_end = datetime.fromtimestamp(plot.ts_max).strftime(fmt)
+    """Start / end time labels along the x axis (host-local).
+
+    HH:MM within one calendar day; with the date (MM/DD HH:MM) once the chart
+    spans days, so a seven-day chart cannot be read as a single day.
+    """
+    start = datetime.fromtimestamp(plot.ts_min)
+    end = datetime.fromtimestamp(plot.ts_max)
+    fmt = "%H:%M" if start.date() == end.date() else "%m/%d %H:%M"
     return (
         f'<text x="{_MARGIN_LEFT}" y="{y}" font-size="10" fill="#666">'
-        f"{_html_lib.escape(t_start)}</text>"
+        f"{_esc(start.strftime(fmt))}</text>"
         f'<text x="{plot.w - _MARGIN_RIGHT}" y="{y}" '
         f'text-anchor="end" font-size="10" fill="#666">'
-        f"{_html_lib.escape(t_end)}</text>"
+        f"{_esc(end.strftime(fmt))}</text>"
     )
 
 
@@ -609,7 +713,7 @@ def _title_svg(plot: _Plot, label: str) -> str:
     return (
         f'<text x="{_MARGIN_LEFT + plot.chart_w // 2}" y="{_MARGIN_TOP - 2}" '
         f'text-anchor="middle" font-size="11" font-weight="bold" fill="#333">'
-        f"{_html_lib.escape(label)}</text>"
+        f"{_esc(label)}</text>"
     )
 
 
@@ -663,8 +767,7 @@ def _polyline_svg(
         _svg_open(w, h)
         + _y_max_label_svg(f"{y_max:.0f}{unit}")
         + _threshold_svg(plot, threshold, threshold_label)
-        + f'<polyline points="{plot.points(pts)}" '
-        f'fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>'
+        + plot.line(pts, color)
         + _time_axis_svg(plot, h - 4)
         + _title_svg(plot, label)
         + "</svg>"
@@ -709,15 +812,11 @@ def _psi_svg(
         y_range=y_max_data if y_max_data > 0 else 1.0,
     )
 
-    lines_svg = ""
-    for series, color, dash in zip(series_list, _SVG_PALETTE, _PSI_DASHES):
-        if not series:
-            continue
-        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
-        lines_svg += (
-            f'<polyline points="{plot.points(series)}" fill="none" stroke="{color}" '
-            f'stroke-width="1.5" stroke-linejoin="round"{dash_attr}/>'
-        )
+    lines_svg = "".join(
+        plot.line(series, color, dash)
+        for series, color, dash in zip(series_list, _SVG_PALETTE, _PSI_DASHES)
+        if series
+    )
 
     legend_y = h - _PSI_LEGEND_H + 2
     legend_svg = ""
@@ -728,7 +827,7 @@ def _psi_svg(
             f'<line x1="{lx}" y1="{legend_y + 5}" x2="{lx + 14}" y2="{legend_y + 5}" '
             f'stroke="{col}" stroke-width="2"{dash_attr}/>'
             f'<text x="{lx + 18}" y="{legend_y + 8}" font-size="10" fill="#333">'
-            f"{_html_lib.escape(lbl)}</text>"
+            f"{_esc(lbl)}</text>"
         )
 
     return (
@@ -758,6 +857,7 @@ th { background: #f0f0f0; text-align: left; }
 .badge-ok   { background: #d4edda; color: #155724; padding: .2rem .5rem; border-radius: 4px; font-weight: bold; }
 .badge-warn { background: #fff3cd; color: #856404; padding: .2rem .5rem; border-radius: 4px; font-weight: bold; }
 .badge-crit { background: #f8d7da; color: #721c24; padding: .2rem .5rem; border-radius: 4px; font-weight: bold; }
+.badge-info { background: #d1ecf1; color: #0c5460; padding: .2rem .5rem; border-radius: 4px; font-weight: bold; }
 .finding { border-left: 4px solid #c33; padding: .5rem 1rem; margin: 1rem 0; background: #fafafa; }
 .finding.warning { border-color: #d90; }
 .finding.info    { border-color: #17a2b8; }
@@ -771,7 +871,7 @@ th { background: #f0f0f0; text-align: left; }
 @media print {
   /* Colour-independent fallback so a monochrome printout still distinguishes
      severities (badges become bordered, finding rules thicken their border). */
-  .badge-ok, .badge-warn, .badge-crit {
+  .badge-ok, .badge-warn, .badge-info, .badge-crit {
     background: #fff !important; color: #000 !important; border: 1.5px solid #000;
   }
   .finding { border-left-width: 6px; }
@@ -780,7 +880,9 @@ th { background: #f0f0f0; text-align: left; }
 
 
 def _esc(s: object) -> str:
-    return _html_lib.escape(str(s))
+    """HTML-escape *s*, with control characters shown as escapes (so the file
+    is as safe to ``cat`` as the terminal report)."""
+    return _html_lib.escape(neutralize(str(s)))
 
 
 def render_html(
@@ -821,22 +923,30 @@ def render_html(
 {_summary_section(diag)}
 {_proposal_section(diag)}
 {_charts_section(charts)}
-{_spike_section(charts.spikes if charts else [])}
+{_spike_section(charts)}
 {_quality_section(diag.quality, diag.window)}
 </body></html>"""
 
 
 def _summary_section(diag: Diagnosis) -> str:
     """① サマリ: health badge, verdict and the finding table."""
-    if diag.no_data and not diag.findings:
+    outcome = _outcome(diag)
+    if outcome is _Outcome.NO_DATA:
         badge = '<span class="badge-warn">観測データなし</span>'
         verdict = "観測データがありません。procdiag record でデータを記録してください"
-    elif diag.healthy and diag.fully_evaluated:
+    elif outcome is _Outcome.NOT_EVALUATED:
+        badge = '<span class="badge-warn">未評価</span>'
+        verdict = "評価できたルールがありません。問題がないとはまだ言えません"
+    elif outcome is _Outcome.CLEAR:
         badge = '<span class="badge-ok">正常</span>'
         verdict = "問題は見つかりませんでした"
-    elif diag.healthy:
+    elif outcome is _Outcome.PARTIAL:
         badge = '<span class="badge-warn">問題なし (一部未評価)</span>'
         verdict = "評価できた範囲では問題は見つかりませんでした"
+    elif outcome is _Outcome.INFO_ONLY:
+        n_info = len(diag.findings)
+        badge = f'<span class="badge-info">参考 — info {n_info}件</span>'
+        verdict = f"critical / warning の問題はありませんが、info の検出が {n_info} 件あります"
     else:
         n_crit = sum(1 for f in diag.findings if f.severity == Severity.CRITICAL)
         n_warn = sum(1 for f in diag.findings if f.severity == Severity.WARNING)
@@ -981,8 +1091,10 @@ def _charts_section(charts: "ChartData | None") -> str:
     return html + "".join(f'<div class="chart-row">{svg}</div>' for svg in svgs)
 
 
-def _spike_section(spikes: List[dict]) -> str:
+def _spike_section(charts: "ChartData | None") -> str:
     """④ スパイクイベント一覧: time, trigger, PSI snapshot and culprits."""
+    spikes = charts.spikes if charts else []
+    total = max(charts.spike_total, len(spikes)) if charts else 0
     rows_html = ""
     for ev in spikes:
         ts_str = datetime.fromtimestamp(ev.get("ts", 0)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1005,13 +1117,22 @@ def _spike_section(spikes: List[dict]) -> str:
             f"</tr>"
         )
 
+    note = (
+        f"<p>この期間のスパイクは全 {total} 件です。新しい {len(spikes)} 件を表示しています。</p>"
+        if total > len(spikes)
+        else ""
+    )
     return f"""
 <h2>④ スパイクイベント一覧</h2>
-<table>
+{note}<table>
   <thead><tr><th>時刻</th><th>種別</th><th>PSI (CPU/MEM/IO)</th><th>上位プロセス (CPU順)</th></tr></thead>
   <tbody>{rows_html if rows_html else '<tr><td colspan="4">イベントなし</td></tr>'}</tbody>
 </table>
 """
+
+
+def _pct2(value: float | None) -> str:
+    return "未計測" if value is None else f"{value:.2f}%"
 
 
 def _quality_section(q: ObservationQuality, window: Window | None) -> str:
@@ -1022,9 +1143,9 @@ def _quality_section(q: ObservationQuality, window: Window | None) -> str:
   <dl>
     <dt>観測期間</dt><dd>{q.span_hours:.1f} 時間{_window_text(window)}</dd>
     <dt>欠測 gap 合計</dt><dd>{q.gap_seconds:.0f} 秒</dd>
-    <dt>自己負荷 (平均)</dt><dd>{q.self_cpu_avg:.2f}%</dd>
-    <dt>自己負荷 (最大)</dt><dd>{q.self_cpu_max:.2f}%</dd>
-    <dt>I/O 欠損率</dt><dd>{q.missing_io_pct * 100:.1f}%</dd>
+    <dt>自己負荷 (平均)</dt><dd>{_pct2(q.self_cpu_avg)}</dd>
+    <dt>自己負荷 (最大)</dt><dd>{_pct2(q.self_cpu_max)}</dd>
+    <dt>I/O 欠損率</dt><dd>{_missing_io_text(q)}</dd>
     <dt>減速イベント</dt><dd>{q.throttle_events} 回</dd>
   </dl>
   {"".join(f"<p>備考: {_esc(n)}</p>" for n in q.notes)}
@@ -1081,17 +1202,20 @@ def _row_change(row: ComparisonRow) -> str:
     return text
 
 
-def _period_text(side: Side, *, show_db: bool) -> str:
+def _period_lines(side: Side, *, show_db: bool) -> List[str]:
     db = f"  [{side.db}]" if show_db else ""
     res = side.result
     if res is None:
-        return f"{side.name.label}: 期間内に記録がありません{db}"
+        return [f"{side.name.label}: 期間内に記録がありません{db}"]
     start = _local(res.window.start_ts).strftime("%Y-%m-%d %H:%M")
     end = _local(res.window.end_ts).strftime("%Y-%m-%d %H:%M")
-    return (
-        f"{side.name.label}: {start} 〜 {end}  {res.window.span_hours:.1f} 時間"
+    period = (
+        f"{side.name.label}: {start} 〜 {end}  {res.window.observed_hours:.1f} 時間"
         f" (うち生データ {res.raw_hours:.1f} 時間){db}"
     )
+    if not res.window.holes:
+        return [period]
+    return [period, f"  {holes_note(res.window.holes)}"]
 
 
 def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
@@ -1144,8 +1268,8 @@ def render_comparison_terminal(
     reset = _c(_RESET, color)
     warn = _c(_ANSI[Severity.WARNING], color)
     lines = [
-        _period_text(cmp.before, show_db=show_db),
-        _period_text(cmp.after, show_db=show_db),
+        *_period_lines(cmp.before, show_db=show_db),
+        *_period_lines(cmp.after, show_db=show_db),
         f"時刻はこのホストのローカルタイム ({zone})",
     ]
     lines += [f"{warn}注意: {n.message}{reset}" for n in cmp.notes]
@@ -1190,8 +1314,9 @@ def render_comparison_terminal(
             if side.result and side.result.diagnosis.reasoning:
                 lines.append("")
                 lines.append(f"{_c(_BOLD, color)}推論過程 ({side.name.label}):{reset}")
-                lines += [f"  {s}" for s in side.result.diagnosis.reasoning]
-    return "\n".join(lines)
+                for step in side.result.diagnosis.reasoning:
+                    lines += [f"  {line}" for line in step.splitlines() or [""]]
+    return _finish(lines, color)
 
 
 def _state_dict(state: SideState) -> dict:
@@ -1225,7 +1350,7 @@ def _side_dict(side: Side) -> dict:
             if res
             else None
         ),
-        "span_hours": res.window.span_hours if res else 0.0,
+        "span_hours": res.window.observed_hours if res else 0.0,
         "raw_hours": res.raw_hours if res else 0.0,
         "no_data": res is None,
         "evaluated_rules": list(diag.evaluated_rules),
@@ -1269,7 +1394,7 @@ def render_comparison_json(cmp: Comparison) -> str:
         }
         for n in cmp.notes
     ]
-    return json.dumps(
+    return dumps_json(
         {
             "format": COMPARE_FORMAT,
             "verdict_counts": {v.value: n for v, n in cmp.verdict_counts().items()},
@@ -1279,7 +1404,5 @@ def render_comparison_json(cmp: Comparison) -> str:
             "notes": notes,
             "generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "procdiag_version": procdiag.__version__,
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )

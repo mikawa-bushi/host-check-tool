@@ -21,8 +21,8 @@
 {%- endif %}
 {%- if evidence.results %}終了理由の目安: exit-code=プログラムがエラー終了、signal / core-dump=クラッシュ、oom-kill=メモリ不足で強制終了、timeout=起動・停止がタイムアウト、watchdog=応答停止、start-limit-hit=再起動の回数制限に到達。
 {%- endif %}
-[暫定対処] `systemctl status {{ evidence.unit }}` と `journalctl -u {{ evidence.unit }} -n 100 --no-pager` で、異常終了の直前に出ているエラーメッセージを確認してください。{% if 'oom-kill' in evidence.results %} oom-kill の場合はメモリ不足が原因です (MEM-PRESSURE-01 / OOM-KILL-01 も確認してください)。{% endif %}
-{%- if evidence.restarts_maybe_clean %}異常終了の記録は `journalctl -u {{ evidence.unit }} | grep 'Failed with result'` で確認できます。
+[暫定対処] `systemctl status {{ evidence.unit | shq }}` と `journalctl -u {{ evidence.unit | shq }} -n 100 --no-pager` で、異常終了の直前に出ているエラーメッセージを確認してください。{% if 'oom-kill' in evidence.results %} oom-kill の場合はメモリ不足が原因です (MEM-PRESSURE-01 / OOM-KILL-01 も確認してください)。{% endif %}
+{%- if evidence.restarts_maybe_clean %}異常終了の記録は `journalctl -u {{ evidence.unit | shq }} | grep 'Failed with result'` で確認できます。
 {%- endif %}
 {%- if evidence.restarts_clean %}終了するたびに再起動する設計のサービス (ログイン画面の getty など) では、正常終了の後の再起動は異常ではありません。設計どおりでなければ、すぐに終了してしまう原因 (設定や入力の誤り) をログで確認してください。
 {%- endif %}

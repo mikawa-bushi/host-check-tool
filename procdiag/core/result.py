@@ -46,15 +46,31 @@ class Confidence(str, Enum):
 
 @dataclass
 class Window:
-    """The observation period a rule evaluated."""
+    """The observation period a rule evaluated.
+
+    ``holes`` are the stretches inside it where nothing was recorded (the PC
+    was off, the recorder stopped, the clock jumped), oldest first and
+    disjoint.  They are not observed time.
+    """
 
     start_ts: float
     end_ts: float
+    holes: tuple[tuple[float, float], ...] = ()
 
     @property
     def span_hours(self) -> float:
-        """Length of the window in hours."""
+        """Length of the window in hours, holes included."""
         return (self.end_ts - self.start_ts) / 3600.0
+
+    @property
+    def observed_hours(self) -> float:
+        """Hours actually recorded: the span less the holes."""
+        return self.span_hours - sum(end - start for start, end in self.holes) / 3600.0
+
+    def observed_hours_between(self, start: float, end: float) -> float:
+        """Hours recorded in ``[start, end]``: its length less the holes in it."""
+        holes = sum(max(0.0, min(b, end) - max(a, start)) for a, b in self.holes)
+        return (end - start - holes) / 3600.0
 
 
 # The span from the first row to the last falls short of the time recorded:
@@ -114,9 +130,10 @@ class ObservationQuality:
 
     span_hours: float = 0.0
     gap_seconds: float = 0.0  # total recorder gap (job-late) delay in seconds
-    missing_io_pct: float = 0.0  # fraction of proc rows where io_counters was NULL
-    self_cpu_avg: float = 0.0
-    self_cpu_max: float = 0.0
+    # None = not measured in the window (shown as 未計測, JSON null), never 0.
+    missing_io_pct: Optional[float] = None  # fraction of proc rows with no io_counters
+    self_cpu_avg: Optional[float] = None
+    self_cpu_max: Optional[float] = None
     throttle_events: int = 0
     notes: list[str] = field(default_factory=list)  # demotion reasons etc.
 

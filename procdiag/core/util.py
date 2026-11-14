@@ -8,11 +8,13 @@ imports, docstrings in English, user-visible strings in Japanese.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import shlex
 import sys
-from collections.abc import Hashable
-from typing import Optional
+from collections.abc import Hashable, Iterable
+from typing import Any, Optional
 
 # Binary byte units, shared by the samplers, rules and reports so every module
 # converts sizes the same way as ``df -h`` / ``free -h`` (powers of 1024).
@@ -158,6 +160,102 @@ def should_use_color(no_color: bool = False) -> bool:
     if no_color or os.environ.get("NO_COLOR"):
         return False
     return sys.stdout.isatty()
+
+
+def storable_text(text: str) -> str:
+    r"""Return *text* in a form SQLite and a UTF-8 stream accept.
+
+    psutil and ``os`` decode host names and paths with ``surrogateescape``, so
+    a Shift_JIS argv or a UTF-8 name the kernel cut at 15 bytes arrives with
+    lone surrogates, which neither SQLite nor ``click.echo`` can encode.  Non
+    UTF-8 bytes become ``\xNN`` so two such names stay distinct.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "surrogateescape").decode(
+            "utf-8", "backslashreplace"
+        )
+    return text
+
+
+# What a terminal may act on or that changes what is shown: C0 / DEL / C1
+# controls, the Unicode line and paragraph separators, and the bidirectional
+# marks and overrides.
+_TERMINAL_ACTIVE = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
+# What ``json.dumps(ensure_ascii=False)`` leaves unescaped from the set above.
+_JSON_LEFT_RAW = re.compile(
+    "[\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
+_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escape_char(match: "re.Match[str]") -> str:
+    ch = match.group()
+    if ch in _NAMED_ESCAPES:
+        return _NAMED_ESCAPES[ch]
+    code = ord(ch)
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+
+
+def neutralize(text: str, *, allow: Iterable[str] = ()) -> str:
+    r"""Make host-supplied *text* one line of inert, printable text.
+
+    Control characters and newlines become ``\x1b`` / ``\n`` style escapes, so
+    a process name cannot clear the screen, set the title, hide the rest of the
+    line or start a forged line of its own.  *allow* lists exact escape
+    sequences procdiag emitted itself (its colour codes); those pass through.
+    """
+    text = storable_text(text)
+    if not allow:
+        return _TERMINAL_ACTIVE.sub(_escape_char, text)
+    keep = re.compile("(" + "|".join(re.escape(a) for a in allow) + ")")
+    return "".join(
+        part if i % 2 else _TERMINAL_ACTIVE.sub(_escape_char, part)
+        for i, part in enumerate(keep.split(text))
+    )
+
+
+def neutralized_lines(lines: Iterable[str], *, allow: Iterable[str] = ()) -> str:
+    """Join *lines* with newlines, each one passed through :func:`neutralize`."""
+    allow = tuple(allow)
+    return "\n".join(neutralize(line, allow=allow) for line in lines)
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _json_surrogate(match: "re.Match[str]") -> str:
+    """A non UTF-8 byte kept by ``surrogateescape``, as the text ``\\xNN`` (JSON-escaped)."""
+    code = ord(match.group())
+    return f"\\\\x{code - 0xDC00:02x}" if 0xDC80 <= code <= 0xDCFF else "\\ufffd"
+
+
+def dumps_json(obj: Any) -> str:
+    """``json.dumps`` for reports: UTF-8 text with terminal-active code points escaped.
+
+    ``ensure_ascii=False`` keeps Japanese readable but would also pass DEL, C1
+    controls (U+009B is a CSI) and the bidi overrides to a terminal as they are,
+    and a name with non UTF-8 bytes (lone surrogates) would not encode at all.
+    """
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    text = _LONE_SURROGATE.sub(_json_surrogate, text)
+    return _JSON_LEFT_RAW.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+
+
+def shell_quote(value: object) -> str:
+    """*value* as one shell word, safe to paste into a command line."""
+    return shlex.quote(str(value))
+
+
+_UNIT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]{0,254}")
+
+
+def is_unit_name(name: object) -> bool:
+    """Whether *name* could be a systemd unit name (so ``systemctl restart`` fits)."""
+    return isinstance(name, str) and _UNIT_NAME.fullmatch(name) is not None
 
 
 class CounterDelta:

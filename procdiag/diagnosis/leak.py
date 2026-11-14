@@ -121,6 +121,7 @@ class FdLeakRule(MeasuredRule):
             store.proc_identities(),
             "fds_max",
             min_span_hours=self.min_observation_hours,
+            holes=window.holes,
         )
 
     def judge(
@@ -229,6 +230,7 @@ class ThreadLeakRule(MeasuredRule):
             store.proc_identities(),
             "threads_max",
             min_span_hours=self.min_observation_hours,
+            holes=window.holes,
         )
 
     def judge(
@@ -333,6 +335,7 @@ class ZombieRule(MeasuredRule):
             series,
             min_points=12,
             min_span_hours=self.min_observation_hours,
+            holes=window.holes,
         )
         if fit is None:
             return []
