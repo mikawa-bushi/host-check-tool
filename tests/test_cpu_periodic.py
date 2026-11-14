@@ -32,6 +32,11 @@ def host_tz(monkeypatch):
     time.tzset()
 
 
+@pytest.fixture(autouse=True)
+def _utc_host(host_tz):
+    host_tz("UTC")
+
+
 def _run(store, config=None):
     diag = Engine(config or ProcdiagConfig()).run(store, only=["CPU-PERIODIC-01"])
     store.close()
