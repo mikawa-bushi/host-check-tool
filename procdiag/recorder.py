@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, Optional
 
 from . import spikes
 from .config import ProcdiagConfig
+from .core.result import Capability
 from .core.sampler import RunContext, SampleBatch, Sampler
 from .core.util import MiB
 from .scheduler import TierScheduler
@@ -125,10 +126,9 @@ class Recorder:
             self._samplers = self._build_samplers()
 
         # Collaborators (build defaults when not injected) ------------------
-        if trigger is not None:
-            self._trigger = trigger
-        else:
-            self._trigger = self._build_trigger()
+        # The default trigger is built in run(), once setup() has found out
+        # whether PSI can be read.
+        self._trigger = trigger
 
         if selfmeter is not None:
             self._selfmeter = selfmeter
@@ -144,6 +144,8 @@ class Recorder:
         self._session_id: Optional[int] = None
         self._flush_interval = 60.0
         self._retention_interval = 3600.0
+        # Samplers whose collect failure this session has already kept.
+        self._failed_samplers: set[str] = set()
 
     # ------------------------------------------------------------------
     # Sampler / collaborator factory (T09 wiring)
@@ -181,17 +183,15 @@ class Recorder:
         }
 
     def _build_trigger(self) -> Any:
-        """Build a SpikeTrigger with PSI availability from config context.
+        """Build a SpikeTrigger in PSI mode only when setup() could read PSI.
 
-        PSI availability is detected during setup(); we default to the
-        conservative assumption that PSI is available (it will be corrected
-        by SystemSampler.setup once setup() runs).
+        On a kernel with PSI disabled ``/proc/pressure`` exists but cannot be
+        read; the trigger then needs the CPU / memory / swap fallback.
         """
         try:
             from .samplers.trigger import SpikeTrigger  # type: ignore[import]
 
-            # Use PSI if /proc/pressure/cpu exists on the real filesystem.
-            psi_available = (self._ctx.proc_root / "pressure" / "cpu").exists()
+            psi_available = self._ctx.capabilities.get(Capability.PSI.value, False)
             return SpikeTrigger(self._config.trigger, psi_available=psi_available)
         except Exception:
             logger.warning(
@@ -252,7 +252,26 @@ class Recorder:
         batches = sampler.run(self._ctx)
         for batch in batches:
             self._storage.buffer(batch.table, batch.rows)
+        if self._ctx.notes:
+            self._keep_failure_notes()
         return batches
+
+    def _keep_failure_notes(self) -> None:
+        """Keep each sampler's first collect failure of this session in the DB.
+
+        Once per sampler: a sampler that fails on every tick must not fill the
+        DB with the same note.  ``check`` shows them in its quality notes.
+        """
+        notes, self._ctx.notes = self._ctx.notes, []
+        for note in notes:
+            name = note.partition(":")[0]
+            if name in self._failed_samplers:
+                continue
+            self._failed_samplers.add(name)
+            try:
+                self._storage.record_event("sampler_failed", note)
+            except sqlite3.Error as exc:
+                logger.error("サンプラーの失敗を記録 DB に書き込めません: %s", exc)
 
     # ------------------------------------------------------------------
     # Spike handling
@@ -488,6 +507,15 @@ class Recorder:
                 sampler.setup(self._ctx)
             except Exception:
                 logger.exception("サンプラーsetup例外 (name=%s)", name)
+        # What this session cannot observe goes with its data, so check does
+        # not read the rules that needed it as "no problem".
+        for capability, reason in self._ctx.unobserved.items():
+            try:
+                self._storage.record_unobserved(capability, reason)
+            except sqlite3.Error as exc:
+                logger.error("観測できない項目を記録 DB に書き込めません: %s", exc)
+        if self._trigger is None:
+            self._trigger = self._build_trigger()
 
         # Attach selfmeter to context.
         if self._selfmeter is not None:

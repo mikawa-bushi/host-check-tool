@@ -20,7 +20,7 @@ from .core import (
     configure_rule,
     get_rule,
 )
-from .core.result import CoverageGap, covers
+from .core.result import CoverageGap, Unobserved, covers, unobserved_seconds
 from .diagnosis import Engine
 from .storage import RAW_TABLES, Storage, StorageVersionError
 
@@ -157,6 +157,7 @@ class Why(str, Enum):
     NO_DATA = "no_data"
     TOO_SHORT = "too_short"
     NOT_RECORDED = "not_recorded"
+    NOT_OBSERVED = "not_observed"
     SCHEMA_MISSING = "schema_missing"
     RULE_ERRORED = "rule_errored"
     SUBJECT_NOT_OBSERVED = "subject_not_observed"
@@ -181,6 +182,7 @@ _WHY_JA = {
     Why.NO_DATA: "期間内に記録がない",
     Why.TOO_SHORT: "記録時間が足りない",
     Why.NOT_RECORDED: "期間内に必要な記録がない",
+    Why.NOT_OBSERVED: "記録時に観測できなかった",
     Why.SCHEMA_MISSING: "DB の版が古い",
     Why.RULE_ERRORED: "ルールの実行エラー",
     Why.SUBJECT_NOT_OBSERVED: "対象を測定できなかった",
@@ -431,6 +433,8 @@ def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
         if r.rule_id == rule_id:
             if r.reason is CoverageGap.SCHEMA_MISSING:
                 return Unknown(Why.SCHEMA_MISSING, r.detail)
+            if r.reason is CoverageGap.NOT_OBSERVED:
+                return Unknown(Why.NOT_OBSERVED, r.detail)
             hint = (
                 " (生データは保持期間を過ぎると削除されます)"
                 if set(r.missing) & set(RAW_TABLES)
@@ -527,6 +531,22 @@ def _span_hours(side: Side) -> float:
     return side.result.window.span_hours if side.result else 0.0
 
 
+def _blind(side: Side, rule_id: str) -> list[Unobserved]:
+    """The parts of *side* in which the recording could not feed *rule_id*."""
+    cls = get_rule(rule_id)
+    if side.result is None or cls is None:
+        return []
+    return [
+        p
+        for p in side.result.diagnosis.unobserved
+        if p.capability in cls.requires_observed
+    ]
+
+
+def _observed_hours(side: Side, rule_id: str) -> float:
+    return _span_hours(side) - unobserved_seconds(_blind(side, rule_id)) / 3600.0
+
+
 def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
     gap = _rule_gap(side, rule_id)
     if gap is not None:
@@ -538,10 +558,24 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
         worst = max(hits, key=lambda f: _SEVERITY_RANK[f.severity])
         return Detected(worst.severity, len(hits), None, worst)
     # A problem that comes a few times a day can miss a shorter period by
-    # chance, so no finding there says nothing against the other period's.
-    mine, theirs = _span_hours(side), _span_hours(other)
+    # chance, so no finding there says nothing against the other period's;
+    # neither does a part the recording could not observe.
+    mine, theirs = _observed_hours(side, rule_id), _observed_hours(other, rule_id)
     if covers(mine, theirs):
         return Clear(None)
+    blind = _blind(side, rule_id)
+    if blind:
+        labels = "、".join(dict.fromkeys(p.capability.label for p in blind))
+        return Unknown(
+            Why.NOT_OBSERVED,
+            f"{side.name.label}の期間のうち {labels} を観測できたのは {mine:.1f} 時間で、"
+            f"{other.name.label}の {theirs:.1f} 時間より短いため、検出が無くても"
+            + (
+                "直ったとは言えません"
+                if side.name is SideName.AFTER
+                else "無かったとは言えません"
+            ),
+        )
     if side.name is SideName.AFTER:
         return Unknown(
             Why.TOO_SHORT,

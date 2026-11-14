@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..core import (
+    Capability,
     Confidence,
     Finding,
     Rule,
@@ -363,7 +364,8 @@ class CpuSaturationRule(Rule):
     title = "CPU 飽和 (PSI)"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
-    requires_rows = ("sys_samples",)
+    requires_rows = ("sys_samples", "sys_samples.psi_cpu_some10")
+    requires_observed = (Capability.PSI,)
     what = (
         "sys_samples の psi_cpu_some10 が閾値超の連続分数を数え、15分以上継続したら"
         "spike_events の top_processes から犯人プロセスを集計して列挙する"

@@ -44,12 +44,15 @@ from procdiag.compare import (
 )
 from procdiag.compare import exit_code as compare_exit_code
 from procdiag.core import (
+    Capability,
     Confidence,
+    CoverageGap,
     Diagnosis,
     Headline,
     ObservationQuality,
     Severity,
     SkippedRule,
+    UncoveredRule,
     Window,
     configure_rule,
 )
@@ -299,15 +302,30 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
             f"観測時間不足で未評価 {n_skip} 件"
             f" (あと最長 {longest:.1f} 時間の記録で全ルールを評価できます)"
         )
-    if n_unc:
-        parts.append(f"記録データが無く未評価 {n_unc} 件")
+    blind = _uncovered(diag, blind=True)
+    if n_unc - len(blind):
+        parts.append(f"記録データが無く未評価 {n_unc - len(blind)} 件")
+    if blind:
+        lacked = "、".join(
+            dict.fromkeys(Capability(n).label for r in blind for n in r.missing)
+        )
+        parts.append(f"記録時に {lacked} を観測できず未評価 {len(blind)} 件")
     if n_err:
         parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
     return " / ".join(parts)
 
 
-def _uncovered_list(diag: Diagnosis) -> str:
-    return ", ".join(f"{r.rule_id} ({r.detail})" for r in diag.uncovered_rules)
+def _uncovered(diag: Diagnosis, *, blind: bool) -> List[UncoveredRule]:
+    """Uncovered rules the recording could not observe for (*blind*) or not."""
+    return [
+        r
+        for r in diag.uncovered_rules
+        if (r.reason is CoverageGap.NOT_OBSERVED) is blind
+    ]
+
+
+def _uncovered_list(rules: List[UncoveredRule]) -> str:
+    return ", ".join(f"{r.rule_id} ({r.detail})" for r in rules)
 
 
 def _skipped_by_wait(diag: Diagnosis) -> List[SkippedRule]:
@@ -391,8 +409,13 @@ def render_terminal(
             lines.append(f"{warn}⚠ {coverage}{_c(_RESET, color)}")
             if diag.skipped_rules:
                 lines.append(f"  未評価: {_skipped_list(diag)}")
-            if diag.uncovered_rules:
-                lines.append(f"  記録なしで未評価: {_uncovered_list(diag)}")
+            for blind, label in (
+                (False, "記録なしで未評価"),
+                (True, "観測できず未評価"),
+            ):
+                rules = _uncovered(diag, blind=blind)
+                if rules:
+                    lines.append(f"  {label}: {_uncovered_list(rules)}")
 
     # --- Observation quality block ---
     q = diag.quality

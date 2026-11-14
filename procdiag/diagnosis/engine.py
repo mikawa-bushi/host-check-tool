@@ -41,12 +41,14 @@ from ..core import (
     Severity,
     SkippedRule,
     UncoveredRule,
+    Unobserved,
     Window,
     all_rules,
     configure_rule,
     covers,
     rule_id_problems,
 )
+from ..core.result import blind_throughout, unobserved_seconds
 from ..core.util import humanize_bytes
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
@@ -229,7 +231,8 @@ class Engine:
            (``Rule.configure`` applies ``config.rules.min_observation_hours``,
            the one knob for the regression rules per design §6.3/§8).  A rule
            whose declared inputs (``requires_schema`` / ``requires_rows``)
-           are missing for the window is not run and is listed in
+           are missing for the window, or whose ``requires_observed`` no
+           recording in the window could observe, is not run and is listed in
            ``uncovered_rules``.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
@@ -269,6 +272,11 @@ class Engine:
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
         coverage_cache: dict[tuple[str, str], bool] = {}
+        unobserved = (
+            [p for u in store.unobserved_periods() if (p := u.within(window))]
+            if has_data
+            else []
+        )
 
         for rule_cls in rule_classes:
             rule, config_error = configure_rule(rule_cls, self.config)
@@ -291,7 +299,7 @@ class Engine:
                     )
                 )
                 continue
-            gap = self._coverage_gap(store, rule, window, coverage_cache)
+            gap = self._coverage_gap(store, rule, window, coverage_cache, unobserved)
             if gap is not None:
                 reasoning.append(
                     f"{rule.rule_id}: 入力データが無いため未評価 "
@@ -360,7 +368,9 @@ class Engine:
         )
 
         # --- Step 6: build quality ---
-        quality = self._build_quality(store, window, events_in_window=has_data)
+        quality = self._build_quality(
+            store, window, events_in_window=has_data, unobserved=unobserved
+        )
 
         healthy = not any(
             f.severity in (Severity.WARNING, Severity.CRITICAL) for f in findings
@@ -379,6 +389,7 @@ class Engine:
             uncovered_rules=uncovered,
             measurements=measurements,
             folded=folded,
+            unobserved=unobserved,
         )
 
     # ------------------------------------------------------------------
@@ -391,6 +402,7 @@ class Engine:
         rule: Rule,
         window: Window,
         cache: dict[tuple[str, str], bool],
+        unobserved: list[Unobserved],
     ) -> Optional[UncoveredRule]:
         def exists(name: str) -> bool:
             key = ("schema", name)
@@ -403,24 +415,39 @@ class Engine:
                 )
             return cache[key]
 
-        def has_rows(table: str) -> bool:
-            key = ("rows", table)
+        def has_rows(name: str) -> bool:
+            key = ("rows", name)
             if key not in cache:
-                inside = store.time_bounds(table, window.start_ts, window.end_ts)
-                cache[key] = inside is not None or (
-                    table in OPTIONAL_SAMPLER_TABLES
-                    and store.time_bounds(table) is None
-                )
+                table, _, column = name.partition(".")
+                if column:
+                    cache[key] = store.has_values(
+                        table, column, window.start_ts, window.end_ts
+                    )
+                else:
+                    inside = store.time_bounds(table, window.start_ts, window.end_ts)
+                    cache[key] = inside is not None or (
+                        table in OPTIONAL_SAMPLER_TABLES
+                        and store.time_bounds(table) is None
+                    )
             return cache[key]
 
-        missing = tuple(
-            n for n in (*rule.requires_schema, *rule.requires_rows) if not exists(n)
-        )
+        needed = dict.fromkeys((*rule.requires_schema, *rule.requires_rows))
+        missing = tuple(n for n in needed if not exists(n))
         if missing:
             return UncoveredRule(
                 rule.rule_id, rule.title, CoverageGap.SCHEMA_MISSING, missing
             )
-        empty = tuple(t for t in rule.requires_rows if not has_rows(t))
+        blind = [p for p in unobserved if p.capability in rule.requires_observed]
+        if blind_throughout(blind, window):
+            lacked = tuple(dict.fromkeys(p.capability.value for p in blind))
+            return UncoveredRule(
+                rule.rule_id, rule.title, CoverageGap.NOT_OBSERVED, lacked
+            )
+        tables = [n for n in rule.requires_rows if "." not in n]
+        columns = [n for n in rule.requires_rows if "." in n]
+        empty = tuple(t for t in tables if not has_rows(t)) or tuple(
+            c for c in columns if not has_rows(c)
+        )
         if empty:
             return UncoveredRule(
                 rule.rule_id, rule.title, CoverageGap.NOT_RECORDED, empty
@@ -481,7 +508,12 @@ class Engine:
             return f"[提案テンプレートの生成に失敗: {exc}]"
 
     def _build_quality(
-        self, store: "Storage", window: Window, *, events_in_window: bool
+        self,
+        store: "Storage",
+        window: Window,
+        *,
+        events_in_window: bool,
+        unobserved: list[Unobserved],
     ) -> ObservationQuality:
         """Assemble ObservationQuality from DB statistics over *window*."""
         span_hours = window.span_hours
@@ -521,6 +553,15 @@ class Engine:
                 "ops_events", since=since, until=until, where="kind = 'data_lost'"
             )
         )
+        notes.extend(_unobserved_notes(unobserved, window))
+        if events_in_window:
+            notes.extend(
+                dict.fromkeys(
+                    f"記録中に失敗した処理があります ({_local_minute(ts)} 以降): {detail}"
+                    for ts, _, until, detail in store.session_events("sampler_failed")
+                    if ts <= window.end_ts and until > window.start_ts
+                )
+            )
 
         return ObservationQuality(
             span_hours=span_hours,
@@ -531,6 +572,30 @@ class Engine:
             throttle_events=throttle_events,
             notes=notes,
         )
+
+
+def _local_minute(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _unobserved_notes(unobserved: list[Unobserved], window: Window) -> list[str]:
+    """One note per reason the recording could not observe something."""
+    by_reason: dict[str, list[Unobserved]] = {}
+    for p in unobserved:
+        by_reason.setdefault(p.reason, []).append(p)
+    notes = []
+    for reason, periods in by_reason.items():
+        if blind_throughout(periods, window):
+            notes.append(f"{reason} (診断した期間の全体)")
+            continue
+        start = min(p.start_ts for p in periods)
+        end = max(p.end_ts for p in periods)
+        hours = unobserved_seconds(periods) / 3600.0
+        notes.append(
+            f"{reason} (診断した期間のうち {_local_minute(start)} 〜"
+            f" {_local_minute(end)} の {hours:.1f} 時間)"
+        )
+    return notes
 
 
 # ---------------------------------------------------------------------------

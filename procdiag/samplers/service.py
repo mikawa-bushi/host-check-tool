@@ -28,6 +28,7 @@ import time
 from typing import Dict, Mapping, Optional
 
 from .. import kernlog, systemd
+from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
@@ -74,10 +75,11 @@ class ServiceSampler(Sampler):
         """Enable only on systemd hosts."""
         self._enabled = systemd.available()
         self._journal = self._enabled and kernlog.journal_readable()
-        ctx.capabilities["systemd"] = self._enabled
+        ctx.capabilities[Capability.SYSTEMD.value] = self._enabled
         if not self._enabled:
-            ctx.notes.append(
-                "service: systemd が見つからないため、サービス再起動の記録をスキップします"
+            ctx.lacks(
+                Capability.SYSTEMD,
+                "service: systemd が見つからないため、サービス再起動の記録をスキップします",
             )
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
