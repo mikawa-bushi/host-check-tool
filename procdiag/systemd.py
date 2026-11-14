@@ -9,6 +9,8 @@ non-systemd distros) simply skip these checks.
 
 from __future__ import annotations
 
+import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,7 +20,18 @@ _TIMEOUT_SEC = 10.0
 # ``systemctl show`` takes unit names on the command line; chunk long lists so
 # the argv stays far below ARG_MAX on hosts with hundreds of units.
 _SHOW_CHUNK = 100
-SERVICE_PROPERTIES = ("Id", "NRestarts", "Result", "ActiveState", "SubState")
+SERVICE_PROPERTIES = (
+    "Id",
+    "NRestarts",
+    "Restart",
+    "RestartForceExitStatus",
+    "Result",
+    "ActiveState",
+    "SubState",
+)
+# systemd logs "<unit>: Failed with result '<result>'." under this id each time a
+# run of a unit ends abnormally, also when Restart= then starts it again.
+_UNIT_FAILED_MESSAGE_ID = "d9b373ed55a64feb8242e02dbe79a49c"
 
 
 def available() -> bool:
@@ -94,6 +107,45 @@ def n_restarts(props: Mapping[str, str]) -> Optional[int]:
         return int(value) if value else None
     except ValueError:
         return None
+
+
+def unit_failures(since: float) -> Optional[Dict[str, List[str]]]:
+    """``{unit: [UNIT_RESULT, ...]}`` for system units whose run ended
+    abnormally after *since* (epoch seconds), oldest first.
+
+    None when ``journalctl`` fails.  Without permission to read the system
+    journal ``journalctl`` returns nothing; check that before trusting an
+    empty result.
+    """
+    out = run(
+        [
+            "journalctl",
+            "-q",
+            "--no-pager",
+            "-o",
+            "json",
+            "--output-fields=UNIT,UNIT_RESULT",
+            "--since",
+            f"@{math.floor(since)}",
+            "_PID=1",
+            f"MESSAGE_ID={_UNIT_FAILED_MESSAGE_ID}",
+        ]
+    )
+    if out is None:
+        return None
+    failures: Dict[str, List[str]] = {}
+    for line in out.splitlines():
+        try:
+            entry = json.loads(line)
+            ts = int(entry["__REALTIME_TIMESTAMP"]) / 1e6
+        except (ValueError, KeyError, TypeError):
+            continue
+        unit, result = entry.get("UNIT"), entry.get("UNIT_RESULT")
+        if ts > since and isinstance(unit, str):
+            failures.setdefault(unit, []).append(
+                result if isinstance(result, str) else ""
+            )
+    return failures
 
 
 def ntp_synchronized() -> Optional[bool]:

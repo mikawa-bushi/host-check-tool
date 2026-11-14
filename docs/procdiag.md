@@ -279,6 +279,15 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
 
 - `ServiceSampler`: systemd が数える自動再起動回数 (`NRestarts`) の増加と failed 遷移だけを
   `service_events` に記録する (cgroup の作り直しは timer 起動の oneshot でも起きるため使わない)。
+  確認の間に `NRestarts` が下がったとき (手動の再起動や `systemctl reset-failed` で 0 に戻る) は、
+  下がった後の値をその間の再起動回数として数える。0 に戻った後に前回の値以上まで増えると、
+  増えた分しか数えられない。
+  `Restart=always`、`RestartForceExitStatus=` のあるユニットは正常終了の後も再起動されるため、
+  systemd がジャーナルに残す「Failed with result」の行で見分け、異常終了の後の再起動を
+  `kind=restart`、それ以外を `kind=restart_clean` として記録する (`Restart=on-success` は常に
+  `restart_clean`)。ジャーナルを読めない (root または systemd-journal / adm グループが必要) ときは
+  `kind=restart_maybe_clean` として記録する。最初の確認で既に failed のユニットは遷移として数えず、
+  `kind=failed_at_start` として記録する。
 - `KernelLogSampler`: `journalctl -k` を前回の続き (cursor) から読み、I/O エラー・FS エラー・
   ハングタスク・MCE・segfault・USB 切断・温度制限の行だけを `kernel_events` に記録する。
   読み取りには root または systemd-journal / adm グループが必要。
@@ -343,7 +352,7 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 | `DISK-INODE-01` | io_disk | inode 使用率の高止まり・増加を検出 (容量に空きがあっても書けない状態) |
 | `FS-READONLY-01` | io_disk | 記録中にファイルシステムが読み取り専用へ切り替わったことを検出 |
 | `UNCLEAN-SHUTDOWN-01` | crash | 記録セッション履歴から、停止処理なしの再起動 (電源断・パニック) を検出 |
-| `SERVICE-RESTART-01` | crash | systemd の自動再起動 (NRestarts) の増加・failed 遷移からクラッシュループを検出 |
+| `SERVICE-RESTART-01` | crash | systemd の自動再起動 (NRestarts) の増加・failed 遷移からクラッシュループを検出 (正常終了の後と分かっている再起動は再起動ループとせず、確信度 low の warning。ジャーナルを読めず見分けられなかった再起動は数えるが、確信度 medium) |
 | `KERNEL-ERROR-01` | crash | カーネルログの I/O エラー・FS エラー・ハングタスク・MCE・segfault・USB 切断を集計 |
 | `THERMAL-01` | cpu | 高温下での継続的なクロック低下 (サーマルスロットリング) を検出 |
 
