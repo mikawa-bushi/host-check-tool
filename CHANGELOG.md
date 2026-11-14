@@ -22,6 +22,10 @@
 - `check` / `compare` の `--only` にルール ID を打ち間違える (小文字も含む) と、ルールを 1 つも評価せずに「問題は見つかりませんでした」と出し、終了コード 0 で終わっていた。HTML も「正常」だった。存在しない ID は診断せずに終了コード 4 で断り、近いルール ID を示す (例: `mem-leak-01` には「MEM-LEAK-01 のことですか?」)。`--skip` と `config.rules.disabled` の打ち間違いは黙って無視され、そのルールが動いていた。これも終了コード 4 で断る。`rules.disabled` で無効にしたルールを `--only` に書いたときと、指定の結果、実行するルールが 1 つも残らないときも同じ。ライブラリから `Engine.run` / `Engine.select` に渡したときは `ValueError` になる。`rules.disabled` の打ち間違いは、`rules.overrides` と同じく `record` を含め設定を読むすべてのコマンドを止める。これまで打ち間違いが黙って無視されていた環境では、更新すると記録が始まらなくなるので、エラーの示すルール ID を直すこと。
 - `rules.extra_rules` で読み込むルールが組み込みのルールと同じ ID を使うと、組み込みのルールが黙って置き換わっていた。DISK-FULL-01 の重大な検出が消え、終了コード 0 になることがあった。同じ ID のルールは登録せず、そのモジュールの読み込みの失敗として推論過程 (`--verbose` / JSON) に記録する。組み込みのルールはそのまま動く。
 - UTF-8 の BOM 付きで保存した config.py (Windows のメモ帳など) や、`# -*- coding: cp932 -*-` の行がある config.py を、Python としては正しいのに「設定ファイルの読み込みに失敗しました」として終了コード 4 で断っていた。Python のソースと同じ規則で読む。
+- XFS の「Metadata corruption detected」「Metadata CRC error detected」、btrfs の「BTRFS: error (device …)」、ブロック層の「critical target / timeout / recoverable transport / critical nexus / device offline / protection error」、SCSI の「FAILED Result」、NVMe のタイムアウトと「Device not ready」が記録されず、ディスクやファイルシステムが壊れていても KERNEL-ERROR-01 が何も報告しなかった。これらを重大なファイルシステムエラー / ディスク I/O エラーとして記録する。
+- 記録を止める直前の最大 5 分 (`quick` では約 8%) と、記録を止めていた間のカーネルログが記録されなかった。停止するときにカーネルログとサービスの状態をもう一度読み、次の `record` は同じ DB に前回読んだところの続きから読む。再起動や電源断の前のブートの最後の行も、journal に残っていれば記録する。同じ行を 2 回記録することはない。
+- journal を読む権限が無いとき、カーネルログの読み取りが「新しい行は無い」と同じ結果を返していた。「読めない」として扱う。
+- `snapshot` の「カーネルログ (24時間)」と OOM-KILL-01 の照合が、24 時間以内に再起動していると再起動前の行を読まなかった。期間内なら前のブートの行も読む。
 
 ## [0.6.0] - 2026-11-10
 
