@@ -12,6 +12,7 @@ import pytest
 from synth import make_db
 
 from procdiag.config import ProcdiagConfig
+from procdiag.core import Window
 from procdiag.diagnosis import Engine
 from procdiag.storage import make_row
 
@@ -20,8 +21,8 @@ _GiB = 1024**3
 _T0 = 1_780_000_000.0 - (1_780_000_000.0 % 60) - 6 * 3600
 
 
-def _run(store, rule_id):
-    diag = Engine(ProcdiagConfig()).run(store, only=[rule_id])
+def _run(store, rule_id, window=None):
+    diag = Engine(ProcdiagConfig()).run(store, only=[rule_id], window=window)
     assert diag.evaluated_rules == [rule_id], (
         diag.skipped_rules,
         diag.uncovered_rules,
@@ -299,6 +300,24 @@ class TestSinglecoreEpisodes:
         store.conn.commit()
 
         assert _run(store, "CPU-SINGLECORE-01") == []
+        store.close()
+
+    def test_a_minute_the_raw_samples_only_partly_cover_is_read_from_the_rollup(
+        self, tmp_path
+    ):
+        store = make_db(tmp_path)
+        store.buffer(
+            "sys_rollup_1m", [_rollup_row(_T0 + 60 * m, 4, True) for m in range(30)]
+        )
+        store.buffer(
+            "sys_samples",
+            [_core_rows(_T0 + 25 * 60 + 40 + i, 4, True) for i in range(260)],
+        )
+        store.flush(reason="synth")
+
+        (f,) = _run(store, "CPU-SINGLECORE-01", Window(_T0, _T0 + 1800))
+
+        assert f.evidence["duration_minutes"] == 30
         store.close()
 
     def test_one_cpu_has_no_single_core_to_blame(self, tmp_path):

@@ -355,13 +355,17 @@ class TestCpuSinglecore:
         store.flush(reason="synth")
 
     def test_singlecore_detected(self, tmp_path):
-        """A 20-minute singlecore episode should produce a CPU-SINGLECORE-01 finding."""
+        """A 20-minute singlecore episode in the 1-minute rollup is reported.
+
+        The raw samples are gone (pruned), so only the rollup rows are judged.
+        """
         hours = 10.0
         store = make_db(tmp_path, hours=hours)
         add_sys_baseline(store, hours=hours)
         now = time.time()
         ep_start = now - 5 * _HOUR
         self._add_singlecore_episode(store, start_ts=ep_start, duration_minutes=20)
+        store.conn.execute("DELETE FROM sys_samples")
         add_proc_series(
             store,
             "singleproc",
