@@ -26,9 +26,10 @@ from test_recorder import FakeClock, _AdvancingSleep
 
 from procdiag.config import ProcdiagConfig, RulesConfig, SamplingConfig, WatchDir
 from procdiag.core import CoverageGap
-from procdiag.core.sampler import RunContext
+from procdiag.core.sampler import RunContext, SampleBatch, Sampler
 from procdiag.diagnosis import Engine
 from procdiag.recorder import Recorder
+from procdiag.samplers.blockdev import is_partition
 from procdiag.samplers.cgroup import CgroupSampler
 from procdiag.samplers.disk import DiskSampler
 from procdiag.samplers.system import SystemSampler
@@ -240,6 +241,82 @@ class TestEveryUnreadableWatchDirIsNamed:
         notes = "\n".join(diag.quality.notes)
         assert str(not_mounted_yet) in notes
         assert str(data) in notes
+
+    def test_watch_dirs_whose_paths_hold_a_colon_and_a_space_are_each_named(
+        self, tmp_path
+    ):
+        first = tmp_path / "mnt: disk1"
+        second = tmp_path / "mnt: disk2"
+        db = tmp_path / "rec.db"
+        cfg = ProcdiagConfig(
+            db_path=str(db),
+            sampling=SamplingConfig(
+                system_interval=0.1,
+                cgroup_interval=0.3,
+                process_interval=0.5,
+                disk_interval=0.5,
+                dir_scan_interval=5.0,
+                watch_dirs=[WatchDir(path=str(first)), WatchDir(path=str(second))],
+            ),
+        )
+        clock = FakeClock(0.0)
+        rec = Recorder(
+            cfg,
+            db_path=db,
+            ctx=RunContext(cfg, proc_root=_FIXTURES / "proc_tree"),
+            samplers={"system": SystemSampler(), "disk": DiskSampler()},
+            duration=1.0,
+            clock=clock,
+            sleep=_AdvancingSleep(clock),
+        )
+        assert rec.run() == 0
+
+        with Storage(db, read_only=True) as store:
+            diag = Engine(cfg).run(store, only=["CPU-SATURATION-01"])
+
+        notes = "\n".join(diag.quality.notes)
+        assert str(first) in notes
+        assert str(second) in notes
+
+
+class _FailsDifferentlyEveryTick(Sampler):
+    name = "disk"
+    interval_key = "disk_interval"
+    tier = "T3"
+
+    def __init__(self) -> None:
+        self._ticks = 0
+
+    def collect(self, ctx: RunContext) -> list[SampleBatch]:
+        self._ticks += 1
+        raise RuntimeError(f"disk read failed at tick {self._ticks}")
+
+
+class TestASamplerThatKeepsFailingIsNotedOnce:
+    def test_the_db_keeps_one_note_for_the_sampler_however_the_failure_reads(
+        self, tmp_path
+    ):
+        db = tmp_path / "rec.db"
+        cfg = ProcdiagConfig(
+            db_path=str(db),
+            sampling=SamplingConfig(system_interval=0.1, disk_interval=0.3),
+        )
+        clock = FakeClock(0.0)
+        rec = Recorder(
+            cfg,
+            db_path=db,
+            ctx=RunContext(cfg, proc_root=_FIXTURES / "proc_tree"),
+            samplers={"system": SystemSampler(), "disk": _FailsDifferentlyEveryTick()},
+            duration=2.0,
+            clock=clock,
+            sleep=_AdvancingSleep(clock),
+        )
+        assert rec.run() == 0
+
+        with Storage(db, read_only=True) as store:
+            diag = Engine(cfg).run(store, only=["CPU-SATURATION-01"])
+
+        assert sum("collect失敗" in n for n in diag.quality.notes) == 1
 
 
 def _fake_sysfs(root: Path) -> Path:
@@ -640,3 +717,95 @@ class TestWatchDirStaysOnItsFileSystem:
 
         assert is_estimate == 0
         assert size < 8 * _MiB
+
+
+_NAMED_AFTER_THE_DISK_NUMBER = [
+    ("sdp", "sdp1"),
+    ("vdp", "vdp2"),
+    ("xvdp", "xvdp1"),
+    ("sdap", "sdap1"),
+]
+
+
+class TestPartitionsOfADiskWhoseNameEndsInPAreNotDisks:
+    @pytest.mark.parametrize("disk, part", _NAMED_AFTER_THE_DISK_NUMBER)
+    def test_system_io_through_the_partition_is_counted_once(
+        self, tmp_path, monkeypatch, disk, part
+    ):
+        sys_root = tmp_path / "sys"
+        (sys_root / "block" / disk).mkdir(parents=True)
+        disks = _Disks(**{disk: (1000, 2000), part: (900, 1900)})
+
+        got = _disk_delta(
+            _ctx(sys_root=sys_root),
+            disks,
+            monkeypatch,
+            **{disk: (4096, 8192), part: (4096, 8192)},
+        )
+
+        assert got == (4096, 8192)
+
+    @pytest.mark.parametrize("disk, part", _NAMED_AFTER_THE_DISK_NUMBER)
+    def test_cgroup_io_of_an_lvm_volume_on_the_partition_is_counted_once(
+        self, tmp_path, disk, part
+    ):
+        sys_root = tmp_path / "sys"
+        block, by_number = sys_root / "block", sys_root / "dev" / "block"
+        (block / disk).mkdir(parents=True)
+        (block / "dm-0" / "slaves").mkdir(parents=True)
+        (block / "dm-0" / "slaves" / part).touch()
+        by_number.mkdir(parents=True)
+        (by_number / "8:240").symlink_to(f"../../block/{disk}")
+        (by_number / "252:0").symlink_to("../../block/dm-0")
+        io = _CgroupIo(tmp_path, sys_root)
+        stat = {"8:240": (1_000_000, 2_000_000), "252:0": (990_000, 1_990_000)}
+        io.tick(stat)
+
+        assert io.tick(_bumped(stat, "8:240", "252:0")) == (4096, 8192)
+
+    @pytest.mark.parametrize(
+        "name, listed, expected",
+        [
+            ("sda1", ["sda"], True),
+            ("sdp1", ["sdp"], True),
+            ("xvdp12", ["xvdp"], True),
+            ("nvme0n1p1", ["nvme0n1"], True),
+            ("nvme0n1p10", ["nvme0n1"], True),
+            ("mmcblk0p2", ["mmcblk0"], True),
+            ("md0p1", ["md0"], True),
+            ("sdp1", ["sd"], False),
+            ("sdap1", ["sda"], False),
+            ("sdp", ["sdp"], False),
+            ("md10", ["md1"], False),
+            ("loop10", ["loop1"], False),
+            ("nvme0n11", ["nvme0n1"], False),
+            ("mmcblk0boot0", ["mmcblk0"], False),
+            ("sda1", ["sdb"], False),
+        ],
+    )
+    def test_a_partition_is_named_after_its_disk_and_a_number(
+        self, name, listed, expected
+    ):
+        assert is_partition(name, set(listed)) is expected
+
+
+class TestDiskIoDoesNotJumpWhenAListingIsEmptyForATick:
+    def test_psutil_listing_no_disk_for_one_tick_is_not_io(self, tmp_path, monkeypatch):
+        ctx = _ctx(sys_root=_fake_sysfs(tmp_path / "sys"))
+        disks = _Disks(sda=(100 * _GiB, 0), **{"dm-0": (90 * _GiB, 0)})
+        sampler = _system_sampler(ctx, disks, monkeypatch)
+
+        listed, disks.counters = disks.counters, {}
+        assert _tick(sampler, ctx) == (0, 0)
+        disks.counters = listed
+
+        assert _tick(sampler, ctx) == (0, 0)
+
+    def test_an_io_stat_with_no_device_for_one_tick_is_not_io(self, tmp_path):
+        io = _CgroupIo(tmp_path, _fake_sysfs(tmp_path / "sys"))
+        stat = {"8:0": (10 * _GiB, 0), "252:0": (9 * _GiB, 0)}
+        io.tick(stat)
+
+        io.tick({})
+
+        assert io.tick(stat) == (0, 0)
