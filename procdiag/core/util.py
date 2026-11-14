@@ -291,15 +291,8 @@ class CounterDelta:
         in a delta of their sum.  A name that appears after the first call counts
         from 0, because a new device's counters start there.  Returns ``None`` on
         the first call for *key*.
-
-        An empty *values* after a call that had names is a listing that could not
-        be read this time: it returns ``None`` and keeps the baselines, so the
-        names that come back are differenced against what they counted before,
-        not from 0.
         """
         prev = self._prev_each.get(key)
-        if prev and not values:
-            return None
         self._prev_each[key] = dict(values)
         if prev is None:
             return None

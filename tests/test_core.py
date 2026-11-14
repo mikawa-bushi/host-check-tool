@@ -422,17 +422,3 @@ def test_counter_delta_each_a_name_that_comes_and_goes_does_not_move_the_others(
         "sda": 0,  # counter reset
         "loop0": 10,
     }
-
-
-def test_counter_delta_each_an_empty_listing_leaves_the_baselines_in_place():
-    from procdiag.core.util import CounterDelta
-
-    d = CounterDelta()
-    d.update_each("disks", {"sda": 100, "loop0": 7_000})
-    assert (
-        d.update_each("disks", {}) is None
-    )  # nothing listed: no delta, no baseline lost
-    assert d.update_each("disks", {"sda": 130, "loop0": 7_000}) == {
-        "sda": 30,
-        "loop0": 0,
-    }

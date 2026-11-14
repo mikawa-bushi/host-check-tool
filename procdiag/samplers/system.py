@@ -276,11 +276,15 @@ class SystemSampler(Sampler):
         Each device is differenced on its own and only then added up, so a
         device that starts or stops counting (a loop device attached or
         detached, a sysfs entry unreadable for a moment) is not I/O.  Returns
-        ``(0, 0)`` on the first call or if counters are unavailable.
+        ``(0, 0)`` on the first call or if counters are unavailable.  An empty
+        listing is no counters: it leaves the baselines in place, so the disks
+        that come back are not counted from 0.
         """
         try:
-            per_disk = psutil.disk_io_counters(perdisk=True) or {}
+            per_disk = psutil.disk_io_counters(perdisk=True)
         except (AttributeError, OSError):
+            return 0, 0
+        if not per_disk:
             return 0, 0
         read = self._deltas.update_each(
             "disk_read", {n: c.read_bytes for n, c in per_disk.items()}
