@@ -9,11 +9,12 @@ Currently implements:
 
 - **CPU-SINGLECORE-01**: Detect single-core saturation — episodes where the
   busiest core is at ≥ 95% while the rest of the CPU is quiet (total CPU below
-  ``avg_pct_max``, raised on hosts with fewer than 4 CPUs) for ≥ 15 consecutive
-  minutes.  A minute counts when that held for half of it, judged per second
-  from ``sys_samples`` where they remain and from ``sys_rollup_1m`` elsewhere.
-  Cross-references ``proc_rollup_1m`` to name the process that used the most
-  CPU during the episode and appends a py-spy suggestion for Python processes.
+  ``avg_pct_max``, raised on a host recorded with fewer than 4 CPUs) for ≥ 15
+  consecutive minutes.  A minute counts when that held for half of it, judged
+  per second from ``sys_samples``; minutes only ``sys_rollup_1m`` covers are not
+  judged.  Cross-references ``proc_rollup_1m`` to name the process that used the
+  most CPU during the episode and appends a py-spy suggestion for Python
+  processes.
 
 - **CPU-SATURATION-01**: Detect system-wide CPU pressure — sustained episodes
   where ``psi_cpu_some10`` > 20 for ≥ 15 consecutive minutes, a minute counting
@@ -26,7 +27,6 @@ Design doc reference: §6.2 CPU-PERIODIC-01 / CPU-SINGLECORE-01 / CPU-SATURATION
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 from ..core import (
@@ -38,8 +38,8 @@ from ..core import (
     register,
 )
 from ..spikes import culprits
-from .episodes import MINUTE, held, sample_interval, sustained_minutes
-from .trend import detect_periodicity, find_sustained_episodes
+from .episodes import MINUTE, sustained_minutes
+from .trend import detect_periodicity
 
 if TYPE_CHECKING:
     from ..storage import Storage
@@ -55,10 +55,6 @@ _CPU_SINGLECORE_MIN_MINUTES: int = 15
 # at least this many CPUs; fewer CPUs make the pinned core a bigger share, and
 # the limit rises by the difference.
 _CPU_SINGLECORE_REFERENCE_CPUS: int = 4
-# A rollup minute carries only the busiest second's core and the minute's
-# average, so it counts when the average alone shows at least this share of a
-# core busy: one busy second adds only 1/60 of a core to it.
-_CPU_SINGLECORE_ROLLUP_CORE_SHARE: float = 0.5
 
 _CPU_PERIODIC_WARNING_COUNT: int = 5
 
@@ -175,11 +171,13 @@ class CpuPeriodicRule(Rule):
 class CpuSinglecoreRule(Rule):
     """Detect single-core saturation with the rest of the CPU quiet.
 
-    A minute is saturated when the busiest core was at ≥ 95% and the total CPU
-    stayed below the ceiling for half of it, judged per second from
-    ``sys_samples`` where they remain.  Minutes only ``sys_rollup_1m`` still
-    covers are judged from its columns (see ``_rollup_saturated``).  Fires for
-    each run of ``min_consecutive_minutes`` such minutes and cross-references
+    A minute is saturated when, for half of it, the busiest core was at ≥ 95%
+    and the total CPU was below the ceiling, judged per second from
+    ``sys_samples``.  ``sys_rollup_1m`` keeps the busiest core of the single
+    busiest second and the minute's average, so it cannot tell one busy second
+    from a sustained minute; minutes only the rollup covers are not judged (the
+    rule is listed as evaluated on the raw part only).  Fires for each run of
+    ``min_consecutive_minutes`` such minutes and cross-references
     ``proc_rollup_1m`` to name the top offender and flag Python processes.
     """
 
@@ -188,13 +186,12 @@ class CpuSinglecoreRule(Rule):
     title = "シングルコア飽和"
     default_severity = Severity.WARNING
     min_observation_hours = 0.0
-    requires_rows = ("sys_rollup_1m",)
+    requires_rows = ("sys_samples",)
     what = (
-        "最も忙しいコアが 95% 以上で CPU 全体が cpu_avg 未満 (50%。CPU が 4 個より"
-        "少ないホストでは 1 コア分が占める割合の違いだけ引き上げる) の秒が"
+        "最も忙しいコアが 95% 以上で CPU 全体が cpu_avg 未満 (50%。記録した CPU 数が"
+        "4 個より少ないホストでは、1 コア分が占める割合の違いだけ引き上げる) の秒が"
         "1 分の半分以上を占める分を数え、15分以上連続したらプロセスを突合する。"
-        "生データが残っていない時間帯は 1 分集計 (その分で最も忙しかった秒のコア・"
-        "全体の平均) で判定し、平均が 1 コアの半分に満たない分は数えない"
+        "生データ (sys_samples) の無い時間帯は判定しない"
     )
     why = (
         "シングルコア飽和はマルチコアシステムで見落とされやすい。"
@@ -212,35 +209,33 @@ class CpuSinglecoreRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run CPU-SINGLECORE-01 against the observation window."""
-        sys_rows = store.rows(
-            "sys_rollup_1m",
-            since=window.start_ts,
-            until=window.end_ts,
-        )
-        if not sys_rows:
-            return []
         raw_rows = store.rows(
             "sys_samples",
             since=window.start_ts,
             until=window.end_ts,
         )
-
-        ncpu = _cpu_count_floor(raw_rows, sys_rows)
-        if ncpu < 2:
+        if not raw_rows:
             return []
-        avg_limit = self.avg_pct_max + max(
-            0.0, 100.0 / ncpu - 100.0 / _CPU_SINGLECORE_REFERENCE_CPUS
-        )
 
-        saturated, minute_stats = self._saturated_minutes(
-            raw_rows, sys_rows, ncpu, avg_limit
-        )
-        saturated_episodes = find_sustained_episodes(
+        ncpu = _recorded_cpu_count(store)
+        if ncpu == 1:
+            return []
+        avg_limit = self.avg_pct_max
+        if ncpu:
+            avg_limit += max(0.0, 100.0 / ncpu - 100.0 / _CPU_SINGLECORE_REFERENCE_CPUS)
+
+        saturated_episodes = sustained_minutes(
             [
-                (minute, float(minute), saturated[minute])
-                for minute in sorted(saturated)
+                (
+                    row["ts"],
+                    row["cpu_max_core"] is not None
+                    and row["cpu_total"] is not None
+                    and row["cpu_max_core"] >= self.core_pct_threshold
+                    and row["cpu_total"] < avg_limit,
+                )
+                for row in raw_rows
             ],
-            min_consecutive=self.min_consecutive_minutes,
+            min_minutes=self.min_consecutive_minutes,
         )
 
         if not saturated_episodes:
@@ -274,15 +269,13 @@ class CpuSinglecoreRule(Rule):
                 if "python" in name.lower():
                     has_python = True
 
-            ep_stats = [
-                stats
-                for minute, stats in minute_stats.items()
-                if ep_start <= minute <= ep_end
+            ep_rows = [r for r in raw_rows if ep_start <= r["ts"] < ep_end + MINUTE]
+            cores = [
+                r["cpu_max_core"] for r in ep_rows if r["cpu_max_core"] is not None
             ]
-            core_values = [core for core, _ in ep_stats if core is not None]
-            avg_values = [avg for _, avg in ep_stats if avg is not None]
-            core_max_val = max(core_values, default=self.core_pct_threshold)
-            cpu_avg_val = sum(avg_values) / len(avg_values) if avg_values else 0.0
+            totals = [r["cpu_total"] for r in ep_rows if r["cpu_total"] is not None]
+            core_max_val = max(cores, default=self.core_pct_threshold)
+            cpu_avg_val = sum(totals) / len(totals) if totals else 0.0
             duration_minutes = round((ep_end - ep_start) / 60.0) + 1
 
             subject = top_process_names[0] if top_process_names else "不明"
@@ -291,13 +284,14 @@ class CpuSinglecoreRule(Rule):
                 "core_max_pct": round(core_max_val, 1),
                 "cpu_avg_pct": round(cpu_avg_val, 1),
                 "cpu_avg_limit_pct": round(avg_limit, 1),
-                "cpu_count_estimate": ncpu,
                 "duration_minutes": duration_minutes,
                 "top_processes": top_process_names,
                 "has_python_process": has_python,
                 "episode_start": ep_start,
                 "episode_end": ep_end,
             }
+            if ncpu:
+                evidence["cpu_count"] = ncpu
 
             summary = (
                 f"シングルコア飽和: cpu_max_core={core_max_val:.0f}%"
@@ -322,91 +316,19 @@ class CpuSinglecoreRule(Rule):
 
         return findings
 
-    def _saturated_minutes(
-        self, raw_rows, rollup_rows, ncpu: int, avg_limit: float
-    ) -> tuple[dict[int, bool], dict[int, tuple[float | None, float | None]]]:
-        """Per minute: whether it was saturated, and (busiest core, average CPU).
 
-        A minute that ``sys_samples`` covers for at least half of it is judged
-        per second; every other minute ``sys_rollup_1m`` has is judged from the
-        rollup row.
-        """
-        interval = sample_interval([row["ts"] for row in raw_rows])
-        by_minute: dict[int, list] = {}
-        for row in raw_rows:
-            by_minute.setdefault(int(row["ts"] // MINUTE) * int(MINUTE), []).append(row)
+def _recorded_cpu_count(store: "Storage") -> int | None:
+    """The CPU count the recorder wrote into ``meta``; None when it did not.
 
-        saturated: dict[int, bool] = {}
-        stats: dict[int, tuple[float | None, float | None]] = {}
-        for minute, rows in by_minute.items():
-            if not held(len(rows), interval):
-                continue
-            pinned = sum(
-                row["cpu_max_core"] is not None
-                and row["cpu_total"] is not None
-                and row["cpu_max_core"] >= self.core_pct_threshold
-                and row["cpu_total"] < avg_limit
-                for row in rows
-            )
-            cores = [r["cpu_max_core"] for r in rows if r["cpu_max_core"] is not None]
-            totals = [r["cpu_total"] for r in rows if r["cpu_total"] is not None]
-            saturated[minute] = held(pinned, interval)
-            stats[minute] = (
-                max(cores, default=None),
-                sum(totals) / len(totals) if totals else None,
-            )
-
-        from_raw = set(saturated)
-        for row in rollup_rows:
-            minute = int(row["ts_min"] // MINUTE) * int(MINUTE)
-            if minute in from_raw:
-                continue
-            core, avg = row["cpu_max_core_max"], row["cpu_avg"]
-            judged = self._rollup_saturated(core, avg, ncpu, avg_limit)
-            if judged or minute not in saturated:
-                saturated[minute] = judged
-                stats[minute] = (core, avg)
-        return saturated, stats
-
-    def _rollup_saturated(
-        self, core: float | None, avg: float | None, ncpu: int, avg_limit: float
-    ) -> bool:
-        """Judge a minute from ``cpu_max_core_max`` and ``cpu_avg`` alone.
-
-        The rollup keeps the busiest core of the single busiest second and the
-        average total CPU of the minute, so ``core >= threshold`` can be one
-        second.  A core busy for ``s`` seconds of the minute adds ``s / 60`` of
-        a core to the average, so the average must be at least half a core:
-        one busy second never reaches it, while half a minute of a pinned core
-        does.  Other load adds to the average too, which can let a minute of
-        short bursts on a busy host through, but never a quiet one.
-        """
-        if core is None or avg is None:
-            return False
-        core_share_floor = _CPU_SINGLECORE_ROLLUP_CORE_SHARE * 100.0 / ncpu
-        return core >= self.core_pct_threshold and core_share_floor <= avg < avg_limit
-
-
-def _cpu_count_floor(raw_rows, rollup_rows) -> int:
-    """The CPU count the recording itself proves is at least there.
-
-    The database does not store the CPU count.  One sample's busiest core cannot
-    exceed the CPU total times the CPU count, so ``cpu_max_core / cpu_total`` is
-    at most the count for every sample (and ``cpu_max_core_max / cpu_max`` for a
-    rollup minute).  The largest ratio is the tightest bound; it reaches the
-    count whenever one core was busy while the rest were idle, the very
-    situation this rule looks for.  1 when no row tells.
+    Recordings made before the count was written have none, and the rule then
+    keeps ``avg_pct_max`` as it is: a count guessed from the samples can fall
+    short on a busy host and loosen the limit.
     """
-    best = 1.0
-    for row in raw_rows:
-        core, total = row["cpu_max_core"], row["cpu_total"]
-        if core is not None and total:
-            best = max(best, core / total)
-    for row in rollup_rows:
-        core, total = row["cpu_max_core_max"], row["cpu_max"]
-        if core is not None and total:
-            best = max(best, core / total)
-    return max(1, math.ceil(best - 1e-6))
+    try:
+        count = int(store.meta().get("cpu_count", ""))
+    except ValueError:
+        return None
+    return count if count >= 1 else None
 
 
 # ---------------------------------------------------------------------------
