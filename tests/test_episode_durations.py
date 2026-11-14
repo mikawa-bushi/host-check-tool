@@ -242,6 +242,20 @@ def _rollup_row(ts_min, ncpu, pinned, *, rest=2.0):
     )
 
 
+def _proc_rollup(ts_min, proc_id, *, avg, peak):
+    return make_row(
+        "proc_rollup_1m",
+        ts_min=ts_min,
+        proc_id=proc_id,
+        cpu_avg=avg,
+        cpu_max=peak,
+        rss_avg=100 * _MiB,
+        rss_max=100 * _MiB,
+        fds_max=4,
+        threads_max=2,
+    )
+
+
 class TestSinglecoreEpisodes:
     @staticmethod
     def _recorded(tmp_path, ncpu, seconds, pinned, *, rollup=True):
@@ -326,6 +340,22 @@ class TestSinglecoreEpisodes:
         (f,) = _run(store, "CPU-SINGLECORE-01")
 
         assert f.evidence["duration_minutes"] == 20
+        store.close()
+
+    def test_the_process_busy_throughout_is_named_not_one_that_peaked_once(
+        self, tmp_path
+    ):
+        store = self._recorded(tmp_path, 4, 1800, lambda i: True)
+        _register(store, "blip", "pinned")
+        rows = [_proc_rollup(_T0, 1, avg=1.7, peak=100.0)]
+        rows += [_proc_rollup(_T0 + 60 * m, 2, avg=99.0, peak=100.0) for m in range(30)]
+        store.buffer("proc_rollup_1m", rows)
+        store.flush(reason="synth")
+
+        (f,) = _run(store, "CPU-SINGLECORE-01")
+
+        assert f.subject == "pinned"
+        assert f.evidence["top_processes"][0] == "pinned"
         store.close()
 
     def test_a_recording_gap_ends_the_episode(self, tmp_path):
