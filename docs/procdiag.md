@@ -194,7 +194,7 @@ host-check-tool/
 │   ├── bundle.py         # 持ち出し用バンドル (procdiag bundle)
 │   ├── status.py         # 記録 DB の概況 (status / bundle で共用)
 │   ├── systemd.py        # systemctl / timedatectl / journalctl の読み取り専用ラッパー
-│   ├── kernlog.py        # カーネルログ (journalctl -k) の異常行の分類
+│   ├── kernlog.py        # カーネルログ (journal のカーネルの行) の異常行の分類
 │   ├── export.py         # CSV / JSON エクスポート
 │   ├── service.py        # systemd ユニット生成
 │   ├── report.py         # terminal / JSON / HTML+SVG レポート生成
@@ -279,9 +279,13 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
 
 - `ServiceSampler`: systemd が数える自動再起動回数 (`NRestarts`) の増加と failed 遷移だけを
   `service_events` に記録する (cgroup の作り直しは timer 起動の oneshot でも起きるため使わない)。
-- `KernelLogSampler`: `journalctl -k` を前回の続き (cursor) から読み、I/O エラー・FS エラー・
+- `KernelLogSampler`: journal のカーネルの行を前回の続き (cursor) から読み、I/O エラー・FS エラー・
   ハングタスク・MCE・segfault・USB 切断・温度制限の行だけを `kernel_events` に記録する。
+  cursor は記録した行と同じフラッシュで `meta` の `kernel_log_cursor` に保存し、同じ DB への
+  次の `record` はその続きから読む。記録を止めていた間の行と、再起動・電源断の前のブートの
+  最後の行も、journal に残っていれば記録される。
   読み取りには root または systemd-journal / adm グループが必要。
+- どちらも停止するときにもう一度読む。前回の読み取りから停止までの最大 5 分の出来事も残る。
 
 ### 記録セッション
 

@@ -43,6 +43,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Samplers that record what happened since their previous read (up to one
+# 5-minute interval ago): stopping reads them once more to keep that tail.
+_EVENT_SAMPLERS = ("service", "kernel_log")
+
 
 class Recorder:
     """Resident record loop for procdiag.
@@ -153,7 +157,10 @@ class Recorder:
         """
         from .samplers.cgroup import CgroupSampler  # type: ignore[import]
         from .samplers.disk import DiskSampler  # type: ignore[import]
-        from .samplers.kernel_log import KernelLogSampler  # type: ignore[import]
+        from .samplers.kernel_log import (  # type: ignore[import]
+            CURSOR_KEY,
+            KernelLogSampler,
+        )
         from .samplers.process import ProcessSampler  # type: ignore[import]
         from .samplers.service import ServiceSampler  # type: ignore[import]
         from .samplers.system import SystemSampler  # type: ignore[import]
@@ -169,7 +176,7 @@ class Recorder:
             "disk": DiskSampler(),
             "thermal": ThermalSampler(),
             "service": ServiceSampler(),
-            "kernel_log": KernelLogSampler(),
+            "kernel_log": KernelLogSampler(cursor=self._storage.meta().get(CURSOR_KEY)),
         }
 
     def _build_trigger(self) -> Any:
@@ -528,6 +535,8 @@ class Recorder:
 
         # Graceful shutdown.
         try:
+            for name in _EVENT_SAMPLERS:
+                self._run_sampler(name)
             self._storage.flush(reason="signal")
             # Roll up the just-flushed final samples so the last (up to one
             # flush-interval + 1 min) of raw data is promoted to *_rollup_1m

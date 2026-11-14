@@ -548,19 +548,25 @@ class TestKernelLogSampler:
 
         calls = []
 
-        def fake_read(*, since=None, after_cursor=None):
-            calls.append((since is not None, after_cursor))
-            return [KernelEvent(1.0, "io_error", "I/O error")], "c1"
+        def fake_read(*, after_cursor):
+            calls.append(after_cursor)
+            return [KernelEvent(1.0, "io_error", "I/O error")], f"{after_cursor}+"
 
-        monkeypatch.setattr(kl_mod.kernlog, "journal_readable", lambda: True)
+        monkeypatch.setattr(kl_mod.kernlog, "newest_cursor", lambda: "newest")
         monkeypatch.setattr(kl_mod.kernlog, "read_events", fake_read)
-        sampler = kl_mod.KernelLogSampler()
         ctx = _make_ctx()
+        sampler = kl_mod.KernelLogSampler()
         sampler.setup(ctx)
-        (batch,) = sampler.collect(ctx)
+        batches = sampler.collect(ctx)
         sampler.collect(ctx)
-        assert batch.rows == [(1.0, "io_error", "I/O error")]
-        assert calls == [(True, None), (False, "c1")]
+        resumed = kl_mod.KernelLogSampler(cursor="stored")
+        resumed.setup(ctx)
+        resumed.collect(ctx)
+        assert [(b.table, b.rows) for b in batches] == [
+            ("meta", [("kernel_log_cursor", "newest+")]),
+            ("kernel_events", [(1.0, "io_error", "I/O error")]),
+        ]
+        assert calls == ["newest", "newest+", "stored"]
 
 
 # ---------------------------------------------------------------------------

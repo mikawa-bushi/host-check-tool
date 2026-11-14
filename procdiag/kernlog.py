@@ -1,4 +1,4 @@
-"""Kernel-log anomaly reader (``journalctl -k``) shared by recorder, snapshot and rules.
+"""Kernel-log anomaly reader (the journal's kernel lines) for recorder, snapshot, rules.
 
 Production-floor PCs "freeze" or "fall over" for reasons that only the kernel
 log states plainly: a failing disk (I/O errors, a filesystem remounted
@@ -133,10 +133,13 @@ def read_events(
     *after_cursor* resumes exactly after a previous read (no duplicates);
     otherwise *since* (epoch seconds) bounds the start.  *until* bounds the
     end.  Times are passed as ``@epoch`` so the host's time zone cannot shift
-    the range.  ``events`` is None when the journal cannot be read at all (no
-    journalctl, no permission).
+    the range.  Earlier boots are included: ``-k`` would limit the read to the
+    running boot and hide the lines logged before a reboot or a power loss.
+    ``events`` is None when the journal cannot be read at all (no journalctl,
+    no permission).
     """
-    args = ["journalctl", "-k", "-q", "--no-pager", "-o", "short-unix", "--show-cursor"]
+    args = ["journalctl", "_TRANSPORT=kernel", "-q", "--no-pager"]
+    args += ["-o", "short-unix", "--show-cursor"]
     if after_cursor:
         args += ["--after-cursor", after_cursor]
     elif since is not None:
@@ -154,3 +157,12 @@ def journal_readable() -> bool:
     """Whether this process can read kernel messages from the journal."""
     out = run(["journalctl", "-k", "-n", "1", "-q", "--no-pager"])
     return bool(out and out.strip())
+
+
+def newest_cursor() -> Optional[str]:
+    """Cursor of the newest kernel message; None when the journal is unreadable."""
+    out = run(
+        ["journalctl", "_TRANSPORT=kernel", "-n", "1", "-q", "--no-pager"]
+        + ["-o", "short-unix", "--show-cursor"]
+    )
+    return parse_short_unix(out)[1] if out else None
