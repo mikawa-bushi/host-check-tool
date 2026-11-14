@@ -194,6 +194,25 @@ def _daily(minute_of_day, length, total_minutes, last_day=99):
     }
 
 
+def _windows(start_minute, minutes, windows):
+    """Recording minute -> pressure for ``(day, minute_of_day, length)`` windows.
+
+    *start_minute* is where the recording starts, in minutes after the local
+    midnight of day 0.
+    """
+    pressure = {}
+    for day, minute_of_day, length in windows:
+        first = day * 1440 + minute_of_day - start_minute
+        for i in range(first, first + length):
+            if 0 <= i < minutes:
+                pressure[i] = 9.0
+    return pressure
+
+
+def _nights(first_day=-1, last_day=9):
+    return [(d, 2 * 60, 2 * 60) for d in range(first_day, last_day + 1)]
+
+
 class TestMemPressure:
     def test_one_pressure_minute_and_a_stray_swap_out_is_not_chronic(
         self, tmp_path, local_tz
@@ -374,7 +393,13 @@ class TestMemPressure:
 
     @pytest.mark.parametrize(
         "days, observed, fires",
-        [((0, 1), 4, False), ((0, 1, 2), 4, True), ((0, 1), 3, True)],
+        [
+            ((0, 1), 4, False),
+            ((0, 1, 2), 4, True),
+            ((0, 1), 3, True),
+            ((0, 1, 2), 5, True),
+            ((0, 1, 2, 3), 7, False),
+        ],
     )
     def test_pressure_days_must_be_most_of_the_observed_days(
         self, tmp_path, local_tz, days, observed, fires
@@ -398,12 +423,170 @@ class TestMemPressure:
         store.close()
 
 
+class TestMemPressureThresholds:
+    @pytest.mark.parametrize("psi, fires", [(5.0, False), (5.1, True)])
+    def test_a_pressure_minute_is_psi_above_five(self, tmp_path, local_tz, psi, fires):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {m: psi for m in _daily(14 * 60, 30, minutes)}
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+        assert bool(_run(store, "MEM-PRESSURE-01")) is fires
+        store.close()
+
+    @pytest.mark.parametrize(
+        "start_minute, observed_days", [(18 * 60, 3), (18 * 60 + 1, 2)]
+    )
+    def test_an_edge_day_needs_six_hours_of_psi_rows_to_count(
+        self, tmp_path, local_tz, start_minute, observed_days
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = (1440 - start_minute) + 2 * 1440
+        pressure = _windows(start_minute, minutes, [(1, 14 * 60, 30), (2, 14 * 60, 30)])
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_minute * 60,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["n_total_days"] == observed_days
+        assert f.evidence["n_pressure_days"] == 2
+        store.close()
+
+
+class TestMemPressureSliverDays:
+    """A day with under six hours of PSI rows is a day only when it holds the pressure."""
+
+    @pytest.mark.parametrize("start_minute", range(0, 1440, 30))
+    def test_nightly_pressure_is_found_wherever_a_two_day_recording_starts(
+        self, tmp_path, local_tz, start_minute
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 48 * 60
+        pressure = _windows(start_minute, minutes, _nights())
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_minute * 60,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        found = _run(store, "MEM-PRESSURE-01")
+
+        clock = f"{start_minute // 60:02d}:{start_minute % 60:02d}"
+        assert len(found) == 1, f"recording from {clock} was judged healthy"
+        assert found[0].evidence["n_pressure_days"] >= 2
+        store.close()
+
+    def test_the_sliver_that_holds_a_night_is_a_pressure_day(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        start_minute = 4 * 60
+        minutes = 48 * 60
+        pressure = _windows(start_minute, minutes, _nights())
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_minute * 60,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["n_total_days"] == 3
+        assert f.evidence["n_pressure_days"] == 2
+        assert f.confidence == Confidence.MEDIUM
+        store.close()
+
+    @pytest.mark.parametrize(
+        "run, swap_out, counted",
+        [(10, 8 * _MiB, True), (9, 8 * _MiB, False), (10, 0, False)],
+    )
+    def test_a_sliver_counts_only_for_a_sustained_run_with_swap_out(
+        self, tmp_path, local_tz, run, swap_out, counted
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        start_minute = 20 * 60
+        minutes = 55 * 60
+        full_days = _windows(
+            start_minute, minutes, [(1, 14 * 60, 30), (2, 14 * 60, 30)]
+        )
+        sliver = _windows(start_minute, minutes, [(3, 60, run)])
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_minute * 60,
+            minutes,
+            pressure={**full_days, **sliver},
+            swap_out={
+                **{m: 8 * _MiB for m in full_days},
+                **{m: swap_out for m in sliver},
+            },
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        expected = 3 if counted else 2
+        assert f.evidence["n_total_days"] == expected
+        assert f.evidence["n_pressure_days"] == expected
+        store.close()
+
+    @pytest.mark.parametrize("start_minute", range(0, 1440, 30))
+    def test_a_day_short_of_observation_is_never_a_promise_that_cannot_be_kept(
+        self, tmp_path, local_tz, start_minute
+    ):
+        local_tz("JST-9")
+        engine = Engine(ProcdiagConfig())
+        start = _local_midnight_jst() + start_minute * 60
+
+        def recording(path, minutes):
+            path.mkdir()
+            store = make_db(path)
+            pressure = _windows(start_minute, minutes, _nights())
+            _pressure_recording(
+                store,
+                start,
+                minutes,
+                pressure=pressure,
+                swap_out={m: 2 * _MiB for m in pressure},
+            )
+            return store
+
+        store = recording(tmp_path / "short", 24 * 60)
+        diag = engine.run(store, only=["MEM-PRESSURE-01"])
+        store.close()
+        if not diag.skipped_rules:
+            assert diag.evaluated_rules == ["MEM-PRESSURE-01"]
+            return
+        (skipped,) = diag.skipped_rules
+
+        longer = int(24 * 60 + skipped.remaining_hours * 60) + 1
+        store = recording(tmp_path / "longer", longer)
+        again = engine.run(store, only=["MEM-PRESSURE-01"])
+        store.close()
+        assert again.evaluated_rules == ["MEM-PRESSURE-01"]
+
+
 class TestMemPressureNeedsObservedDays:
-    def _all_day_pressure(self, tmp_path, start, hours):
+    def _all_day_pressure(self, tmp_path, start, hours, quiet_hours=0):
         tmp_path.mkdir(exist_ok=True)
         store = make_db(tmp_path)
         minutes = int(hours * 60)
-        pressure = {m: 20.0 for m in range(minutes)}
+        pressure = {m: 20.0 for m in range(quiet_hours * 60, minutes)}
         _pressure_recording(
             store,
             start,
@@ -415,7 +598,9 @@ class TestMemPressureNeedsObservedDays:
 
     def test_one_observed_day_is_not_evaluable_not_healthy(self, tmp_path, local_tz):
         local_tz("JST-9")
-        store = self._all_day_pressure(tmp_path, _local_midnight_jst() + 20 * 3600, 24)
+        store = self._all_day_pressure(
+            tmp_path, _local_midnight_jst() + 20 * 3600, 24, quiet_hours=4
+        )
 
         diag = Engine(ProcdiagConfig()).run(store, only=["MEM-PRESSURE-01"])
 
@@ -426,6 +611,18 @@ class TestMemPressureNeedsObservedDays:
         assert skipped.required_hours == pytest.approx(
             diag.quality.span_hours + 10.0, abs=0.1
         )
+        store.close()
+
+    def test_pressure_in_the_edge_sliver_is_enough_to_evaluate(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = self._all_day_pressure(tmp_path, _local_midnight_jst() + 20 * 3600, 24)
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["n_total_days"] == 2
+        assert f.evidence["n_pressure_days"] == 2
         store.close()
 
     def test_two_observed_days_are_evaluated(self, tmp_path, local_tz):
