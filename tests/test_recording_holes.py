@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from datetime import datetime
@@ -9,8 +10,10 @@ from click.testing import CliRunner
 from synth import add_sys_baseline, make_db
 
 from procdiag.cli import cli
-from procdiag.config import ProcdiagConfig
+from procdiag.config import ProcdiagConfig, SamplingConfig
+from procdiag.core import Confidence, Window
 from procdiag.diagnosis import Engine
+from procdiag.storage import make_row
 
 _MB = 1024 * 1024
 _HOUR = 3600.0
@@ -54,6 +57,67 @@ def _record(
 
 def _minute_now() -> float:
     return time.time() // 60 * 60
+
+
+def _sys_rows(store, start: float, end: float, step: float) -> None:
+    """System rows every *step* seconds in [start, end), with their rollups."""
+    stamps = [start + k * step for k in range(int((end - start) / step))]
+    store.buffer(
+        "sys_samples",
+        [
+            make_row(
+                "sys_samples",
+                ts=ts,
+                cpu_total=5.0,
+                cpu_max_core=7.0,
+                mem_used=2 << 30,
+                mem_available=6 << 30,
+                swap_used=0,
+                swap_in=0,
+                swap_out=0,
+                load1=0.1,
+                psi_cpu_some10=0.0,
+                psi_mem_some10=0.0,
+                psi_mem_full10=0.0,
+                psi_io_some10=0.0,
+                psi_io_full10=0.0,
+                disk_read_bytes=0,
+                disk_write_bytes=0,
+                self_cpu=0.1,
+                self_rss=40 * _MB,
+            )
+            for ts in stamps
+        ],
+    )
+    minutes = sorted({ts // 60 * 60 for ts in stamps})
+    store.buffer(
+        "sys_rollup_1m",
+        [(m, 5.0, 7.0, 5.0, 7.0, 2 << 30, 2 << 30, 0.0, 0.0, 0.0, 0) for m in minutes],
+    )
+    store.flush(reason="synth")
+
+
+def _proc_samples(store, proc_id: int, stamps, *, pss_mb=None) -> None:
+    store.buffer(
+        "proc_samples",
+        [
+            make_row(
+                "proc_samples",
+                ts=ts,
+                proc_id=proc_id,
+                pid=4242,
+                cpu_pct=1.0,
+                rss=200 * _MB,
+                pss=None if pss_mb is None else int(pss_mb * _MB),
+                num_threads=24,
+                num_fds=48,
+                io_read_delta=0,
+                io_write_delta=0,
+            )
+            for ts in stamps
+        ],
+    )
+    store.flush(reason="synth")
 
 
 class TestRecordingHoles:
@@ -158,6 +222,116 @@ class TestRecordingHoles:
         rows = result.stdout.split("結果:")[0]
         assert "解消" not in rows
         assert "修正後の期間 2.0 時間は修正前の 24.0 時間より短い" in rows
+        header = result.stdout.split("時刻はこのホストのローカルタイム")[0]
+        assert "  2.0 時間 (うち生データ 2.0 時間)" in header
+        assert f"{_local(at + 59 * 60)} 〜 {_local(now - _HOUR)}" in header
+        data = json.loads(
+            CliRunner()
+            .invoke(
+                cli, ["compare", str(before.path), str(after.path), "--format", "json"]
+            )
+            .stdout
+        )
+        assert data["after"]["span_hours"] == pytest.approx(118 / 60)
+        assert data["after"]["raw_hours"] == pytest.approx(118 / 60)
+
+    def test_a_recording_sampled_every_six_minutes_has_no_holes(self, tmp_path):
+        now = _minute_now()
+        start = now - 12 * _HOUR
+        store = make_db(tmp_path, hours=12)
+        config = ProcdiagConfig(sampling=SamplingConfig(system_interval=360))
+        store.set_meta("config", config.model_dump_json())
+        _sys_rows(store, start, now, 360.0)
+        proc_id = _register(store, "plc-gateway", start)
+        store.buffer(
+            "proc_rollup_1m",
+            [
+                (ts, proc_id, 1.0, 1.0, int((200 + 20 * h) * _MB), 0, 48, 24)
+                for h in [k * 0.1 for k in range(120)]
+                for ts in [start + h * _HOUR]
+            ],
+        )
+        store.flush(reason="synth")
+        diag = Engine(ProcdiagConfig()).run(store)
+        store.close()
+
+        assert diag.quality.span_hours == pytest.approx(12 - 0.1)
+        assert diag.quality.gap_seconds == 0
+        assert "MEM-LEAK-01" in diag.evaluated_rules
+        assert [f.rule_id for f in diag.findings] == ["MEM-LEAK-01"]
+
+    def test_a_leak_in_many_short_shifts_is_judged_like_the_gate(self, tmp_path):
+        now = _minute_now()
+        store = make_db(tmp_path, hours=36)
+        shifts = [now - (12 - i) * 3 * _HOUR for i in range(12)]
+        proc_id = _register(store, "plc-gateway", shifts[0])
+        for start in shifts:
+            _sys_rows(store, start, start + 1800, 5.0)
+            store.buffer(
+                "proc_rollup_1m",
+                [
+                    (start + m * 60, proc_id, 1.0, 1.0, int((200 + m) * _MB), 0, 48, 24)
+                    for m in range(30)
+                ],
+            )
+            store.flush(reason="synth")
+        diag = Engine(ProcdiagConfig()).run(store, only=["MEM-LEAK-01"])
+        store.close()
+
+        assert diag.evaluated_rules == ["MEM-LEAK-01"]
+        (leak,) = diag.findings
+        assert leak.evidence["slope_mb_per_h"] == pytest.approx(60, rel=0.01)
+
+    def test_zombies_left_over_on_another_day_are_not_a_trend(self, tmp_path):
+        now = _minute_now()
+        day1, day2 = now - 33 * _HOUR, now - 9 * _HOUR
+        store = make_db(tmp_path, hours=33)
+        proc_id = _register(store, "plc-gateway", day1)
+        for start, zombies in ((day1, 2), (day2, 20)):
+            _sys_rows(store, start, start + 9 * _HOUR, 60.0)
+            stamps = [start + k * 600 for k in range(54)]
+            _proc_samples(store, proc_id, stamps)
+            store.buffer("proc_counts", [(ts, 300, zombies) for ts in stamps])
+            store.flush(reason="synth")
+        diag = Engine(ProcdiagConfig()).run(store, only=["ZOMBIE-01"])
+        store.close()
+
+        assert diag.evaluated_rules == ["ZOMBIE-01"]
+        assert diag.findings == []
+
+    def test_pss_stepping_across_a_hole_does_not_confirm_a_leak(self, tmp_path):
+        now = _minute_now()
+        day1, day2 = now - 33 * _HOUR, now - 9 * _HOUR
+        store = make_db(tmp_path, hours=33)
+        proc_id = _register(store, "plc-gateway", day1)
+        for start, pss_mb in ((day1, 100), (day2, 140)):
+            _record(store, proc_id, start, 9 * 60, rss_mb=200, slope_mb_h=20)
+            _proc_samples(
+                store, proc_id, [start + k * 600 for k in range(54)], pss_mb=pss_mb
+            )
+        diag = Engine(ProcdiagConfig()).run(store, only=["MEM-LEAK-01"])
+        store.close()
+
+        (leak,) = diag.findings
+        assert leak.confidence is Confidence.LOW
+        assert "pss_note" in leak.evidence
+
+    def test_an_explicit_window_wider_than_the_records_has_holes_at_its_ends(
+        self, tmp_path
+    ):
+        now = _minute_now()
+        start = now - 8 * _HOUR
+        store = make_db(tmp_path, hours=8)
+        proc_id = _register(store, "plc-gateway", start)
+        _record(store, proc_id, start, 8 * 60, rss_mb=200)
+        last = start + (8 * 60 - 1) * 60
+        diag = Engine(ProcdiagConfig()).run(
+            store, window=Window(start - 2 * _HOUR, last + _HOUR)
+        )
+        store.close()
+
+        assert diag.quality.span_hours == pytest.approx((last - start) / _HOUR)
+        assert diag.quality.gap_seconds == pytest.approx(3 * _HOUR)
 
 
 class TestClockSteppedBack:
@@ -183,9 +357,35 @@ class TestClockSteppedBack:
         assert _local(boot + 9 * _HOUR) in notes
         assert _local(boot + 240) in notes
 
-    def test_the_service_starts_after_the_clock_is_synchronized(self):
+    def test_a_chosen_period_leaves_out_rows_stamped_after_now(self, tmp_path):
+        now = _minute_now()
+        boot = now - 7 * _HOUR
+        store = make_db(tmp_path, hours=7)
+        proc_id = _register(store, "app", boot)
+        _record(store, proc_id, boot + 9 * _HOUR, 3, rss_mb=50)
+        _record(store, proc_id, boot + 180, 7 * 60 - 3, rss_mb=60, slope_mb_h=30)
+        store.close()
+        since = datetime.fromtimestamp(boot - _HOUR).strftime("%Y-%m-%dT%H:%M")
+
+        result = CliRunner().invoke(
+            cli,
+            ["check", "--db", str(store.path), "--since", since, "--format", "json"]
+            + ["--only", "MEM-LEAK-01"],
+        )
+        data = json.loads(result.stdout)
+        assert datetime.fromisoformat(data["window"]["end"]).timestamp() < now
+        assert [f["rule_id"] for f in data["findings"]] == ["MEM-LEAK-01"]
+
+    def test_a_system_unit_starts_after_the_clock_is_synchronized(self):
+        result = CliRunner().invoke(cli, ["service", "print", "--system"])
+        assert result.exit_code == 0, result.output
+        unit = result.output.split("[Service]")[0]
+        assert "After=local-fs.target time-sync.target\n" in unit
+        assert "Wants=local-fs.target\n" in unit
+
+    def test_a_user_unit_names_no_system_target(self):
         result = CliRunner().invoke(cli, ["service", "print"])
         assert result.exit_code == 0, result.output
         unit = result.output.split("[Service]")[0]
-        assert "After=local-fs.target time-sync.target" in unit
-        assert "Wants=local-fs.target\n" in unit
+        assert "After=local-fs.target\n" in unit
+        assert "time-sync" not in unit
