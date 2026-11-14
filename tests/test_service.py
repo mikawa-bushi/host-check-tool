@@ -214,13 +214,21 @@ def test_a_failure_restarts_but_a_precondition_error_does_not():
 
 
 def _run_exec_start(unit: str, cwd: Path) -> subprocess.CompletedProcess:
+    # pytest-cov would measure the child, which runs outside the project folder
+    # and so cannot find the project's coverage config: its statement-only data
+    # then fails to combine with the parent's branch data.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("COV_CORE", "COVERAGE_"))
+    }
     return subprocess.run(
         exec_args(unit),
         cwd=cwd,
         capture_output=True,
         text=True,
         timeout=60,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**env, "PYTHONDONTWRITEBYTECODE": "1"},
     )
 
 
