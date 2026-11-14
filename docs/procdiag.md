@@ -280,6 +280,17 @@ cgroup v2 が存在しない環境では自動的にスキップされ、demotio
 - `collect_dirs()`: 1 時間毎に `watch_dirs` を走査 (`dir_samples`)。
   時間予算内に完了しない場合は `is_estimate=1` で打ち切り結果を記録。
 
+### Tier-3 — CPU 温度・クロック (10 秒)
+
+`ThermalSampler` が CPU 温度と現在 / 最大クロックを `thermal_samples` に記録する:
+
+- 温度 (`temp_max_c`) は CPU 自身のセンサー (coretemp・k10temp・zenpower・cpu_thermal など) の
+  最高値。NVMe・GPU・Wi-Fi など CPU 以外のセンサーは、どれほど熱くても使わない。
+- CPU のセンサーが無いときは、PC では ACPI の温度ゾーン (acpitz)、ARM ボードでは SoC の
+  温度ゾーン (soc_thermal) を使う。どれも無ければ温度は空になり、THERMAL-01 は高温を判定できない。
+  `snapshot` の「CPU 温度」も同じ値を表示する。
+- 0.6.0 までの版で記録した DB の `temp_max_c` は、CPU 以外も含むすべてのセンサーの最高値。
+
 ### Tier-3 — サービス / カーネルログ (5 分)
 
 - `ServiceSampler`: systemd が数える自動再起動回数 (`NRestarts`) の増加と failed 遷移だけを
@@ -350,7 +361,7 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 | `UNCLEAN-SHUTDOWN-01` | crash | 記録セッション履歴から、停止処理なしの再起動 (電源断・パニック) を検出 |
 | `SERVICE-RESTART-01` | crash | systemd の自動再起動 (NRestarts) の増加・failed 遷移からクラッシュループを検出 |
 | `KERNEL-ERROR-01` | crash | カーネルログの I/O エラー・FS エラー・ハングタスク・MCE・segfault・USB 切断を集計 |
-| `THERMAL-01` | cpu | 高温下での継続的なクロック低下 (サーマルスロットリング) を検出 |
+| `THERMAL-01` | cpu | 高温下での継続的なクロック低下 (サーマルスロットリング) を検出。同じ時刻の CPU 温度とクロック比を突き合わせ、80°C 以上かつ最大の 85% 未満の記録が 3 回以上続いた期間を数える |
 
 最低観測時間はルールごとに異なる (瞬時型 0h 〜 日次反復型 24h)。線形回帰系ルールの
 既定 6 時間は `config.rules.min_observation_hours` で一括調整できる (0 で無効)。
