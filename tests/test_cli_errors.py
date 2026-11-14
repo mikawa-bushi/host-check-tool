@@ -405,12 +405,14 @@ class TestClosedPipe:
     def test_export_into_a_closed_pipe_is_silent(self, tmp_path, good_db):
         read_end, write_end = os.pipe()
         os.close(read_end)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("COV_CORE")}
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "procdiag.cli", "export", "--db", str(good_db)],
                 stdout=write_end,
                 stderr=subprocess.PIPE,
                 cwd=tmp_path,
+                env=env,
                 timeout=60,
             )
         finally:
