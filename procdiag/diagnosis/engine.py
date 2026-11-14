@@ -300,6 +300,21 @@ class Engine:
                 uncovered.append(gap)
                 continue
             try:
+                shortfall = rule.recording_shortfall_hours(store, window)
+                if shortfall > 0:
+                    reasoning.append(
+                        f"{rule.rule_id}: 判定に必要な観測が足りないためスキップ "
+                        f"(あと {shortfall:.1f}h)"
+                    )
+                    skipped.append(
+                        SkippedRule(
+                            rule_id=rule.rule_id,
+                            title=rule.title,
+                            required_hours=window.span_hours + shortfall,
+                            remaining_hours=shortfall,
+                        )
+                    )
+                    continue
                 if isinstance(rule, MeasuredRule):
                     measured = rule.assess(store, window)
                     found = [m.finding for m in measured if m.finding]
