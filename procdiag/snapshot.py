@@ -404,12 +404,40 @@ def _check_services(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
 
     if not systemd.available():
         return [item(INFO, "systemd がないため確認できません")]
+    failed_item = functools.partial(
+        item, name="failed_units", label="failed のユニット"
+    )
+    restart_item = functools.partial(
+        item, name="restarted_units", label="自動再起動したサービス"
+    )
+    unknown = "確認できません (systemctl が失敗しました)"
+    items: List[SnapshotItem] = []
 
-    failed = systemd.failed_units() or []
-    f_status = WARNING if failed else OK
-    f_hint = "`systemctl status <unit>` と `journalctl -u <unit> -n 50` で原因を確認してください"
+    failed = systemd.failed_units()
+    if failed is None:
+        items.append(
+            failed_item(INFO, unknown, "`systemctl --failed` で確認してください")
+        )
+    else:
+        f_status = WARNING if failed else OK
+        f_hint = "`systemctl status <unit>` と `journalctl -u <unit> -n 50` で原因を確認してください"
+        items.append(
+            failed_item(
+                f_status,
+                ", ".join(failed) if failed else "なし",
+                _advice(f_status, f_hint),
+            )
+        )
 
-    info = systemd.show_units(systemd.list_service_units() or []) or {}
+    units = systemd.list_service_units()
+    info = None if units is None else systemd.show_units(units)
+    if info is None:
+        items.append(
+            restart_item(
+                INFO, unknown, "`systemctl show -p NRestarts <unit>` で確認してください"
+            )
+        )
+        return items
     counts = {unit: systemd.n_restarts(props) or 0 for unit, props in info.items()}
     restarted = sorted(
         ((unit, n) for unit, n in counts.items() if n > 0), key=lambda x: -x[1]
@@ -423,15 +451,8 @@ def _check_services(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
         "異常終了して systemd が自動再起動しています。"
         "`journalctl -u <unit>` でエラーを確認してください"
     )
-    return [
-        item(
-            f_status,
-            ", ".join(failed) if failed else "なし",
-            _advice(f_status, f_hint),
-            name="failed_units",
-            label="failed のユニット",
-        ),
-        item(
+    items.append(
+        restart_item(
             r_status,
             (
                 ", ".join(f"{u} ({n}回)" for u, n in restarted[:5])
@@ -439,10 +460,9 @@ def _check_services(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
                 else "なし"
             ),
             _advice(r_status, r_hint),
-            name="restarted_units",
-            label="自動再起動したサービス",
-        ),
-    ]
+        )
+    )
+    return items
 
 
 @_check("カーネル", "kernel_log", "カーネルログ (24時間)")
@@ -450,7 +470,8 @@ def _check_kernel_log(item: _Item) -> List[SnapshotItem]:
     from .diagnosis.crash import KERNEL_SEVERITY
 
     events, _ = kernlog.read_events(since=time.time() - _KERNEL_LOOKBACK_SEC)
-    if events is None:
+    # journalctl can exit 0 with no output when the system journal is unreadable.
+    if events is None or (not events and not kernlog.journal_readable()):
         return [
             item(
                 INFO, "読み取れません (root または systemd-journal/adm グループが必要)"
@@ -459,12 +480,14 @@ def _check_kernel_log(item: _Item) -> List[SnapshotItem]:
     if not events:
         return [item(OK, "異常なし")]
     counts = Counter(e.kind for e in events)
-    # Graded like KERNEL-ERROR-01's critical kinds; anything else is a warning.
-    severe = any(KERNEL_SEVERITY.get(k) is Severity.CRITICAL for k in counts)
+    status = min(
+        (KERNEL_SEVERITY.get(k, Severity.WARNING).value for k in counts),
+        key=STATUSES.index,
+    )
     detail = ", ".join(f"{kernlog.LABELS.get(k, k)} {n}件" for k, n in counts.items())
     return [
         item(
-            CRITICAL if severe else WARNING,
+            status,
             detail,
             "`journalctl -k --since '24 hours ago' -p warning` で内容を確認してください",
         )
