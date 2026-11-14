@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+import psutil
+
 from procdiag.config import ProcdiagConfig, SamplingConfig
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler, SystemSnapshot
 from procdiag.recorder import Recorder
@@ -581,6 +583,7 @@ class TestRecorder:
         meta = storage.meta()
         assert "hostname" in meta, "meta must have hostname"
         assert "kernel" in meta, "meta must have kernel"
+        assert meta["cpu_count"] == str(psutil.cpu_count())
         assert "started_ts" in meta, "meta must have started_ts"
         assert "config" in meta, "meta must have config"
         cfg_data = json.loads(meta["config"])

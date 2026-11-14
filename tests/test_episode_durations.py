@@ -158,6 +158,33 @@ class TestIoBottleneckDuration:
         store.close()
 
 
+class TestIoBottleneckEpisodes:
+    def test_the_longest_of_two_episodes_is_reported_and_blamed(self, tmp_path):
+        def procs(ts):
+            second = ts - _T0
+            if 600 <= second < 1800:
+                return [_proc(ts, 2, write=10 * _MiB)]
+            if 2400 <= second < 4200:
+                return [_proc(ts, 3, write=10 * _MiB)]
+            return []
+
+        store = _io_store(
+            tmp_path,
+            [4800],
+            lambda s, i: 600 <= i < 1800 or 2400 <= i < 4200,
+            procs=procs,
+        )
+
+        (f,) = _run(store, "IO-BOTTLENECK-01")
+
+        assert f.evidence["duration_minutes"] == pytest.approx(30.0, abs=1.0)
+        assert _T0 + 2340 <= f.evidence["episode_start"] <= _T0 + 2460
+        names = [p["name"] for p in f.evidence["top_writers"]]
+        assert names[0] == "plc-logger"
+        assert "backup" not in names
+        store.close()
+
+
 class TestIoBottleneckCulprit:
     @staticmethod
     def _store(tmp_path):
@@ -225,15 +252,18 @@ def _core_rows(ts, ncpu, pinned, *, rest=2.0):
     return _sys(ts, cpu=sum(per_core) / ncpu, core=max(per_core))
 
 
-def _rollup_row(ts_min, ncpu, pinned, *, rest=2.0):
-    total = (100.0 + rest * (ncpu - 1)) / ncpu if pinned else rest
+def _rollup_row(ts_min, ncpu, *, bg, pinned=False):
+    """A 1-minute rollup row: every core at ``bg`` %, one at 100 % for the minute
+    (``pinned``) or for one second of it."""
+    peak = (100.0 + bg * (ncpu - 1)) / ncpu if pinned else bg + (100.0 - bg) / ncpu
+    avg = peak if pinned else bg + (100.0 - bg) / ncpu / 60
     return make_row(
         "sys_rollup_1m",
         ts_min=ts_min,
-        cpu_avg=total,
-        cpu_max=total,
-        cpu_p95=total,
-        cpu_max_core_max=100.0 if pinned else rest,
+        cpu_avg=avg,
+        cpu_max=peak,
+        cpu_p95=avg,
+        cpu_max_core_max=100.0,
         mem_used_avg=2 * _GiB,
         mem_used_max=2 * _GiB,
         psi_cpu_max=0.0,
@@ -259,15 +289,16 @@ def _proc_rollup(ts_min, proc_id, *, avg, peak):
 
 class TestSinglecoreEpisodes:
     @staticmethod
-    def _recorded(tmp_path, ncpu, seconds, pinned, *, rollup=True):
+    def _recorded(tmp_path, ncpu, seconds, pinned, *, rest=2.0, known=True):
         store = make_db(tmp_path)
+        if known:
+            store.write_meta({"cpu_count": str(ncpu)})
         store.buffer(
             "sys_samples",
-            [_core_rows(_T0 + i, ncpu, pinned(i)) for i in range(seconds)],
+            [_core_rows(_T0 + i, ncpu, pinned(i), rest=rest) for i in range(seconds)],
         )
         store.flush(reason="synth")
-        if rollup:
-            store.rollup_incremental()
+        store.rollup_incremental()
         return store
 
     @pytest.mark.parametrize("ncpu", [2, 4, 8])
@@ -278,53 +309,53 @@ class TestSinglecoreEpisodes:
 
         assert f.evidence["duration_minutes"] == 30
         assert "30分継続" in f.summary
+        assert f.evidence["cpu_count"] == ncpu
+        assert f"CPU 数 {ncpu} 個" in f.proposal
         store.close()
 
-    @pytest.mark.parametrize("ncpu", [2, 4, 8])
-    def test_a_core_pinned_in_rollup_only_minutes_is_reported(self, tmp_path, ncpu):
-        store = make_db(tmp_path)
-        store.buffer(
-            "sys_rollup_1m", [_rollup_row(_T0 + 60 * m, ncpu, True) for m in range(30)]
-        )
-        store.flush(reason="synth")
+    def test_the_cpu_count_is_shown_only_when_it_was_recorded(self, tmp_path):
+        store = self._recorded(tmp_path, 4, 1800, lambda i: True, known=False)
 
         (f,) = _run(store, "CPU-SINGLECORE-01")
 
-        assert f.evidence["duration_minutes"] == 30
+        assert "cpu_count" not in f.evidence
+        assert "CPU 数" not in f.proposal
+        store.close()
+
+    def test_two_cpus_with_no_recorded_count_are_judged_as_strictly_as_before(
+        self, tmp_path
+    ):
+        store = self._recorded(tmp_path, 2, 1800, lambda i: True, known=False)
+
+        assert _run(store, "CPU-SINGLECORE-01") == []
+        store.close()
+
+    @pytest.mark.parametrize("known", [True, False])
+    @pytest.mark.parametrize("ncpu, rest", [(8, 55.0), (8, 45.0), (4, 55.0)])
+    def test_a_busy_host_with_one_pinned_core_is_not_a_single_core(
+        self, tmp_path, ncpu, rest, known
+    ):
+        store = self._recorded(
+            tmp_path, ncpu, 1800, lambda i: True, rest=rest, known=known
+        )
+
+        assert _run(store, "CPU-SINGLECORE-01") == []
         store.close()
 
     def test_every_core_busy_on_two_cpus_is_not_a_single_core(self, tmp_path):
         store = self._recorded(tmp_path, 2, 1800, lambda i: True)
         store.conn.execute("UPDATE sys_samples SET cpu_total = 92.0")
-        store.conn.execute("UPDATE sys_rollup_1m SET cpu_avg = 92.0, cpu_max = 92.0")
         store.conn.commit()
 
         assert _run(store, "CPU-SINGLECORE-01") == []
         store.close()
 
-    def test_a_minute_the_raw_samples_only_partly_cover_is_read_from_the_rollup(
-        self, tmp_path
-    ):
-        store = make_db(tmp_path)
-        store.buffer(
-            "sys_rollup_1m", [_rollup_row(_T0 + 60 * m, 4, True) for m in range(30)]
-        )
-        store.buffer(
-            "sys_samples",
-            [_core_rows(_T0 + 25 * 60 + 40 + i, 4, True) for i in range(260)],
-        )
-        store.flush(reason="synth")
-
-        (f,) = _run(store, "CPU-SINGLECORE-01", Window(_T0, _T0 + 1800))
-
-        assert f.evidence["duration_minutes"] == 30
-        store.close()
-
     def test_one_cpu_has_no_single_core_to_blame(self, tmp_path):
         store = make_db(tmp_path)
+        store.write_meta({"cpu_count": "1"})
         store.buffer(
             "sys_samples",
-            [_sys(_T0 + i, cpu=100.0, core=100.0) for i in range(1800)],
+            [_sys(_T0 + i, cpu=40.0, core=100.0) for i in range(1800)],
         )
         store.flush(reason="synth")
         store.rollup_incremental()
@@ -332,25 +363,50 @@ class TestSinglecoreEpisodes:
         assert _run(store, "CPU-SINGLECORE-01") == []
         store.close()
 
-    def test_one_busy_second_per_minute_is_not_twenty_minutes(self, tmp_path):
-        store = self._recorded(tmp_path, 4, 1200, lambda i: i % 60 == 30)
+    @pytest.mark.parametrize("ncpu, rest", [(4, 2.0), (8, 10.0), (16, 6.0)])
+    def test_one_busy_second_per_minute_is_not_thirty_minutes(
+        self, tmp_path, ncpu, rest
+    ):
+        store = self._recorded(tmp_path, ncpu, 1800, lambda i: i % 60 == 30, rest=rest)
 
         assert _run(store, "CPU-SINGLECORE-01") == []
         store.close()
 
-    def test_one_busy_second_per_minute_in_rollup_only_minutes(self, tmp_path):
+    @pytest.mark.parametrize("pinned", [True, False])
+    @pytest.mark.parametrize("ncpu, bg", [(8, 10.0), (16, 6.0), (4, 2.0)])
+    def test_minutes_only_the_rollup_covers_are_not_judged(
+        self, tmp_path, ncpu, bg, pinned
+    ):
         store = make_db(tmp_path)
-        rows = []
-        for m in range(20):
-            row = list(_rollup_row(_T0 + 60 * m, 4, False))
-            row[4] = 100.0
-            row[2] = 26.0
-            row[1] = 2.0 + 24.0 / 60
-            rows.append(tuple(row))
-        store.buffer("sys_rollup_1m", rows)
+        store.write_meta({"cpu_count": str(ncpu)})
+        store.buffer(
+            "sys_rollup_1m",
+            [_rollup_row(_T0 + 60 * m, ncpu, bg=bg, pinned=pinned) for m in range(30)],
+        )
         store.flush(reason="synth")
 
-        assert _run(store, "CPU-SINGLECORE-01") == []
+        diag = Engine(ProcdiagConfig()).run(store, only=["CPU-SINGLECORE-01"])
+
+        assert diag.findings == []
+        assert [u.rule_id for u in diag.uncovered_rules] == ["CPU-SINGLECORE-01"]
+        store.close()
+
+    def test_only_the_raw_part_of_a_window_is_judged(self, tmp_path):
+        store = make_db(tmp_path)
+        store.write_meta({"cpu_count": "4"})
+        store.buffer(
+            "sys_rollup_1m",
+            [_rollup_row(_T0 + 60 * m, 4, bg=2.0, pinned=True) for m in range(30)],
+        )
+        store.buffer(
+            "sys_samples",
+            [_core_rows(_T0 + 600 + i, 4, True) for i in range(1200)],
+        )
+        store.flush(reason="synth")
+
+        (f,) = _run(store, "CPU-SINGLECORE-01", Window(_T0, _T0 + 1800))
+
+        assert f.evidence["duration_minutes"] == 20
         store.close()
 
     def test_pinned_for_most_of_each_minute_counts(self, tmp_path):
@@ -367,7 +423,7 @@ class TestSinglecoreEpisodes:
         store = self._recorded(tmp_path, 4, 1800, lambda i: True)
         _register(store, "blip", "pinned")
         rows = [_proc_rollup(_T0, 1, avg=1.7, peak=100.0)]
-        rows += [_proc_rollup(_T0 + 60 * m, 2, avg=99.0, peak=100.0) for m in range(30)]
+        rows += [_proc_rollup(_T0 + 60 * m, 2, avg=99.0, peak=99.0) for m in range(30)]
         store.buffer("proc_rollup_1m", rows)
         store.flush(reason="synth")
 
