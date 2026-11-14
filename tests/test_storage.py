@@ -348,9 +348,8 @@ def test_proc_id_for_updates_last_seen(tmp_db):
     ts1 = 1000.0
     ts2 = 2000.0
     tmp_db.proc_id_for("proc", "hash000000", "proc", ts1)
-    tmp_db.conn.commit()
     tmp_db.proc_id_for("proc", "hash000000", "proc", ts2)
-    tmp_db.conn.commit()
+    tmp_db.flush()
 
     row = tmp_db.conn.execute(
         "SELECT last_seen FROM proc_registry WHERE name='proc' AND cmdline_hash='hash000000'"
@@ -458,7 +457,7 @@ def test_cg_unit_path_falls_back_for_unknown_id(tmp_db):
 
 
 # ---------------------------------------------------------------------------
-# read-only rows() query cache + cgroup last_seen throttle (issue #3 §2)
+# read-only rows() query cache + cgroup last_seen (issue #3 §2)
 # ---------------------------------------------------------------------------
 
 
@@ -485,22 +484,17 @@ def test_readwrite_rows_are_not_cached(tmp_db):
     assert tmp_db.rows("sys_samples") is not tmp_db.rows("sys_samples")
 
 
-def test_cg_last_seen_update_is_throttled(tmp_db):
+def test_cg_last_seen_is_the_latest_sighting_after_a_flush(tmp_db):
     unit = "system.slice/throttle.service"
+    for ts in (1000.0, 1010.0, 1100.0):
+        tmp_db.cg_id_for(unit, ts)
+    tmp_db.flush()
 
-    def _last_seen():
-        return tmp_db.conn.execute(
-            "SELECT last_seen FROM cgroup_registry WHERE unit_path = ?", (unit,)
-        ).fetchone()["last_seen"]
-
-    tmp_db.cg_id_for(unit, 1000.0)
-    assert _last_seen() == 1000.0
-    # Within the throttle window: last_seen is not rewritten every tick.
-    tmp_db.cg_id_for(unit, 1010.0)
-    assert _last_seen() == 1000.0
-    # Past the throttle window: last_seen advances.
-    tmp_db.cg_id_for(unit, 1100.0)
-    assert _last_seen() == 1100.0
+    row = tmp_db.conn.execute(
+        "SELECT first_seen, last_seen FROM cgroup_registry WHERE unit_path = ?",
+        (unit,),
+    ).fetchone()
+    assert (row["first_seen"], row["last_seen"]) == (1000.0, 1100.0)
 
 
 # ---------------------------------------------------------------------------
