@@ -513,11 +513,13 @@ class UncleanShutdownRule(Rule):
 class ServiceRestartRule(Rule):
     """Detect crash-looping or failed systemd services.
 
-    Reads ``service_events`` (automatic restarts counted by systemd's
-    ``NRestarts``, and transitions into the ``failed`` state).  Restarts within
-    any one hour at or above ``loop_restarts_per_hour`` are a crash loop
-    (CRITICAL); ``warn_restarts`` in the window, or any failed transition, is a
-    WARNING.
+    Restarts within any one hour at or above ``loop_restarts_per_hour`` are a
+    crash loop (CRITICAL); ``warn_restarts`` in the window, a failed
+    transition, or a unit already failed when recording started is a WARNING.
+    Restarts the recorder could not tell from restarts after a clean exit
+    (``restart_maybe_clean``) still count, at MEDIUM confidence.  Restarts
+    known to follow a clean exit (``restart_clean``) never make a crash loop:
+    ``warn_restarts`` of them is a LOW-confidence WARNING.
     """
 
     rule_id = "SERVICE-RESTART-01"
@@ -550,24 +552,51 @@ class ServiceRestartRule(Rule):
 
         findings: list[Finding] = []
         for unit, events in by_unit.items():
+            n_maybe_clean = sum(
+                r["n_restarts"] or 0
+                for r in events
+                if r["kind"] == "restart_maybe_clean"
+            )
+            n_clean = sum(
+                r["n_restarts"] or 0 for r in events if r["kind"] == "restart_clean"
+            )
             restarts = [
                 (r["ts"], r["n_restarts"] or 0)
                 for r in events
-                if r["kind"] == "restart"
+                if r["kind"] in ("restart", "restart_maybe_clean")
             ]
             n_restarts = sum(n for _, n in restarts)
             n_failed = sum(1 for r in events if r["kind"] == "failed")
+            failed_at_start = any(r["kind"] == "failed_at_start" for r in events)
             peak = _max_in_hour(restarts)
             looping = peak >= self.loop_restarts_per_hour
-            if not (looping or n_restarts >= self.warn_restarts or n_failed):
+            abnormal = (
+                looping
+                or n_restarts >= self.warn_restarts
+                or n_failed > 0
+                or failed_at_start
+            )
+            if not (abnormal or n_clean >= self.warn_restarts):
                 continue
+            if not abnormal:
+                confidence = Confidence.LOW
+            elif n_maybe_clean:
+                confidence = Confidence.MEDIUM
+            else:
+                confidence = Confidence.HIGH
 
             results = sorted({r["result"] for r in events if r["result"]} - {"success"})
             parts = []
             if n_restarts:
                 parts.append(f"自動再起動 {n_restarts} 回 (1時間あたり最大 {peak} 回)")
+            if n_maybe_clean:
+                parts.append(f"うち {n_maybe_clean} 回は正常終了後の可能性あり")
+            if n_clean:
+                parts.append(f"正常終了後の自動再起動 {n_clean} 回")
             if n_failed:
                 parts.append(f"failed {n_failed} 回")
+            if failed_at_start:
+                parts.append("記録開始時点で既に failed")
             reason = f" — 原因: {', '.join(results)}" if results else ""
             findings.append(
                 Finding(
@@ -579,14 +608,17 @@ class ServiceRestartRule(Rule):
                         "unit": unit,
                         "restarts": n_restarts,
                         "max_restarts_per_hour": peak,
+                        "restarts_maybe_clean": n_maybe_clean,
+                        "restarts_clean": n_clean,
                         "failed_count": n_failed,
+                        "failed_at_start": failed_at_start,
                         "results": results,
                         "crash_loop": looping,
                         "first_ts": events[0]["ts"],
                         "last_ts": events[-1]["ts"],
                     },
                     detected_at=(events[0]["ts"], events[-1]["ts"]),
-                    confidence=Confidence.HIGH,
+                    confidence=confidence,
                 )
             )
         return findings
