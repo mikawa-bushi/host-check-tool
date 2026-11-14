@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 import pytest
+from click.testing import CliRunner
 
+from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RetentionConfig
 from procdiag.recorder import Recorder
 from procdiag.storage import Storage
@@ -292,6 +294,74 @@ class TestWalAfterGuard:
         assert not wal.exists() or wal.stat().st_size < 128 * 1024
 
 
+class TestGuardEvents:
+    def test_reclaim_event_reports_what_was_returned(self, mixed_template, tmp_path):
+        db = _copy(mixed_template, tmp_path)
+        budget = _budget_needing_first_rung(db, tmp_path)
+
+        with Storage(db) as store:
+            store.enforce_size_budget(max_bytes=budget, min_free_bytes=None)
+
+            events = store.rows("ops_events", where="kind = 'db_guard_reclaim'")
+            assert len(events) == 1
+            assert "VACUUM 済み" in events[0]["detail"]
+            assert "WAL 切り詰め済み" in events[0]["detail"]
+
+    def test_reclaim_event_names_a_wal_a_reader_still_holds(
+        self, raw_template, tmp_path
+    ):
+        db = _copy(raw_template, tmp_path)
+        budget = int(db.stat().st_size * 0.6)
+
+        with Storage(db) as store:
+            store.conn.execute("PRAGMA busy_timeout=0")
+            reader = sqlite3.connect(db)
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM proc_samples").fetchone()
+            store.enforce_size_budget(max_bytes=budget, min_free_bytes=None)
+            reader.close()
+
+            events = store.rows("ops_events", where="kind = 'db_guard_reclaim'")
+            assert len(events) == 1
+            assert "次回" in events[0]["detail"]
+            assert "WAL 切り詰め済み" not in events[0]["detail"]
+
+    def test_failing_event_write_does_not_stop_the_guard(
+        self, mixed_template, tmp_path, monkeypatch
+    ):
+        db = _copy(mixed_template, tmp_path)
+        budget = _budget_needing_first_rung(db, tmp_path)
+
+        def disk_full(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database or disk is full")
+
+        with Storage(db) as store:
+            monkeypatch.setattr(store, "record_event", disk_full)
+
+            result = store.enforce_size_budget(max_bytes=budget, min_free_bytes=None)
+
+            assert result["steps"] == ["raw_24h"]
+            assert result["vacuumed"] is True
+        assert _on_disk(db) <= budget
+
+
+class TestPruneValidation:
+    def test_bad_rollup_duration_deletes_nothing(self, mixed_template, tmp_path):
+        db = _copy(mixed_template, tmp_path)
+
+        def raw_rows() -> int:
+            with sqlite3.connect(db) as conn:
+                return conn.execute("SELECT COUNT(*) FROM proc_samples").fetchone()[0]
+
+        before = raw_rows()
+        result = CliRunner().invoke(
+            cli, ["prune", "--db", str(db), "--raw", "12h", "--rollup", "2w"]
+        )
+
+        assert result.exit_code != 0
+        assert raw_rows() == before
+
+
 class TestDiskLow:
     def test_stops_at_the_rung_that_returns_enough_space(
         self, mixed_template, tmp_path, monkeypatch
@@ -333,6 +403,45 @@ class TestNearlyFullDisk:
             assert any("VACUUM" in e["detail"] for e in errors)
             assert result["vacuumed"] is False
         assert db.stat().st_size >= before
+
+    def test_vacuum_that_cannot_run_does_not_walk_the_whole_ladder(
+        self, mixed_template, tmp_path, monkeypatch
+    ):
+        db = _copy(mixed_template, tmp_path)
+        on_disk = _on_disk(db)
+        disk = _FakeDisk(db, capacity=int(1.5 * on_disk))
+        min_free = int(disk.free() + 0.5 * on_disk)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            first = store.enforce_size_budget(max_bytes=None, min_free_bytes=min_free)
+
+            assert first["vacuumed"] is False
+            assert len(first["steps"]) <= 2
+            assert _span(store, "proc_samples", "ts") / _HOUR > 11
+            assert _span(store, "proc_rollup_1m", "ts_min") / _DAY > 19
+            errors = store.rows("ops_events", where="kind = 'db_guard_error'")
+            assert any("VACUUM" in e["detail"] for e in errors)
+
+            second = store.enforce_size_budget(max_bytes=None, min_free_bytes=min_free)
+
+            assert second["steps"] == []
+            assert _span(store, "proc_samples", "ts") / _HOUR > 11
+
+    def test_low_disk_cuts_deep_enough_to_vacuum_when_that_returns_the_space(
+        self, mixed_template, tmp_path, monkeypatch
+    ):
+        db = _copy(mixed_template, tmp_path)
+        on_disk = _on_disk(db)
+        disk = _FakeDisk(db, capacity=int(2.5 * on_disk))
+        min_free = int(disk.free() + 0.5 * on_disk)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            result = store.enforce_size_budget(max_bytes=None, min_free_bytes=min_free)
+
+            assert result["vacuumed"] is True
+        assert disk.free() >= min_free
 
     def test_failing_vacuum_is_recorded_and_the_wal_is_returned(
         self, mixed_template, tmp_path
