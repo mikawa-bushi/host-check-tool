@@ -253,11 +253,17 @@ class TestDetectPeriodicity:
             "hourly",
         )  # 5 same-minute events can match either
 
-    def test_truly_hourly(self):
-        """Hourly events over 3 consecutive hours at :45 should be detected."""
+    def test_three_hours_are_too_few_to_rule_out_chance(self):
+        """Three spikes at :45 in three hours line up by chance too often."""
         ts = _hourly_timestamps(3, minute=45)
+        assert detect_periodicity(ts, tol_sec=120.0, min_events=3) is None
+
+    def test_truly_hourly(self):
+        """Hourly events over 5 consecutive hours at :45 should be detected."""
+        ts = _hourly_timestamps(5, minute=45)
         period = detect_periodicity(ts, tol_sec=120.0, min_events=3)
         assert period is not None
+        assert (period.kind, period.anchor, period.count) == ("hourly", ":45", 5)
 
     def test_irregular_returns_none(self):
         """Timestamps with no pattern should return None."""
