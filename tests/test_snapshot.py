@@ -69,6 +69,27 @@ class TestChecks:
             "inode:/data": "warning",
         }
 
+    def test_a_bind_mounted_file_is_not_a_disk(self, monkeypatch, tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        hosts = tmp_path / "hosts"
+        hosts.write_text("127.0.0.1 localhost\n")
+        parts = [
+            _Part("/dev/mapper/vg-lv", str(data), "ext4", "rw,relatime"),
+            _Part("/dev/mapper/vg-lv", str(hosts), "ext4", "ro,relatime"),
+        ]
+        monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
+        monkeypatch.setattr(
+            snap.psutil, "disk_usage", lambda mp: _Usage(100, 50, 50, 50.0)
+        )
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (1000, 100))
+
+        st = _statuses(snap._check_disks(ProcdiagConfig()))
+
+        assert st == {f"disk:{data}": "ok", f"inode:{data}": "ok"}
+
     def test_memory_levels(self, monkeypatch, tmp_path):
         vm = namedtuple("vm", "total available")
         sw = namedtuple("sw", "total used percent")

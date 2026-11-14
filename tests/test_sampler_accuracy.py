@@ -9,12 +9,15 @@ walk stays on the file system it started on.
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import psutil
 import pytest
@@ -181,6 +184,64 @@ class TestUnreadableWatchDirIsNotNoGrowth:
         assert str(missing) in "\n".join(diag.quality.notes)
 
 
+class _SleepWithEvent(_AdvancingSleep):
+    """The fake clock's sleep, running *action* once the clock reaches *at*."""
+
+    def __init__(self, clock: FakeClock, at: float, action) -> None:
+        super().__init__(clock)
+        self._at = at
+        self._action = action
+
+    def __call__(self, secs: float) -> None:
+        super().__call__(secs)
+        if self._action is not None and self._clock() >= self._at:
+            action, self._action = self._action, None
+            action()
+
+
+class TestEveryUnreadableWatchDirIsNamed:
+    def test_a_dir_that_vanishes_after_another_was_named_is_named_too(self, tmp_path):
+        db = tmp_path / "rec.db"
+        not_mounted_yet = tmp_path / "not-mounted-yet"
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "a.bin").write_bytes(b"x" * 100)
+        cfg = ProcdiagConfig(
+            db_path=str(db),
+            sampling=SamplingConfig(
+                system_interval=0.1,
+                cgroup_interval=0.3,
+                process_interval=0.5,
+                disk_interval=0.5,
+                dir_scan_interval=0.3,
+                watch_dirs=[
+                    WatchDir(path=str(not_mounted_yet)),
+                    WatchDir(path=str(data)),
+                ],
+            ),
+        )
+        clock = FakeClock(0.0)
+        rec = Recorder(
+            cfg,
+            db_path=db,
+            ctx=RunContext(cfg, proc_root=_FIXTURES / "proc_tree"),
+            samplers={"system": SystemSampler(), "disk": DiskSampler()},
+            duration=2.0,
+            clock=clock,
+            sleep=_SleepWithEvent(
+                clock, 1.0, lambda: data.rename(tmp_path / "data.unmounted")
+            ),
+        )
+        assert rec.run() == 0
+
+        with Storage(db, read_only=True) as store:
+            diag = Engine(cfg).run(store, only=["CPU-SATURATION-01"])
+
+        notes = "\n".join(diag.quality.notes)
+        assert str(not_mounted_yet) in notes
+        assert str(data) in notes
+
+
 def _fake_sysfs(root: Path) -> Path:
     """sda (partitions sda1 and sda3) with LVM's dm-0 on sda3 and an attached loop0."""
     block = root / "block"
@@ -288,7 +349,7 @@ class TestDiskIoIsCountedOnce:
 
         assert (read, write) == (4096 + 1024, 512)
 
-    def test_without_sysfs_the_psutil_total_is_kept(self, tmp_path, monkeypatch):
+    def test_without_sysfs_every_disk_is_counted(self, tmp_path, monkeypatch):
         ctx = _ctx(sys_root=tmp_path / "no-sysfs")
         disks = _Disks(**{"sda": (1000, 2000), "dm-0": (900, 1900)})
 
@@ -328,6 +389,206 @@ class TestDiskIoIsCountedOnce:
 
         assert row["io_rbytes_delta"] == 4096
         assert row["io_wbytes_delta"] == 8192
+
+
+def _tick(sampler: SystemSampler, ctx: RunContext) -> tuple[int, int]:
+    row = dict(zip(TABLE_COLUMNS["sys_samples"], sampler.collect(ctx)[0].rows[0]))
+    return row["disk_read_bytes"], row["disk_write_bytes"]
+
+
+_GiB = 1024**3
+
+
+def _system_sampler(ctx: RunContext, disks: _Disks, monkeypatch) -> SystemSampler:
+    monkeypatch.setattr(psutil, "disk_io_counters", disks)
+    sampler = SystemSampler()
+    sampler.setup(ctx)
+    sampler.collect(ctx)
+    return sampler
+
+
+class TestDiskIoDoesNotJumpWhenTheDevicesChange:
+    def test_detaching_a_loop_device_is_not_io(self, tmp_path, monkeypatch):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        ctx = _ctx(sys_root=sys_root)
+        disks = _Disks(
+            sda=(100 * _GiB, 0), **{"dm-0": (90 * _GiB, 0), "loop0": (3 * _GiB, 0)}
+        )
+        sampler = _system_sampler(ctx, disks, monkeypatch)
+
+        shutil.rmtree(sys_root / "block" / "loop0" / "loop")
+        assert _tick(sampler, ctx) == (0, 0)
+
+        (sys_root / "block" / "loop0" / "loop").mkdir()
+        assert _tick(sampler, ctx) == (0, 0)
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="root can read any directory")
+    def test_a_stacked_device_that_cannot_be_read_for_a_moment_is_not_io(
+        self, tmp_path, monkeypatch
+    ):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        ctx = _ctx(sys_root=sys_root)
+        disks = _Disks(sda=(100 * _GiB, 0), **{"dm-0": (90 * _GiB, 0)})
+        sampler = _system_sampler(ctx, disks, monkeypatch)
+
+        slaves = sys_root / "block" / "dm-0" / "slaves"
+        slaves.chmod(0o000)
+        try:
+            assert _tick(sampler, ctx) == (0, 0)
+        finally:
+            slaves.chmod(0o700)
+        assert _tick(sampler, ctx) == (0, 0)
+
+
+class TestUnreadableSysfsDoesNotLoseDiskIo:
+    @pytest.mark.skipif(os.getuid() == 0, reason="root can read any directory")
+    def test_a_sysfs_that_cannot_be_searched(self, tmp_path, monkeypatch):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        sys_root.chmod(0o000)
+        try:
+            got = _disk_delta(
+                _ctx(sys_root=sys_root),
+                _Disks(sda=(1000, 2000)),
+                monkeypatch,
+                sda=(4096, 8192),
+            )
+        finally:
+            sys_root.chmod(0o700)
+
+        assert got == (4096, 8192)
+
+    def test_a_pathlib_that_raises_on_permission_denied(self, tmp_path, monkeypatch):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        is_dir = Path.is_dir
+
+        def denied(path: Path, *args, **kwargs) -> bool:
+            if sys_root in path.parents:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return is_dir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "is_dir", denied)
+
+        got = _disk_delta(
+            _ctx(sys_root=sys_root),
+            _Disks(sda=(1000, 2000)),
+            monkeypatch,
+            sda=(4096, 8192),
+        )
+
+        assert got == (4096, 8192)
+
+
+class TestDisksTheSysfsDoesNotListAreStillCounted:
+    @pytest.mark.parametrize(
+        "listed", [[], ["sda"]], ids=["empty-block-dir", "sdb-has-no-entry"]
+    )
+    def test_every_disk_but_its_partitions_is_counted(
+        self, tmp_path, monkeypatch, listed
+    ):
+        sys_root = tmp_path / "sys"
+        (sys_root / "block").mkdir(parents=True)
+        for name in listed:
+            (sys_root / "block" / name / "slaves").mkdir(parents=True)
+        disks = _Disks(sda=(1000, 2000), sda1=(900, 1900), sdb=(500, 700))
+
+        got = _disk_delta(
+            _ctx(sys_root=sys_root),
+            disks,
+            monkeypatch,
+            sda=(4096, 8192),
+            sda1=(4096, 8192),
+            sdb=(1024, 512),
+        )
+
+        assert got == (4096 + 1024, 8192 + 512)
+
+
+class _CgroupIo:
+    """One cgroup unit whose io.stat the test rewrites between collects."""
+
+    def __init__(self, tmp_path: Path, sys_root: Path) -> None:
+        cgroup = tmp_path / "cgroup"
+        (cgroup / "user.slice").mkdir(parents=True)
+        (cgroup / "cgroup.controllers").write_text("cpu io memory pids\n")
+        self._io_stat = cgroup / "user.slice" / "io.stat"
+        ids: dict[str, int] = {}
+        self._sampler = CgroupSampler(
+            resolve_cg=lambda p, ts: ids.setdefault(p, len(ids) + 1)
+        )
+        self._ctx = _ctx(cgroup_root=cgroup, sys_root=sys_root)
+        self._sampler.setup(self._ctx)
+
+    def tick(
+        self, stat: dict[str, tuple[int, int]]
+    ) -> tuple[Optional[int], Optional[int]]:
+        self._io_stat.write_text(
+            "".join(
+                f"{dev} rbytes={r} wbytes={w} rios=1 wios=1 dbytes=0 dios=0\n"
+                for dev, (r, w) in stat.items()
+            )
+        )
+        (row,) = [
+            dict(zip(TABLE_COLUMNS["cg_samples"], r))
+            for r in self._sampler.collect(self._ctx)[0].rows
+        ]
+        return row["io_rbytes_delta"], row["io_wbytes_delta"]
+
+
+def _bumped(stat: dict[str, tuple[int, int]], *devices: str):
+    return {
+        dev: (r + 4096, w + 8192) if dev in devices else (r, w)
+        for dev, (r, w) in stat.items()
+    }
+
+
+class TestCgroupIoDoesNotJumpWhenTheDevicesChange:
+    def test_detaching_a_loop_device_is_not_io(self, tmp_path):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        io = _CgroupIo(tmp_path, sys_root)
+        stat = {
+            "8:0": (10 * _GiB, 0),
+            "252:0": (9 * _GiB, 0),
+            "7:0": (_GiB, 4 * _GiB),
+        }
+        io.tick(stat)
+
+        shutil.rmtree(sys_root / "block" / "loop0" / "loop")
+
+        assert io.tick(stat) == (0, 0)
+
+
+class TestCgroupIoStackedDevicesAreLeftOutOnlyWhenTheDiskBelowIsListed:
+    @pytest.mark.parametrize(
+        "listed",
+        [
+            ["8:0", "252:0"],
+            ["252:0"],
+            ["7:0"],
+            ["8:0", "7:0"],
+        ],
+        ids=["lvm-and-its-disk", "lvm-alone", "loop-alone", "loop-and-a-disk"],
+    )
+    def test_the_io_is_counted_once(self, tmp_path, listed):
+        io = _CgroupIo(tmp_path, _fake_sysfs(tmp_path / "sys"))
+        stat = {dev: (1_000_000, 2_000_000) for dev in listed}
+        io.tick(stat)
+
+        assert io.tick(_bumped(stat, *listed)) == (4096, 8192)
+
+    def test_md_under_lvm_is_counted_once_when_only_the_stack_is_listed(self, tmp_path):
+        sys_root = _fake_sysfs(tmp_path / "sys")
+        block, by_number = sys_root / "block", sys_root / "dev" / "block"
+        for name, slaves in (("md0", ["sda1", "sdb1"]), ("dm-1", ["md0"])):
+            (block / name / "slaves").mkdir(parents=True)
+            for slave in slaves:
+                (block / name / "slaves" / slave).touch()
+        for number, name in (("9:0", "md0"), ("252:1", "dm-1")):
+            (by_number / number).symlink_to(f"../../block/{name}")
+        io = _CgroupIo(tmp_path, sys_root)
+        stat = {"9:0": (1_000_000, 2_000_000), "252:1": (990_000, 1_990_000)}
+        io.tick(stat)
+
+        assert io.tick(_bumped(stat, "9:0", "252:1")) == (4096, 8192)
 
 
 class TestBindMountedFilesAreNotFileSystems:
