@@ -22,6 +22,7 @@ from typing import Optional
 import pytest
 
 from procdiag.config import BudgetConfig, ProcdiagConfig
+from procdiag.core import Capability
 from procdiag.core.sampler import RunContext, SampleBatch, SystemSnapshot
 from procdiag.samplers.selfmeter import SelfMeter
 from procdiag.samplers.system import SystemSampler, parse_psi
@@ -151,16 +152,15 @@ class TestSystemSamplerSetup:
         ctx = _make_ctx(proc_root=PROC_TREE)
         sampler.setup(ctx)
         assert ctx.capabilities["psi"] is True
-        assert ctx.notes == []
+        assert ctx.unobserved == {}
 
     def test_psi_absent_degrades(self):
-        """Without pressure dir, PSI capability is False and a note is added."""
+        """Without pressure dir, the session lacks PSI and says why."""
         sampler = SystemSampler()
         ctx = _make_ctx(proc_root=PROC_TREE_NOPSI)
         sampler.setup(ctx)
         assert ctx.capabilities["psi"] is False
-        assert len(ctx.notes) == 1
-        assert "PSI" in ctx.notes[0]
+        assert "PSI" in ctx.unobserved[Capability.PSI]
 
 
 # ===========================================================================

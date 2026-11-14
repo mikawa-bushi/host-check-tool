@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 import psutil
 
+from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..storage import make_row
 
@@ -54,10 +55,11 @@ class ThermalSampler(Sampler):
         cur, mx = self._read_freq()
         has_freq = cur is not None or mx is not None
         available = has_temp or has_freq
-        ctx.capabilities["thermal"] = available
+        ctx.capabilities[Capability.THERMAL.value] = available
         if not available:
-            ctx.notes.append(
-                "thermal: 温度センサ・cpufreq が読めません — サーマル検出を無効化"
+            ctx.lacks(
+                Capability.THERMAL,
+                "thermal: 温度センサ・cpufreq が読めません — サーマル検出を無効化",
             )
 
     def collect(self, ctx: RunContext) -> list[SampleBatch]:

@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import psutil
 
 from procdiag.config import ProcdiagConfig
+from procdiag.core import Capability
 from procdiag.core.sampler import RunContext
 from procdiag.samplers.cgroup import CgroupSampler
 from procdiag.samplers.process import ProcessSampler
@@ -125,7 +126,7 @@ class TestCgroupSamplerV2:
         ctx = _make_ctx(cgroup_root=CGROUP_TREE)
         sampler.setup(ctx)
         assert ctx.capabilities.get("cgroup_v2") is True
-        assert len(ctx.notes) == 0
+        assert ctx.unobserved == {}
 
     def test_first_collect_returns_batches(self):
         sampler, _ = self._sampler()
@@ -312,8 +313,7 @@ class TestCgroupSamplerV1:
         ctx = _make_ctx(cgroup_root=CGROUP_TREE_V1)
         sampler.setup(ctx)
         assert ctx.capabilities.get("cgroup_v2") is False
-        assert len(ctx.notes) == 1
-        assert "cgroup v2" in ctx.notes[0]
+        assert "cgroup v2" in ctx.unobserved[Capability.CGROUP_V2]
 
     def test_collect_returns_empty_when_disabled(self):
         stub = _CgStub()

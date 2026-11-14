@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 from ..core import (
+    Capability,
     Confidence,
     Finding,
     Headline,
@@ -352,7 +353,8 @@ class MemPressureRule(Rule):
     title = "慢性メモリ圧迫"
     default_severity = Severity.WARNING
     min_observation_hours = 24.0
-    requires_rows = ("sys_rollup_1m",)
+    requires_rows = ("sys_rollup_1m", "sys_rollup_1m.psi_mem_max")
+    requires_observed = (Capability.PSI,)
     what = (
         "sys_rollup_1m の psi_mem_max が閾値超の状態が 1 日に一定時間以上途切れず続き、"
         "その前後の swap_out_sum も一定量以上ある日が、観測が十分なローカル日の"
@@ -555,7 +557,8 @@ class SwapThrashRule(Rule):
     title = "スワップスラッシング"
     default_severity = Severity.CRITICAL
     min_observation_hours = 0.0  # even a single event is worth reporting
-    requires_rows = ("sys_samples",)
+    requires_rows = ("sys_samples", "sys_samples.psi_mem_full10")
+    requires_observed = (Capability.PSI,)
     what = (
         "sys_samples で swap_in > 0 かつ swap_out > 0 かつ psi_mem_full10 > 0 が"
         "同一サンプルで同時発生したかを検出する"
