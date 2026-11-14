@@ -421,6 +421,29 @@ _GUARD_LADDER: Tuple[Tuple[str, str, Optional[str]], ...] = (
 )
 
 
+def connect_read_only(path: Path) -> sqlite3.Connection:
+    """Open the DB at *path* read-only, also from a directory the reader cannot write.
+
+    Reading a WAL database with ``mode=ro`` still creates a ``-shm`` file beside
+    it, which fails ("attempt to write a readonly database") when the reader
+    cannot write that directory: a recording made by root, a read-only mount.
+    With no ``-wal`` data waiting, no recorder has the file open, so
+    ``immutable=1`` reads the main file as it is.  A ``-wal`` that still holds
+    data is never skipped, because that would silently drop the latest samples.
+    """
+    uri = path.resolve().as_uri()
+    conn = sqlite3.connect(uri + "?mode=ro", uri=True)
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        return conn
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        wal = Path(f"{path}-wal")
+        if "readonly" not in str(exc) or (wal.exists() and wal.stat().st_size > 0):
+            raise
+    return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True)
+
+
 # ---------------------------------------------------------------------------
 # Storage class
 # ---------------------------------------------------------------------------
@@ -439,10 +462,7 @@ class Storage:
         self._read_only = read_only
 
         if read_only:
-            # URI mode: file must exist. as_uri() requires an absolute path,
-            # so resolve first (the CLI passes user-supplied relative paths).
-            uri = self.path.resolve().as_uri() + "?mode=ro"
-            self.conn = sqlite3.connect(uri, uri=True)
+            self.conn = connect_read_only(self.path)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(str(self.path))
@@ -1128,11 +1148,23 @@ class Storage:
         return result
 
     def counts(self) -> Dict[str, Any]:
-        """Return per-table row counts and the DB file size in bytes."""
+        """Return per-table row counts and the DB file size in bytes.
+
+        A table an older DB does not have yet counts as 0 rows.
+        """
+        present = {
+            r[0]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
         result: Dict[str, Any] = {}
         for tbl in _ALL_TABLES:
-            row = self.conn.execute(f"SELECT COUNT(*) AS c FROM {tbl}").fetchone()
-            result[tbl] = row["c"]
+            if tbl in present:
+                row = self.conn.execute(f"SELECT COUNT(*) AS c FROM {tbl}").fetchone()
+                result[tbl] = row["c"]
+            else:
+                result[tbl] = 0
         try:
             result["db_bytes"] = self.path.stat().st_size
         except OSError:

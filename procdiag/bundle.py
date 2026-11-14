@@ -32,6 +32,8 @@ from typing import List, Optional
 
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig
+from .output import atomic_output
+from .storage import connect_read_only
 
 
 @dataclass
@@ -57,7 +59,7 @@ def copy_db(src: Path, dst: Path, *, keep_cmdline: bool) -> None:
     is writing; switching the copy out of WAL mode folds everything into one
     file so no ``-wal`` / ``-shm`` companions are needed.
     """
-    source = sqlite3.connect(src.resolve().as_uri() + "?mode=ro", uri=True)
+    source = connect_read_only(src)
     target = sqlite3.connect(dst)
     try:
         source.backup(target)
@@ -144,8 +146,9 @@ def create_bundle(
         write("README.txt", _readme(hostname, result))
 
         out.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(out, "w:gz") as tar:
-            tar.add(root, arcname=top)
+        with atomic_output(out, "wb") as fh:
+            with tarfile.open(name=str(out), fileobj=fh, mode="w:gz") as tar:
+                tar.add(root, arcname=top)
     return result
 
 
