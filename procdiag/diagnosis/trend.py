@@ -11,10 +11,14 @@ from any rule's ``evaluate()`` without concern for ordering or concurrency.
 
 from __future__ import annotations
 
+import math
 import statistics
+from bisect import bisect_left, bisect_right
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Hashable, Iterable, Iterator, Mapping, Optional
+from itertools import accumulate
+from typing import Any, Hashable, Iterable, Iterator, Mapping, Optional
 
 from ..core import Confidence, Observation, covers
 
@@ -45,17 +49,22 @@ class TrendFit:
 
 @dataclass
 class Period:
-    """A detected periodic firing pattern.
+    """A detected periodic firing pattern, in the host's local time.
 
     ``kind`` is ``"daily"`` (same clock-time each day) or ``"hourly"`` (same
     minute each hour).  ``anchor`` is a human-readable representative
     timestamp (HH:MM for daily, :MM for hourly).  ``count`` is the number of
-    qualifying events.
+    days (hours) in which a load episode started near the anchor, out of the
+    ``cycles`` recorded days (hours) that include the anchor time.
+    ``chance`` bounds the probability that episodes starting at random times
+    line up this well.
     """
 
     kind: str  # "daily" | "hourly"
     anchor: str  # representative time string
     count: int
+    cycles: int = 0
+    chance: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -370,87 +379,173 @@ def extrapolate_full(
 # ---------------------------------------------------------------------------
 
 
+# SpikeTrigger re-fires every spike_cooldown_sec under sustained load and stays
+# silent for at most its 5-minute storm window; a throttled 1-second tier adds
+# up to a minute.  Events closer than this belong to one load episode, and only
+# the start of an episode is something a schedule sets.
+_EPISODE_GAP_SEC = 360.0
+# A schedule recurs in most recorded days (hours), so an hourly pattern needs
+# more than the few hours a daily job touches.
+_MIN_RECURRENCE = 0.5
+_MAX_CHANCE = 0.01
+# Random load is often confined to working hours or breaks, so the chance of
+# a start near a candidate time comes from the hour before or after it when
+# either rate is above the overall one.  One side alone still sees the busy
+# hour when the candidate sits at the edge of a shift or a break.
+_NEARBY_SEC = 3600.0
+
+
 def detect_periodicity(
     timestamps: list[float],
     *,
     tol_sec: float = 120.0,
     min_events: int = 3,
+    recorded_minutes: Optional[Iterable[float]] = None,
 ) -> Optional[Period]:
-    """Detect daily or hourly periodicity in a list of event timestamps.
+    """Detect an hourly or daily schedule in a list of event timestamps.
 
-    **Daily**: at least *min_events* distinct calendar days each have an event
-    within ±*tol_sec* of the same wall-clock time (HH:MM).
+    Events at most 6 minutes apart form one load episode, represented by
+    its start, so one long load is one event rather than a pattern.  A clock
+    time (host local time, as crontab and systemd timers use) is a schedule
+    when episodes start within ±*tol_sec* of it in at least *min_events* days
+    (hours), in at least half of the recorded days (hours) that include it,
+    and when episode starts at random times would line up that well with
+    probability below 1 %.  That chance uses the highest of the start rates in
+    the hour before the candidate time, the hour after it, and overall.
+    Days and hours wrap: a start at 00:00:20 matches an anchor of 23:59:40.
+    *tol_sec* is kept between 1 second (the sampling step) and a third of
+    the day (hour), beyond which every start would match every time.
 
-    **Hourly**: at least *min_events* distinct clock-hours each have an event
-    within ±*tol_sec* of the same minute mark (:MM).
+    *recorded_minutes* are the start times of the minutes the recorder ran;
+    by default every minute from the first to the last event.
 
-    Returns a :class:`Period` or ``None`` if no pattern is found.
-    Daily patterns are checked first and take priority.
+    Hourly is checked first and wins: an hourly job also recurs daily, but a
+    daily job does not recur in half of the hours.
     """
     if len(timestamps) < min_events:
         return None
+    ordered = sorted(timestamps)
+    starts = [
+        _wall_clock(ts)
+        for prev, ts in zip([None, *ordered], ordered)
+        if prev is None or ts - prev > _EPISODE_GAP_SEC
+    ]
+    if recorded_minutes is None:
+        span = int((ordered[-1] - ordered[0]) // 60)
+        recorded_minutes = [ordered[0] + 60.0 * i for i in range(span + 1)]
+    minutes = [int(_wall_clock(ts) // 60) for ts in recorded_minutes]
 
-    times = [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in timestamps]
-
-    # --- daily check: same second-of-day on distinct calendar dates ---
-    daily = _recurring_offset(
-        times,
-        slot=lambda dt: dt.strftime("%Y-%m-%d"),
-        offset=lambda dt: (
-            dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
-        ),
-        tol_sec=tol_sec,
-        min_events=min_events,
-    )
-    if daily is not None:
-        sod, count = daily
-        h = int(sod // 3600)
-        m = int((sod % 3600) // 60)
-        return Period(kind="daily", anchor=f"{h:02d}:{m:02d}", count=count)
-
-    # --- hourly check: same second-of-hour in distinct clock-hours ---
-    hourly = _recurring_offset(
-        times,
-        slot=lambda dt: dt.strftime("%Y-%m-%dT%H"),
-        offset=lambda dt: dt.minute * 60 + dt.second + dt.microsecond / 1e6,
-        tol_sec=tol_sec,
-        min_events=min_events,
-    )
-    if hourly is not None:
-        soh, count = hourly
-        return Period(kind="hourly", anchor=f":{int(soh // 60):02d}", count=count)
-
+    for kind, cycle in (("hourly", 3600), ("daily", 86400)):
+        tol = min(tol_sec, cycle / 3) if tol_sec >= 1.0 else 1.0
+        found = _recurring_time(starts, minutes, cycle, tol, min_events)
+        if found is not None:
+            phase, count, cycles, chance = found
+            minute = int(phase // 60)
+            anchor = (
+                f"{minute // 60:02d}:{minute % 60:02d}"
+                if kind == "daily"
+                else f":{minute:02d}"
+            )
+            return Period(kind, anchor, count, cycles, chance)
     return None
 
 
-def _recurring_offset(
-    times: list[datetime],
-    *,
-    slot: Callable[[datetime], str],
-    offset: Callable[[datetime], float],
+def _wall_clock(ts: float) -> float:
+    """*ts* as seconds on the host's local clock, counted as if it were UTC."""
+    return datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).timestamp()
+
+
+def _recurring_time(
+    starts: list[float],
+    minutes: list[int],
+    cycle: int,
     tol_sec: float,
     min_events: int,
-) -> Optional[tuple[float, int]]:
-    """Find an offset that recurs (±*tol_sec*) in at least *min_events* slots.
+) -> Optional[tuple[float, int, int, float]]:
+    """Find the time of *cycle* at which episode *starts* recur least by chance.
 
-    Events are grouped by ``slot(dt)`` (a calendar day or a clock-hour) and
-    reduced to ``offset(dt)`` seconds within that slot.  Every observed offset
-    is tried as a candidate anchor, in observation order; the first one matched
-    by enough distinct slots is returned as ``(offset, matching_slots)``.
+    *starts* and *minutes* (recorded minutes) are on the local clock.  Every
+    start's time of cycle is tried as a candidate.  Returns ``(phase, count,
+    cycles, chance)`` with *phase* in seconds into the cycle, or ``None``.
     """
-    by_slot: dict[str, list[float]] = {}
-    for dt in times:
-        by_slot.setdefault(slot(dt), []).append(offset(dt))
+    per_cycle = cycle // 60
+    recorded = Counter(m % per_cycle for m in minutes)
+    running = list(
+        accumulate((recorded[m % per_cycle] for m in range(3 * per_cycle)), initial=0)
+    )
 
-    for anchor in (o for offsets in by_slot.values() for o in offsets):
-        matching = sum(
-            1
-            for offsets in by_slot.values()
-            if any(abs(o - anchor) <= tol_sec for o in offsets)
+    def rate_between(lo: float, hi: float) -> float:
+        """Starts per recorded second at times of cycle in [lo, hi)."""
+        span = running[int(hi // 60) + per_cycle] - running[int(lo // 60) + per_cycle]
+        n = bisect_left(phases, hi) - bisect_left(phases, lo)
+        return n / (60.0 * span) if span > 0 else 0.0
+
+    overall_rate = len(starts) / (max(len(minutes), 1) * 60.0)
+    nearby = min(_NEARBY_SEC, cycle / 2)
+    # Copies one cycle earlier and later let a window around 23:59 (:59) see
+    # the starts just after 00:00 (:00).
+    by_phase = sorted(
+        (s % cycle + shift, s) for s in starts for shift in (-cycle, 0, cycle)
+    )
+    phases = [p for p, _ in by_phase]
+    # Any window ±tol_sec around a candidate lies inside one of cycle/tol_sec
+    # fixed windows 3 * tol_sec wide, so summing their tails bounds the chance
+    # of finding such a time anywhere in the cycle.
+    windows = cycle / tol_sec
+    best: Optional[tuple[float, int, int, float]] = None
+    for phase in sorted({s % cycle for s in starts}):
+        first: dict[int, float] = {}
+        lo = bisect_left(phases, phase - tol_sec)
+        hi = bisect_right(phases, phase + tol_sec)
+        for p, s in by_phase[lo:hi]:
+            offset = p - phase
+            n = round((s - offset - phase) / cycle)
+            first[n] = min(first.get(n, offset), offset)
+        count = len(first)
+        cycles = max(recorded[int(phase // 60)], count)
+        if count < min_events or count < _MIN_RECURRENCE * cycles:
+            continue
+        # The candidate's own starts are left out: a real job would otherwise
+        # raise the rate it is judged against.
+        rate = max(
+            overall_rate,
+            rate_between(phase - nearby, phase - tol_sec),
+            rate_between(phase + tol_sec, phase + nearby),
         )
-        if matching >= min_events:
-            return anchor, matching
-    return None
+        # Chance that one day (hour) holds a start inside a fixed window
+        # 3 * tol_sec wide, if starts fell at random times at that rate.
+        p_window = min(1.0, rate * 3 * tol_sec)
+        chance = min(1.0, windows * _binomial_tail(cycles, p_window, count))
+        if chance >= _MAX_CHANCE or (best is not None and chance >= best[3]):
+            continue
+        offsets = sorted(first.values())
+        # Spikes trail the scheduled start by seconds to a minute; the lower
+        # quartile stays near the start without following one early stray.
+        best = ((phase + offsets[(count - 1) // 4]) % cycle, count, cycles, chance)
+    return best
+
+
+def _binomial_tail(n: int, p: float, k: int) -> float:
+    """P(X >= k) for X ~ Binomial(n, p), 1 <= k <= n, p > 0, in log space.
+
+    At or below the mean the result is at least about one half; 1.0 is
+    returned there, because summing up from pmf(k) underflows to 0 when k is
+    far below the mode.
+    """
+    if p >= 1.0 or k <= n * p:
+        return 1.0
+    pmf = math.exp(
+        math.lgamma(n + 1)
+        - math.lgamma(k + 1)
+        - math.lgamma(n - k + 1)
+        + k * math.log(p)
+        + (n - k) * math.log1p(-p)
+    )
+    total = 0.0
+    for i in range(k, n + 1):
+        total += pmf
+        pmf *= (n - i) / (i + 1) * p / (1.0 - p)
+    return min(1.0, total)
 
 
 # ---------------------------------------------------------------------------
