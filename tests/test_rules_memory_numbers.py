@@ -12,11 +12,14 @@ import time
 
 import pytest
 from synth import add_proc_series, make_db
+from test_compare import _compare
 
+from procdiag.compare import Unknown, Verdict, Why
 from procdiag.config import ProcdiagConfig
 from procdiag.core import Confidence
 from procdiag.core.util import humanize_bytes
 from procdiag.diagnosis import Engine
+from procdiag.diagnosis.trend import fit_linear
 from procdiag.storage import make_row
 
 _MiB = 1024**2
@@ -208,23 +211,6 @@ class TestMemPressure:
         assert _run(store, "MEM-PRESSURE-01") == []
         store.close()
 
-    def test_short_slivers_of_a_day_do_not_make_a_high_confidence_recurrence(
-        self, tmp_path, local_tz
-    ):
-        local_tz("JST-9")
-        store = make_db(tmp_path)
-        start = _local_midnight_jst() - 30 * 60
-        bursts = {15, 15 + 12 * 60 + 15, 15 + 24 * 60 + 30}
-        _pressure_recording(
-            store,
-            start,
-            25 * 60,
-            pressure={m: 12.0 for m in bursts},
-            swap_out={m: _MiB for m in bursts},
-        )
-        assert _run(store, "MEM-PRESSURE-01") == []
-        store.close()
-
     def test_sustained_pressure_with_swap_out_on_most_days_fires(
         self, tmp_path, local_tz
     ):
@@ -303,6 +289,175 @@ class TestMemPressure:
         )
         assert _run(store, "MEM-PRESSURE-01") == []
         store.close()
+
+    def test_scattered_one_minute_blips_are_not_sustained(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {d * 1440 + h * 60: 9.0 for d in range(3) for h in range(0, 24, 2)}
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    @pytest.mark.parametrize("length, fires", [(9, False), (10, True)])
+    def test_run_must_last_ten_minutes(self, tmp_path, local_tz, length, fires):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {m: 9.0 for m in _daily(14 * 60, length, minutes)}
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+        assert bool(_run(store, "MEM-PRESSURE-01")) is fires
+        store.close()
+
+    def test_a_dip_inside_the_pressure_ends_the_run(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {
+            d * 1440 + 14 * 60 + k: 9.0
+            for d in range(3)
+            for k in list(range(0, 6)) + list(range(7, 13))
+        }
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    @pytest.mark.parametrize(
+        "offset, fires", [(-2, False), (-1, True), (30, True), (31, False)]
+    )
+    def test_swap_out_counts_within_a_minute_of_the_run(
+        self, tmp_path, local_tz, offset, fires
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {m: 9.0 for m in _daily(14 * 60, 30, minutes)}
+        swap = {d * 1440 + 14 * 60 + offset: 8 * _MiB for d in range(3)}
+        _pressure_recording(
+            store, _local_midnight_jst(), minutes, pressure=pressure, swap_out=swap
+        )
+        assert bool(_run(store, "MEM-PRESSURE-01")) is fires
+        store.close()
+
+    @pytest.mark.parametrize("swap_out, fires", [(_MiB - 1, False), (_MiB, True)])
+    def test_swap_out_must_reach_a_mebibyte_a_day(
+        self, tmp_path, local_tz, swap_out, fires
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {m: 9.0 for m in _daily(14 * 60, 30, minutes)}
+        swap = {d * 1440 + 14 * 60 + 5: swap_out for d in range(3)}
+        _pressure_recording(
+            store, _local_midnight_jst(), minutes, pressure=pressure, swap_out=swap
+        )
+        assert bool(_run(store, "MEM-PRESSURE-01")) is fires
+        store.close()
+
+    @pytest.mark.parametrize(
+        "days, observed, fires",
+        [((0, 1), 4, False), ((0, 1, 2), 4, True), ((0, 1), 3, True)],
+    )
+    def test_pressure_days_must_be_most_of_the_observed_days(
+        self, tmp_path, local_tz, days, observed, fires
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = observed * 24 * 60
+        pressure = {d * 1440 + 14 * 60 + k: 9.0 for d in days for k in range(30)}
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 8 * _MiB for m in pressure},
+        )
+        found = _run(store, "MEM-PRESSURE-01")
+        assert bool(found) is fires
+        if found:
+            assert found[0].evidence["n_pressure_days"] == len(days)
+            assert found[0].evidence["n_total_days"] == observed
+        store.close()
+
+
+class TestMemPressureNeedsObservedDays:
+    def _all_day_pressure(self, tmp_path, start, hours):
+        tmp_path.mkdir(exist_ok=True)
+        store = make_db(tmp_path)
+        minutes = int(hours * 60)
+        pressure = {m: 20.0 for m in range(minutes)}
+        _pressure_recording(
+            store,
+            start,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+        return store
+
+    def test_one_observed_day_is_not_evaluable_not_healthy(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = self._all_day_pressure(tmp_path, _local_midnight_jst() + 20 * 3600, 24)
+
+        diag = Engine(ProcdiagConfig()).run(store, only=["MEM-PRESSURE-01"])
+
+        assert diag.evaluated_rules == []
+        (skipped,) = diag.skipped_rules
+        assert skipped.rule_id == "MEM-PRESSURE-01"
+        assert skipped.remaining_hours == pytest.approx(10.0, abs=0.05)
+        assert skipped.required_hours == pytest.approx(
+            diag.quality.span_hours + 10.0, abs=0.1
+        )
+        store.close()
+
+    def test_two_observed_days_are_evaluated(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = self._all_day_pressure(tmp_path, _local_midnight_jst() + 14 * 3600, 24)
+        (f,) = _run(store, "MEM-PRESSURE-01")
+        assert f.evidence["n_total_days"] == 2
+        assert f.evidence["n_pressure_days"] == 2
+        store.close()
+
+    def test_compare_does_not_call_it_resolved(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        before_store = self._all_day_pressure(
+            tmp_path / "before", _local_midnight_jst(), 72
+        )
+        after_store = self._all_day_pressure(
+            tmp_path / "after", _local_midnight_jst() + 20 * 3600, 24
+        )
+        after_store.conn.execute("UPDATE sys_rollup_1m SET psi_mem_max = 0.5")
+        after_store.conn.commit()
+        engine = Engine(ProcdiagConfig())
+        before = engine.run(before_store, only=["MEM-PRESSURE-01"])
+        after = engine.run(after_store, only=["MEM-PRESSURE-01"])
+        assert before.findings and after.skipped_rules
+
+        (row,) = _compare(before, after).rows
+
+        assert row.verdict is Verdict.NOT_EVALUABLE
+        assert isinstance(row.after, Unknown) and row.after.why is Why.TOO_SHORT
+        assert "あと" in row.after.detail
+        before_store.close()
+        after_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +539,7 @@ def _zombie_scans(store, counts):
         "proc_samples",
         [_app_sample(_T0 + i * _SCAN, app) for i in range(len(counts))],
     )
-    _sys_minutes(store, len(counts) * _SCAN / 60)
+    _sys_minutes(store, len(counts) * _SCAN / 60 + 2)
     store.flush(reason="synth")
 
 
@@ -417,6 +572,41 @@ class TestZombieNoise:
             store, [min(12, i * 12 // ramp) if i < ramp else 0 for i in range(n)]
         )
         assert _run(store, "ZOMBIE-01") == []
+        store.close()
+
+    @pytest.mark.parametrize(
+        "height, amp, r2_band, fires",
+        [(9, 2, (0.55, 0.67), False), (7, 1, (0.75, 0.85), True)],
+    )
+    def test_the_line_must_explain_the_counts(
+        self, tmp_path, height, amp, r2_band, fires
+    ):
+        n = int(_ZOMBIE_HOURS * 3600 / _SCAN)
+        counts = [
+            round(height * i / n) + amp + (amp if (i // 120) % 2 else -amp)
+            for i in range(n)
+        ]
+        fit = fit_linear(
+            [(i * _SCAN, float(z)) for i, z in enumerate(counts)],
+            min_points=12,
+            min_span_hours=6.0,
+        )
+        assert r2_band[0] < fit.r2 < r2_band[1] and fit.slope_per_hour > 0.5
+        store = make_db(tmp_path)
+        _zombie_scans(store, counts)
+        assert bool(_run(store, "ZOMBIE-01")) is fires
+        store.close()
+
+    @pytest.mark.parametrize("last_scan, fires", [(0, False), (9, True)])
+    def test_zombies_must_still_be_there_at_the_end(self, tmp_path, last_scan, fires):
+        n = int(_ZOMBIE_HOURS * 3600 / _SCAN)
+        counts = [int(9 * i / n) for i in range(n - 1)] + [last_scan]
+        store = make_db(tmp_path)
+        _zombie_scans(store, counts)
+        found = _run(store, "ZOMBIE-01")
+        assert bool(found) is fires
+        if found:
+            assert found[0].evidence["current_zombies"] == last_scan
         store.close()
 
     def test_real_accumulation_still_fires(self, tmp_path):
@@ -589,4 +779,19 @@ class TestThreadLeak:
         assert "32768" not in f.proposal
         assert "171913" not in f.proposal
         assert "cat /proc/sys/kernel/threads-max" in f.proposal
+        store.close()
+
+    def test_missing_hostname_is_worded_as_unknown(self, tmp_path, monkeypatch):
+        limit_file = tmp_path / "threads-max"
+        limit_file.write_text("171913\n")
+        monkeypatch.setattr("procdiag.diagnosis.leak._THREADS_MAX_PATH", limit_file)
+        store, _ = _thread_leak_store(tmp_path)
+        store.conn.execute("DELETE FROM meta WHERE key = 'hostname'")
+        store.conn.commit()
+
+        (f,) = _run(store, "THREAD-LEAK-01")
+
+        assert f.evidence["thread_max_source"] == "unknown"
+        assert "ホスト名がない" in f.proposal
+        assert "記録したホスト以外でチェックしている" not in f.proposal
         store.close()
