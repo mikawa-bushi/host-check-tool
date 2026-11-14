@@ -23,6 +23,7 @@ import logging
 import platform
 import signal
 import socket
+import sqlite3
 import threading
 import time
 from functools import partial
@@ -324,16 +325,35 @@ class Recorder:
         except Exception:
             logger.exception("ディレクトリ走査例外")
 
+    def _flush(self, reason: str) -> bool:
+        """Write the buffered rows; on failure say why and keep them buffered."""
+        try:
+            self._storage.flush(reason=reason)
+        except sqlite3.Error as exc:
+            logger.error(
+                "記録 DB に書き込めません (%s): %s。書けるようになるまで記録をメモリに残します",
+                self._storage.path,
+                exc,
+            )
+            return False
+        return True
+
     def _job_flush(self) -> None:
-        """Flush buffer, run incremental rollup, and (hourly) retention."""
-        self._storage.flush(reason="interval")
-        self._storage.rollup_incremental()
-        if self._session_id is not None:
-            # Heartbeat: after a power cut this is when the host went down.
-            try:
-                self._storage.touch_session(self._session_id)
-            except Exception:
-                logger.exception("セッション生存記録の例外")
+        """Flush buffer, run incremental rollup, and (hourly) retention.
+
+        After a failed flush, rollup waits for the rows still buffered (rolling
+        up now would move its watermark past minutes not yet in the DB), but
+        retention and the size guard still run: freeing space is what lets the
+        next flush succeed.
+        """
+        if self._flush("interval"):
+            self._storage.rollup_incremental()
+            if self._session_id is not None:
+                # Heartbeat: after a power cut this is when the host went down.
+                try:
+                    self._storage.touch_session(self._session_id)
+                except Exception:
+                    logger.exception("セッション生存記録の例外")
 
         now_mono = self._clock()
         if now_mono - self._last_retention_mono >= self._retention_interval:
@@ -432,15 +452,25 @@ class Recorder:
     # ------------------------------------------------------------------
 
     def run(self) -> int:
-        """Run the record loop; return 0 on normal exit."""
+        """Run the record loop.
+
+        Returns 0 on normal exit, 1 when the DB cannot be written at start or
+        the rows buffered at stop could not be written.
+        """
         self._start_mono = self._clock()
         self._last_retention_mono = self._start_mono
 
-        # Write session metadata.
         try:
             self._write_meta()
-        except Exception:
-            logger.exception("メタデータ書き込み例外")
+        except sqlite3.Error as exc:
+            logger.error(
+                "記録 DB に書き込めないため、記録を始められません (%s): %s",
+                self._storage.path,
+                exc,
+            )
+            if self._owns_storage:
+                self._storage.close()
+            return 1
 
         # Open this run's session row (UNCLEAN-SHUTDOWN-01 compares sessions).
         try:
@@ -533,11 +563,15 @@ class Recorder:
         except Exception:
             logger.exception("スケジューラループ例外")
 
-        # Graceful shutdown.
+        # Graceful shutdown: the session is closed even when the last rows
+        # cannot be written.
         try:
             for name in _EVENT_SAMPLERS:
                 self._run_sampler(name)
-            self._storage.flush(reason="signal")
+        except Exception:
+            logger.exception("シャットダウン例外")
+        saved = self._flush("signal")
+        if saved:
             # Roll up the just-flushed final samples so the last (up to one
             # flush-interval + 1 min) of raw data is promoted to *_rollup_1m
             # before raw retention can ever delete it.  Without this, the
@@ -545,16 +579,22 @@ class Recorder:
             # manual stop — is lost from the rollup tables that trend/leak
             # rules read.  rollup_incremental is watermark-based and
             # idempotent, so it is safe on the stop path.
-            self._storage.rollup_incremental()
+            try:
+                self._storage.rollup_incremental()
+            except Exception:
+                logger.exception("シャットダウン例外")
+        try:
             self._storage.record_event("stopped", "正常終了")
             if self._session_id is not None:
                 self._storage.end_session(self._session_id)
-        except Exception:
-            logger.exception("シャットダウン例外")
+        except sqlite3.Error as exc:
+            logger.error("停止を記録 DB に書き込めません: %s", exc)
 
         if self._owns_storage:
             try:
                 self._storage.close()
+            except sqlite3.Error:
+                pass  # only the rows of the failed final flush, reported above
             except Exception:
                 logger.exception("Storage close 例外")
 
@@ -562,7 +602,7 @@ class Recorder:
         # Ctrl-C back as KeyboardInterrupt instead of a no-op stop request.
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        return 0
+        return 0 if saved else 1
 
     # ------------------------------------------------------------------
     # Signal handling
