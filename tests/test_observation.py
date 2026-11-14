@@ -190,6 +190,13 @@ class TestRecorderCapabilities:
         )
         assert "すべてを評価" not in text.output
         assert "5 ルール中 0 件のみ評価" in text.output
+        html = CliRunner().invoke(
+            cli,
+            ["check", "--db", str(db), "--format", "html", "--only"]
+            + [",".join(_INSTANT_RULES)],
+        )
+        assert "<th>観測できず未評価</th>" in html.output
+        assert "<th>記録なしで未評価</th>" not in html.output
 
     def test_a_host_that_can_read_everything_evaluates_every_rule(self, tmp_path, host):
         db = tmp_path / "full.db"
