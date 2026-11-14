@@ -524,7 +524,7 @@ def _side_findings(side: Side) -> list[Finding]:
 
 
 def _span_hours(side: Side) -> float:
-    return side.result.window.span_hours if side.result else 0.0
+    return side.result.window.observed_hours if side.result else 0.0
 
 
 def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
@@ -676,7 +676,7 @@ def _evaluate_side(
     if resolved is not None:
         window, raw_hours = resolved
         diag = engine.run(store, only=only, skip=skip, window=window)
-        result = Evaluated(window, raw_hours, diag)
+        result = Evaluated(diag.window or window, raw_hours, diag)
     return Side(
         name=name,
         db=store.path,

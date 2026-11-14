@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -94,6 +95,13 @@ def _make_jinja_env() -> Environment:
     env.filters["humanize_bytes"] = humanize_bytes
     return env
 
+
+# A stretch this long without a system sample is a hole in the recording: well
+# above the step of the coarsest rows (1-minute rollups), well below a stopped
+# recorder or a powered-off night.
+_HOLE_SECONDS = 300.0
+# Holes listed by name in the quality notes; the rest are only counted.
+_HOLES_LISTED = 5
 
 # Leading "<delay>s" token in a gap event's detail (see recorder._on_gap).
 _GAP_DELAY_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)s")
@@ -217,6 +225,8 @@ class Engine:
 
         *window* defaults to the DB's own bounds (``check``); a given window
         is used verbatim and ``no_data`` then means no system sample inside it.
+        Either way its holes (more than ``_HOLE_SECONDS`` without a system
+        sample) are read from the DB and are not observed time.
 
         Steps:
 
@@ -225,7 +235,8 @@ class Engine:
            in ``reasoning`` and never abort the diagnosis).
         1. Determine the observation window from the DB.
         2. Run each rule (with try/except firewall). A rule is skipped while
-           the window is shorter than its configured ``min_observation_hours``
+           the window less its holes is shorter than its configured
+           ``min_observation_hours``
            (``Rule.configure`` applies ``config.rules.min_observation_hours``,
            the one knob for the regression rules per design §6.3/§8).  A rule
            whose declared inputs (``requires_schema`` / ``requires_rows``)
@@ -247,6 +258,12 @@ class Engine:
             window, has_data = self._determine_window(store, reasoning)
         else:
             has_data = store.system_bounds(window.start_ts, window.end_ts) is not None
+        if has_data:
+            holes = store.system_holes(
+                window.start_ts, window.end_ts, longer_than=_HOLE_SECONDS
+            )
+            window = replace(window, holes=tuple(holes))
+        observed_hours = window.observed_hours
 
         if not has_data:
             reasoning.append(
@@ -257,7 +274,8 @@ class Engine:
         if self.verbose:
             reasoning.append(
                 f"観測ウィンドウ: {window.span_hours:.1f}h "
-                f"({window.start_ts:.0f} – {window.end_ts:.0f})"
+                f"({window.start_ts:.0f} – {window.end_ts:.0f}), "
+                f"うち記録 {observed_hours:.1f}h"
             )
 
         # --- Step 2: run rules (per-rule observation guard) ---
@@ -277,17 +295,17 @@ class Engine:
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
             eff_min = rule.min_observation_hours
-            if not covers(window.span_hours, eff_min):
+            if not covers(observed_hours, eff_min):
                 reasoning.append(
                     f"{rule.rule_id}: 観測時間不足のためスキップ "
-                    f"({window.span_hours:.1f}h < {eff_min:.1f}h)"
+                    f"({observed_hours:.1f}h < {eff_min:.1f}h)"
                 )
                 skipped.append(
                     SkippedRule(
                         rule_id=rule.rule_id,
                         title=rule.title,
                         required_hours=eff_min,
-                        remaining_hours=eff_min - window.span_hours,
+                        remaining_hours=eff_min - observed_hours,
                     )
                 )
                 continue
@@ -310,7 +328,7 @@ class Engine:
                         SkippedRule(
                             rule_id=rule.rule_id,
                             title=rule.title,
-                            required_hours=window.span_hours + shortfall,
+                            required_hours=observed_hours + shortfall,
                             remaining_hours=shortfall,
                         )
                     )
@@ -484,17 +502,21 @@ class Engine:
         self, store: "Storage", window: Window, *, events_in_window: bool
     ) -> ObservationQuality:
         """Assemble ObservationQuality from DB statistics over *window*."""
-        span_hours = window.span_hours
         since, until = (
             (window.start_ts, window.end_ts) if events_in_window else (None, None)
         )
 
-        # Gap total from ops_events: sum the delay seconds recorded in each
-        # gap event's detail ("<delay>s ジョブ<name>"), not the event count.
+        # Gap total: the holes, plus the delay seconds of each gap event
+        # ("<delay>s ジョブ<name>") that is not one of them.  A job late after
+        # a suspend reports the hole it ends, which is counted already.
         gap_rows = store.rows(
             "ops_events", since=since, until=until, where="kind = 'gap'"
         )
-        gap_seconds = sum(_parse_gap_delay_seconds(r["detail"]) for r in gap_rows)
+        gap_seconds = sum(end - start for start, end in window.holes) + sum(
+            _parse_gap_delay_seconds(r["detail"])
+            for r in gap_rows
+            if not any(start < r["ts"] <= end for start, end in window.holes)
+        )
 
         # Self CPU from sys_samples — aggregated in SQL so a long recording is
         # not materialised into Python just to compute avg/max.
@@ -521,9 +543,25 @@ class Engine:
                 "ops_events", since=since, until=until, where="kind = 'data_lost'"
             )
         )
+        if window.holes:
+            notes.append(_holes_note(window.holes))
+        future = store.future_bounds()
+        if future is not None:
+            notes.append(
+                f"{_local_minute(future[0])} 〜 {_local_minute(future[1])} の時刻の"
+                "記録は、いまより先の時刻のため診断に使っていません"
+                " (記録中に時計が戻されたと考えられます)"
+            )
+        notes.extend(
+            f"{_local_minute(r['ts'])} に時計の巻き戻しを検出しました。"
+            "それより前の記録の時刻は、実際より進んでいた可能性があります"
+            for r in store.rows(
+                "ops_events", since=since, until=until, where="kind = 'clock_skew'"
+            )
+        )
 
         return ObservationQuality(
-            span_hours=span_hours,
+            span_hours=window.observed_hours,
             gap_seconds=gap_seconds,
             missing_io_pct=missing_io_pct,
             self_cpu_avg=self_cpu_avg if self_cpu_avg is not None else 0.0,
@@ -531,6 +569,25 @@ class Engine:
             throttle_events=throttle_events,
             notes=notes,
         )
+
+
+def _local_minute(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _holes_note(holes: tuple[tuple[float, float], ...]) -> str:
+    total_hours = sum(end - start for start, end in holes) / 3600.0
+    listed = [
+        f"{_local_minute(start)} 〜 {_local_minute(end)}"
+        f" ({(end - start) / 3600.0:.1f} 時間)"
+        for start, end in holes[:_HOLES_LISTED]
+    ]
+    if len(holes) > _HOLES_LISTED:
+        listed.append(f"ほか {len(holes) - _HOLES_LISTED} か所")
+    return (
+        f"記録が途切れていた {len(holes)} か所 (合計 {total_hours:.1f} 時間) は"
+        "観測時間に数えず、増加の傾きもまたいで求めていません: " + "、".join(listed)
+    )
 
 
 # ---------------------------------------------------------------------------

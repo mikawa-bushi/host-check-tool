@@ -45,15 +45,26 @@ class Confidence(str, Enum):
 
 @dataclass
 class Window:
-    """The observation period a rule evaluated."""
+    """The observation period a rule evaluated.
+
+    ``holes`` are the stretches inside it where nothing was recorded (the PC
+    was off, the recorder stopped, the clock jumped), oldest first and
+    disjoint.  They are not observed time.
+    """
 
     start_ts: float
     end_ts: float
+    holes: tuple[tuple[float, float], ...] = ()
 
     @property
     def span_hours(self) -> float:
-        """Length of the window in hours."""
+        """Length of the window in hours, holes included."""
         return (self.end_ts - self.start_ts) / 3600.0
+
+    @property
+    def observed_hours(self) -> float:
+        """Hours actually recorded: the span less the holes."""
+        return self.span_hours - sum(end - start for start, end in self.holes) / 3600.0
 
 
 # The span from the first row to the last falls short of the time recorded:

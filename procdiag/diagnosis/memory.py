@@ -159,6 +159,7 @@ class MemLeakRule(MeasuredRule):
             "rss_avg",
             min_span_hours=self.min_observation_hours,
             unit=MiB,
+            holes=window.holes,
         )
 
     def judge(
@@ -262,7 +263,12 @@ class MemLeakRule(MeasuredRule):
         )
         if len(pss_series) < _PSS_MIN_POINTS:
             return confidence
-        pss_fit = fit_linear(pss_series, min_points=_PSS_MIN_POINTS, min_span_hours=0.0)
+        pss_fit = fit_linear(
+            pss_series,
+            min_points=_PSS_MIN_POINTS,
+            min_span_hours=0.0,
+            holes=window.holes,
+        )
         if pss_fit is None:
             return confidence
         pss_slope_mb_h = pss_fit.slope_per_hour / MiB

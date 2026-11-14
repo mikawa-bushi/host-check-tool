@@ -62,7 +62,7 @@ def _unit_text(
     return f"""\
 [Unit]
 Description=procdiag 常駐記録サービス (procdiag record)
-After=local-fs.target
+After=local-fs.target time-sync.target
 Wants=local-fs.target
 
 [Service]
