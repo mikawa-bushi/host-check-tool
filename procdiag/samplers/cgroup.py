@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..core.result import Capability
 from ..core.sampler import RunContext, SampleBatch, Sampler, register_sampler
 from ..core.util import CounterDelta
 from ..storage import make_row
@@ -131,16 +132,16 @@ class CgroupSampler(Sampler):
         """Detect cgroup v2 and record a demotion note if absent."""
         controllers = ctx.cgroup_root / "cgroup.controllers"
         if controllers.exists():
-            ctx.capabilities["cgroup_v2"] = True
+            ctx.capabilities[Capability.CGROUP_V2.value] = True
             self._enabled = True
         else:
-            ctx.capabilities["cgroup_v2"] = False
             self._enabled = False
-            ctx.notes.append(
+            ctx.lacks(
+                Capability.CGROUP_V2,
                 "cgroup: cgroup v2 統一ツリーが見つかりません"
                 " (cgroup.controllers 不在)。"
                 "cgroup 層のサンプリングをスキップします。"
-                " v1 環境ではプロセス視点のみで診断します。"
+                " v1 環境ではプロセス視点のみで診断します。",
             )
 
     def _refresh_units(self, ctx: RunContext) -> None:
