@@ -740,7 +740,7 @@ class TestThreadLeak:
         assert proc_id >= 4
         (f,) = _run(store, "THREAD-LEAK-01")
         assert f"/proc/{proc_id}/" not in f.proposal
-        assert "pgrep -a edge-agent" in f.proposal
+        assert "pgrep -a -- edge-agent" in f.proposal
         assert "/proc/<PID>/status" in f.proposal
         store.close()
 

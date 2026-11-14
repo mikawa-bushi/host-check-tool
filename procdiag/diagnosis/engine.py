@@ -47,7 +47,7 @@ from ..core import (
     covers,
     rule_id_problems,
 )
-from ..core.util import humanize_bytes
+from ..core.util import humanize_bytes, is_unit_name, neutralize, shell_quote
 from ..plugins import load_extra_rules
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
@@ -84,14 +84,28 @@ _CONFIDENCE_ORDER = {
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
+def _inert(value: object) -> object:
+    """Every substituted string is neutralised: host text stays on its line."""
+    return neutralize(value) if isinstance(value, str) else value
+
+
 def _make_jinja_env() -> Environment:
-    """Return a Jinja2 environment backed by the templates/ directory."""
+    """Return a Jinja2 environment backed by the templates/ directory.
+
+    Names from the host (processes, units, mount points) reach the templates as
+    evidence.  ``finalize`` keeps control characters and newlines out of the
+    proposal; ``shq`` quotes a value as one shell word and ``unit_name`` tells
+    whether ``systemctl restart <name>`` makes sense for it.
+    """
     env = Environment(
         loader=FileSystemLoader(str(_TEMPLATE_DIR)),
         autoescape=False,
         keep_trailing_newline=True,
+        finalize=_inert,
     )
     env.filters["humanize_bytes"] = humanize_bytes
+    env.filters["shq"] = shell_quote
+    env.tests["unit_name"] = is_unit_name
     return env
 
 
@@ -362,8 +376,13 @@ class Engine:
         # --- Step 6: build quality ---
         quality = self._build_quality(store, window, events_in_window=has_data)
 
-        healthy = not any(
-            f.severity in (Severity.WARNING, Severity.CRITICAL) for f in findings
+        # Healthy is a verdict, so it needs data and at least one rule that ran.
+        healthy = (
+            has_data
+            and bool(evaluated)
+            and not any(
+                f.severity in (Severity.WARNING, Severity.CRITICAL) for f in findings
+            )
         )
 
         return Diagnosis(
@@ -510,7 +529,7 @@ class Engine:
         missing_io_pct = store.missing_io_ratio(window.start_ts, window.end_ts)
 
         notes: list[str] = []
-        if missing_io_pct > 0.1:
+        if missing_io_pct is not None and missing_io_pct > 0.1:
             notes.append(
                 f"io_counters 欠損率 {missing_io_pct:.0%} — "
                 "非 root 実行のため他ユーザープロセスの I/O が読めません"
@@ -526,8 +545,8 @@ class Engine:
             span_hours=span_hours,
             gap_seconds=gap_seconds,
             missing_io_pct=missing_io_pct,
-            self_cpu_avg=self_cpu_avg if self_cpu_avg is not None else 0.0,
-            self_cpu_max=self_cpu_max if self_cpu_max is not None else 0.0,
+            self_cpu_avg=self_cpu_avg,
+            self_cpu_max=self_cpu_max,
             throttle_events=throttle_events,
             notes=notes,
         )
