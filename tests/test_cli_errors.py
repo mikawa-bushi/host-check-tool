@@ -109,6 +109,14 @@ class TestBadDb:
         assert "エラー:" in result.output
         assert str(bad) in result.output
 
+    def test_record_refuses_a_db_path_it_cannot_create(self, runner, tmp_path):
+        blocker = tmp_path / "afile"
+        blocker.write_text("x")
+        db = blocker / "sub" / "r.db"
+        result = runner.invoke(cli, ["record", "--db", str(db), "--duration", "2s"])
+        _assert_refused(result)
+        assert str(db) in result.output
+
     @pytest.mark.parametrize("kind", ["truncated", "not-sqlite", "zero-byte"])
     def test_compare_refuses_a_bad_db(self, runner, tmp_path, good_db, kind):
         bad = _make_bad_dbs(tmp_path, good_db)[kind]
