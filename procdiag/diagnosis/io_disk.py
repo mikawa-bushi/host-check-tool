@@ -6,9 +6,10 @@ Currently implements:
   linear trend to ``disk_samples``.  Fires WARNING when fewer than 30 days
   remain; CRITICAL when fewer than 7 days remain.
 - **IO-BOTTLENECK-01**: Detect sustained I/O pressure from ``psi_io_some10``
-  sustained above threshold for 15 minutes or more.  Identifies top I/O
-  writers from ``proc_samples``; falls back to ``cg_samples`` when per-process
-  I/O counters are all NULL (non-root); silences when no fallback data exists.
+  sustained above threshold for 15 minutes or more.  Ranks the processes that
+  did the most I/O while it lasted from ``proc_samples``; falls back to
+  ``cg_samples`` when per-process I/O counters are all NULL (non-root);
+  silences when no fallback data exists.
 - **DISK-GROWTH-01**: Detect rapid directory growth from ``dir_samples`` whose
   daily increment exceeds a configurable threshold.  When the directory
   resides on the same mount-point as a DISK-FULL-01 finding the engine will
@@ -24,6 +25,7 @@ IO-BOTTLENECK-01.
 from __future__ import annotations
 
 import datetime
+import math
 from typing import TYPE_CHECKING
 
 from ..core import (
@@ -37,6 +39,7 @@ from ..core import (
     Window,
     register,
 )
+from .episodes import MINUTE, sustained_minutes
 from .trend import confidence_from_span, extrapolate_full
 
 if TYPE_CHECKING:
@@ -187,11 +190,14 @@ class DiskFullRule(Rule):
 class IoBottleneckRule(Rule):
     """Detect sustained I/O pressure by watching ``psi_io_some10``.
 
-    Fires WARNING when ``psi_io_some10`` exceeds the threshold for at least
-    ``min_duration_minutes`` consecutive minutes.  The evidence block
-    identifies the top I/O writers from ``proc_samples``; when all per-process
-    I/O counters are NULL (non-root execution), the rule falls back to
-    ``cg_samples``; when neither source has data, the rule is silent.
+    A minute counts when ``psi_io_some10`` was above the threshold for at least
+    half of it; the rule fires WARNING for the longest run of at least
+    ``min_duration_minutes`` such minutes (see ``episodes``), so seconds of
+    pressure and recording gaps are never read as minutes.  The evidence block
+    ranks the processes by what they read and wrote during that run, from
+    ``proc_samples``; when all per-process I/O counters are NULL (non-root
+    execution), the rule falls back to ``cg_samples``; when neither source has
+    data, the rule is silent.
     """
 
     rule_id = "IO-BOTTLENECK-01"
@@ -202,8 +208,9 @@ class IoBottleneckRule(Rule):
     requires_rows = ("sys_samples", "sys_samples.psi_io_some10")
     requires_observed = (Capability.PSI,)
     what = (
-        "psi_io_some10 が閾値を超えた継続時間を計測し、"
-        "15分以上継続している場合に発火する"
+        "psi_io_some10 が閾値を超えていた秒が 1 分の半分以上を占める分を数え、"
+        "それが 15分以上連続している場合に発火する。"
+        "原因プロセスは、その間の読み書きの量で選ぶ"
     )
     why = (
         "I/O圧迫が継続するとアプリケーションの応答遅延・タイムアウトが発生する。"
@@ -221,94 +228,48 @@ class IoBottleneckRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run IO-BOTTLENECK-01 against the observation window."""
-        # --- Check psi_io_some10 sustained pressure ---
         sys_rows = store.rows(
             "sys_samples",
             since=window.start_ts,
             until=window.end_ts,
         )
-
         if not sys_rows:
             return []
 
-        # Find the longest consecutive run above the threshold.
-        # Duration is measured from the actual timestamps of the first and last
-        # rows in the run, so the result is independent of sampling interval.
-        max_duration_sec: float = 0.0
-        max_above_values: list[float] = []
-
-        run_start_ts: float | None = None
-        run_prev_ts: float | None = None
-        current_run_values: list[float] = []
-
-        for row in sys_rows:
-            val = row["psi_io_some10"]
-            ts = row["ts"]
-            if val is not None and val > self.psi_threshold:
-                if run_start_ts is None:
-                    run_start_ts = ts
-                run_prev_ts = ts
-                current_run_values.append(val)
-                # Measure duration as span of the current run.
-                current_duration = (
-                    (run_prev_ts - run_start_ts) if run_start_ts is not None else 0.0
-                )
-                if current_duration > max_duration_sec:
-                    max_duration_sec = current_duration
-                    max_above_values = list(current_run_values)
-            else:
-                # End of run — finalise if longer than recorded max.
-                if run_start_ts is not None and run_prev_ts is not None:
-                    span = run_prev_ts - run_start_ts
-                    if span > max_duration_sec:
-                        max_duration_sec = span
-                        max_above_values = list(current_run_values)
-                run_start_ts = None
-                run_prev_ts = None
-                current_run_values = []
-
-        # Finalise a run that extends to the end of the window.
-        if run_start_ts is not None and run_prev_ts is not None:
-            span = run_prev_ts - run_start_ts
-            if span > max_duration_sec:
-                max_duration_sec = span
-                max_above_values = list(current_run_values)
-
-        duration_minutes = max_duration_sec / 60.0
-
-        # When row sampling interval is ~60s (test data), a run of N rows spans
-        # (N-1)*60 seconds.  Require at least min_duration_minutes worth of span.
-        # Also handle the edge case where all rows are above threshold but only
-        # one row (span = 0): count rows as a fallback proxy.
-        if duration_minutes < self.min_duration_minutes:
-            # Fallback: count consecutive rows × assumed 60s interval.
-            max_row_count = 0
-            current_row_count = 0
-            for row in sys_rows:
-                val = row["psi_io_some10"]
-                if val is not None and val > self.psi_threshold:
-                    current_row_count += 1
-                    if current_row_count > max_row_count:
-                        max_row_count = current_row_count
-                else:
-                    current_row_count = 0
-            duration_minutes = max(duration_minutes, max_row_count * 1.0)
-
-        above_values = max_above_values
-
-        if duration_minutes < self.min_duration_minutes:
+        pressure = [
+            (
+                row["ts"],
+                row["psi_io_some10"] is not None
+                and row["psi_io_some10"] > self.psi_threshold,
+            )
+            for row in sys_rows
+        ]
+        episodes = sustained_minutes(
+            pressure, min_minutes=max(1, math.ceil(self.min_duration_minutes))
+        )
+        if not episodes:
             return []
 
-        psi_avg = sum(above_values) / len(above_values) if above_values else 0.0
+        ep_start, ep_end = max(episodes, key=lambda ep: ep[1] - ep[0])
+        ep_stop = ep_end + MINUTE
+        duration_minutes = (ep_stop - ep_start) / MINUTE
 
-        # --- Identify top I/O writers from proc_samples ---
+        above_values = [
+            row["psi_io_some10"]
+            for row in sys_rows
+            if ep_start <= row["ts"] < ep_stop
+            and row["psi_io_some10"] is not None
+            and row["psi_io_some10"] > self.psi_threshold
+        ]
+        psi_avg = sum(above_values) / len(above_values)
+
+        # The culprits are ranked by what they read and wrote while the pressure
+        # lasted, not over the whole window.
         proc_rows = store.rows(
             "proc_samples",
             since=window.start_ts,
             until=window.end_ts,
         )
-
-        # Check if io_write_delta is available (non-null) for any row.
         io_available = any(
             r["io_write_delta"] is not None or r["io_read_delta"] is not None
             for r in proc_rows
@@ -319,30 +280,13 @@ class IoBottleneckRule(Rule):
         confidence = Confidence.HIGH
 
         if io_available:
-            # Aggregate total io_write_delta + io_read_delta per proc_id.
-            proc_io: dict[int, int] = {}
-            for row in proc_rows:
-                pid = row["proc_id"]
-                w = row["io_write_delta"] or 0
-                r = row["io_read_delta"] or 0
-                proc_io[pid] = proc_io.get(pid, 0) + w + r
-
-            # Sort by total I/O descending.
-            top_proc_ids = sorted(proc_io, key=lambda k: proc_io[k], reverse=True)[
-                : self.top_n
-            ]
-
-            # Resolve names.
-            for proc_id in top_proc_ids:
-                name = store.proc_name(proc_id)
-                total_bytes = proc_io[proc_id]
-                if total_bytes > 0:
-                    top_writers.append(
-                        {
-                            "name": name,
-                            "write_mb_total": total_bytes / MiB,
-                        }
-                    )
+            episode_rows = [r for r in proc_rows if ep_start <= r["ts"] < ep_stop]
+            for proc_id, read, write in _top_io(
+                episode_rows, "proc_id", "io_read_delta", "io_write_delta", self.top_n
+            ):
+                top_writers.append(
+                    {"name": store.proc_name(proc_id)} | _io_megabytes(read, write)
+                )
 
         else:
             # Fallback: try cg_samples.
@@ -362,32 +306,25 @@ class IoBottleneckRule(Rule):
 
             confidence = Confidence.LOW
 
-            cg_io: dict[int, int] = {}
-            for row in cg_rows:
-                cg_id = row["cg_id"]
-                w = row["io_wbytes_delta"] or 0
-                r = row["io_rbytes_delta"] or 0
-                cg_io[cg_id] = cg_io.get(cg_id, 0) + w + r
-
-            top_cg_ids = sorted(cg_io, key=lambda k: cg_io[k], reverse=True)[
-                : self.top_n
-            ]
-
-            for cg_id in top_cg_ids:
-                unit_path = store.cg_unit_path(cg_id)
-                total_bytes = cg_io[cg_id]
-                if total_bytes > 0:
-                    top_cg_writers.append(
-                        {
-                            "unit_path": unit_path,
-                            "write_mb_total": total_bytes / MiB,
-                        }
-                    )
+            episode_cg_rows = [r for r in cg_rows if ep_start <= r["ts"] < ep_stop]
+            for cg_id, read, write in _top_io(
+                episode_cg_rows,
+                "cg_id",
+                "io_rbytes_delta",
+                "io_wbytes_delta",
+                self.top_n,
+            ):
+                top_cg_writers.append(
+                    {"unit_path": store.cg_unit_path(cg_id)}
+                    | _io_megabytes(read, write)
+                )
 
         evidence = {
             "psi_io_avg": psi_avg,
             "threshold": self.psi_threshold,
             "duration_minutes": duration_minutes,
+            "episode_start": ep_start,
+            "episode_end": ep_end,
             "top_writers": top_writers,
             "top_cg_writers": top_cg_writers,
             "confidence": confidence.value,
@@ -405,10 +342,31 @@ class IoBottleneckRule(Rule):
                 subject="io/psi",
                 summary=summary,
                 evidence=evidence,
-                detected_at=(window.start_ts, window.end_ts),
+                detected_at=(ep_start, ep_end),
                 confidence=confidence,
             )
         ]
+
+
+def _top_io(
+    rows: list, key: str, read_col: str, write_col: str, top_n: int
+) -> list[tuple[int, int, int]]:
+    """``(id, bytes read, bytes written)`` of the *top_n* ids by read + write."""
+    totals: dict[int, list[int]] = {}
+    for row in rows:
+        read_write = totals.setdefault(row[key], [0, 0])
+        read_write[0] += row[read_col] or 0
+        read_write[1] += row[write_col] or 0
+    ranked = sorted(totals.items(), key=lambda kv: sum(kv[1]), reverse=True)
+    return [(i, read, write) for i, (read, write) in ranked[:top_n] if read + write]
+
+
+def _io_megabytes(read: int, write: int) -> dict[str, float]:
+    return {
+        "read_mb_total": read / MiB,
+        "write_mb_total": write / MiB,
+        "io_mb_total": (read + write) / MiB,
+    }
 
 
 # ---------------------------------------------------------------------------
