@@ -47,8 +47,6 @@ STATUSES = (CRITICAL, WARNING, INFO, OK)  # worst first
 _MEM_AVAIL_WARN_PCT = 10.0
 _MEM_AVAIL_CRIT_PCT = 5.0  # same crisis level OOM-KILL-01 uses
 _SWAP_WARN_PCT = 80.0
-_DISK_WARN_PCT = 90.0
-_DISK_CRIT_PCT = 95.0
 _FD_WARN_PCT = 80.0
 _FD_CRIT_PCT = 90.0
 # Newer kernels report fs.file-max as LONG_MAX, i.e. effectively unlimited.
@@ -282,9 +280,11 @@ def _check_io(
 
 @_check("ディスク", "disks", "ディスク")
 def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
-    from .diagnosis.io_disk import DiskInodeRule
+    from .diagnosis.io_disk import DiskFullRule, DiskInodeRule
     from .samplers.disk import _inode_usage, is_read_only, is_watched_mount
 
+    disk_warn = _threshold(config, DiskFullRule, "warning_pct")
+    disk_crit = _threshold(config, DiskFullRule, "critical_pct")
     inode_warn = _threshold(config, DiskInodeRule, "warning_pct")
     inode_crit = _threshold(config, DiskInodeRule, "critical_pct")
     items: List[SnapshotItem] = []
@@ -297,7 +297,7 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
             usage = psutil.disk_usage(path)
         except OSError:
             continue
-        status = _level(usage.percent, _DISK_WARN_PCT, _DISK_CRIT_PCT)
+        status = _level(usage.percent, disk_warn, disk_crit)
         hint = (
             f"`du -sh {shell_quote(mp)}/* | sort -rh | head`"
             " で大きいディレクトリを確認してください"

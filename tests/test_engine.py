@@ -615,7 +615,7 @@ class TestObservationGuard:
                 ts=start + span * i / 360,
                 mountpoint="/var",
                 total=100 * _GB,
-                used=90 * _GB + used_per_minute * i,
+                used=80 * _GB + used_per_minute * i,
             )
             for i in range(361)
         ]

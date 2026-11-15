@@ -266,6 +266,7 @@ config = ProcdiagConfig(
         disk_interval=60.0,     # Tier3: ディスク使用量
         watch_dirs=[
             WatchDir(path="/var/log", time_budget_sec=10),
+            WatchDir(path="/var/log/journal"),  # DISK-JOURNAL-01 用
         ],
     ),
     retention=RetentionConfig(raw="48h", rollup="90d"),

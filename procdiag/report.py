@@ -49,6 +49,7 @@ from procdiag.core import (
     Confidence,
     CoverageGap,
     Diagnosis,
+    Finding,
     Headline,
     ObservationQuality,
     Severity,
@@ -60,6 +61,7 @@ from procdiag.core import (
 from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
 from procdiag.diagnosis.engine import holes_note
+from procdiag.diagnosis.io_disk import usable_bytes
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -99,6 +101,11 @@ def _finish(lines: List[str], color: bool) -> str:
     colour codes pass through, and only when colour was asked for.
     """
     return neutralized_lines(lines, allow=_OWN_SGR if color else ())
+
+
+def _related(f: Finding) -> List[str]:
+    """The findings folded into *f*, each with its summary (only IDs if unknown)."""
+    return [f"{c.rule_id} {c.summary}" for c in f.folded] or f.related
 
 
 def _confidence_ja(conf: "Confidence | str") -> str:
@@ -296,13 +303,16 @@ def _fill_system_series(
 
 
 def _mount_series(disk_rows: List[sqlite3.Row]) -> dict[str, List[Tuple[float, float]]]:
-    """Per-mountpoint used% series from ``disk_samples`` rows."""
+    """Per-mountpoint used% series from ``disk_samples``, as DISK-FULL-01 counts it."""
     mounts: dict[str, List[Tuple[float, float]]] = {}
     for row in disk_rows:
         mp, total, used = row["mountpoint"], row["total"], row["used"]
-        if mp is None or total is None or used is None or total == 0:
+        if mp is None or total is None or used is None:
             continue
-        mounts.setdefault(mp, []).append((float(row["ts"]), used / total * 100.0))
+        capacity = usable_bytes(row)
+        if capacity <= 0:
+            continue
+        mounts.setdefault(mp, []).append((float(row["ts"]), used / capacity * 100.0))
     return mounts
 
 
@@ -478,11 +488,10 @@ def render_terminal(
             if f.proposal:
                 for pline in f.proposal.splitlines():
                     lines.append(f"     {pline}")
-            if f.related:
-                lines.append(
-                    f"     関連する検出 (同一原因とみられるもの): "
-                    f"{', '.join(f.related)}"
-                )
+            related = _related(f)
+            if related:
+                lines.append("     関連する検出 (同一原因とみられるもの):")
+                lines += [f"       {item}" for item in related]
 
     # --- Rule coverage ---
     coverage = _coverage_summary(diag)
@@ -1026,11 +1035,10 @@ def _proposal_section(diag: Diagnosis) -> str:
             proposal_html = "<p>（提案テンプレートなし）</p>"
 
         related_html = ""
-        if f.related:
-            related_html = (
-                f"<p><em>関連する検出 (同一原因とみられるもの): "
-                f"{_esc(', '.join(f.related))}</em></p>"
-            )
+        related = _related(f)
+        if related:
+            items = "".join(f"<li>{_esc(item)}</li>" for item in related)
+            related_html = f"<p><em>関連する検出 (同一原因とみられるもの):</em></p><ul>{items}</ul>"
 
         detail_html += f"""
 <div class="finding {f.severity.value}">

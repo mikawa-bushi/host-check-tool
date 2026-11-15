@@ -19,7 +19,7 @@ from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Severity
 from procdiag.core.sampler import RunContext
 from procdiag.diagnosis import Engine
-from procdiag.report import render_html, render_json, render_terminal
+from procdiag.report import build_charts, render_html, render_json, render_terminal
 from procdiag.samplers.disk import DiskSampler
 from procdiag.storage import TABLE_COLUMNS, Storage
 
@@ -209,6 +209,25 @@ class TestFullDisk:
         (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
 
         assert f.severity is Severity.CRITICAL
+
+    def test_the_report_chart_shows_the_usage_the_rule_judges(self, tmp_path):
+        store, start = _recording(tmp_path, 1)
+        _disk(
+            store,
+            _flat(
+                start,
+                60,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=95 * _GiB,
+                avail=0,
+                read_only=0,
+            ),
+        )
+
+        charts = build_charts(store)
+
+        assert {pct for _, pct in charts.mounts["/"]} == {100.0}
 
 
 class TestGrowthShown:

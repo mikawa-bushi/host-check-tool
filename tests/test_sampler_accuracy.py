@@ -129,7 +129,7 @@ class TestUnreadableWatchDirIsNotNoGrowth:
         assert sorted(r.rule_id for r in diag.uncovered_rules) == _DIR_RULES
         assert {r.reason for r in diag.uncovered_rules} == {CoverageGap.NOT_RECORDED}
 
-    def test_a_readable_watch_dir_keeps_the_rules_evaluated(self, tmp_path):
+    def test_a_readable_watch_dir_keeps_disk_growth_evaluated(self, tmp_path):
         data = tmp_path / "data"
         data.mkdir()
         (data / "a.bin").write_bytes(b"x" * 1000)
@@ -140,8 +140,10 @@ class TestUnreadableWatchDirIsNotNoGrowth:
         diag = _diagnose_dir_rules(store)
         store.close()
 
-        assert sorted(diag.evaluated_rules) == _DIR_RULES
-        assert diag.uncovered_rules == []
+        assert diag.evaluated_rules == ["DISK-GROWTH-01"]
+        assert [(r.rule_id, r.missing) for r in diag.uncovered_rules] == [
+            ("DISK-JOURNAL-01", ("dir_samples (/var/log/journal)",))
+        ]
 
     def test_a_host_without_watch_dirs_keeps_the_rules_evaluated(self, tmp_path):
         store = make_db(tmp_path, hours=3)

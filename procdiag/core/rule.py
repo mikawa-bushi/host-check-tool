@@ -111,6 +111,15 @@ class Rule:
         for name, value in resolved.items():
             setattr(self, name, value)
 
+    def missing_rows(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """Inputs beyond ``requires_rows`` the window has no rows of.
+
+        Empty when the input is there.  A rule that needs particular rows of a
+        table (one watched directory, a complete scan) overrides this, so a
+        window without them is listed as not recorded instead of healthy.
+        """
+        return ()
+
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours of further recording the rule needs beyond ``min_observation_hours``.
 

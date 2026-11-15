@@ -64,6 +64,7 @@ def _make_v3_db(path, *, wal: bool = True) -> None:
         ("disk_samples", "inodes_total"),
         ("disk_samples", "inodes_used"),
         ("disk_samples", "read_only"),
+        ("disk_samples", "avail"),
         ("proc_registry", "fd_soft_limit"),
         ("proc_registry", "fd_hard_limit"),
     ):
@@ -148,17 +149,20 @@ class TestDiskInode:
         store.close()
 
     def test_fast_growth_warns_before_threshold(self, tmp_path):
+        from procdiag.diagnosis.io_disk import DiskInodeRule
+
         store = make_db(tmp_path)
         now = time.time()
-        for i in range(6):  # +10% of the table per 10 minutes → full in ~hours
+        for i in range(7):  # +10% of the table per hour → full in 3 hours
             _disk(
                 store,
-                now - (6 - i) * 600,
+                now - (6.5 - i) * _HOUR,
                 "/",
                 inodes_total=1000,
                 inodes_used=100 + i * 100,
             )
-        (f,) = self._eval(store)
+        store.flush()
+        (f,) = DiskInodeRule().evaluate(store, _window(7.0))
         assert f.evidence["days_left"] is not None and f.evidence["days_left"] < 1
         assert f.confidence == Confidence.MEDIUM  # forecast, below the level threshold
         store.close()

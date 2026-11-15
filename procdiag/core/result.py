@@ -105,6 +105,7 @@ class Finding:
     confidence: Confidence
     related: list[str] = field(default_factory=list)  # folded Finding IDs
     proposal: str = ""  # rendered Jinja2 proposal (T06 fills this)
+    folded: list["Finding"] = field(default_factory=list)  # the Findings themselves
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict representation with Enum values expanded."""
@@ -118,6 +119,7 @@ class Finding:
             "confidence": self.confidence.value,
             "related": list(self.related),
             "proposal": self.proposal,
+            "folded": [f.to_dict() for f in self.folded],
         }
 
 
