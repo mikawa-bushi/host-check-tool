@@ -23,8 +23,9 @@ Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from ..core import (
     Capability,
@@ -331,17 +332,53 @@ def _consecutive_runs(buckets: list[int]) -> list[list[int]]:
     return runs
 
 
+@dataclass(frozen=True)
+class _Episode:
+    """One sustained pressure run, as the minute buckets ``first`` to ``last``."""
+
+    first: int
+    last: int
+
+    @property
+    def minutes(self) -> int:
+        return self.last - self.first + 1
+
+    @property
+    def surroundings(self) -> range:
+        """The run and the minute on each side of it, where swap-out counts."""
+        return range(self.first - 1, self.last + 2)
+
+
+@dataclass(frozen=True)
+class _Pressure:
+    """The local days that hold sustained pressure, and the episodes behind them.
+
+    ``minutes`` and ``swap_out`` count each episode, and each minute's swap-out,
+    once, however many days the episode makes pressure days.
+    """
+
+    days: frozenset[str]
+    minutes: int
+    swap_out: int
+
+
 @register
 class MemPressureRule(Rule):
     """Detect chronically recurring memory pressure with swap activity.
 
-    Queries ``sys_rollup_1m`` and groups the rows by the host's local calendar
-    day.  A day is a *pressure day* when ``psi_mem_max`` exceeds the threshold
-    for at least ``min_pressure_minutes`` minutes in a row and
-    ``min_swap_out_bytes`` were swapped out within a minute of that run.  A day
-    is *observed* with at least ``min_day_observed_hours`` of PSI rows, or when
-    it is a pressure day: the sliver at an edge of a recording is not a day
-    unless it already holds the pressure.  Fires WARNING when at least
+    Queries ``sys_rollup_1m``.  An *episode* is a run of at least
+    ``min_pressure_minutes`` minutes in a row with ``psi_mem_max`` above the
+    threshold, found on the whole timeline so that midnight never cuts one in
+    two.  An episode is pressure on the host's local calendar day that holds
+    most of its minutes (the day it starts on a tie), and on any other day that
+    holds at least ``min_day_observed_hours`` of it.  A day is a *pressure day*
+    when ``min_swap_out_bytes`` were swapped out within a minute of its
+    episodes.  An episode's minutes and swap-out are counted once, however many
+    days it makes pressure days.  A day is *observed* with at least
+    ``min_day_observed_hours`` of PSI rows, or when it is a pressure day: a day
+    with fewer rows (the sliver at an edge of a recording, or a day cut short by
+    a gap or a power loss) is a day only when it already holds the pressure.
+    Fires WARNING when at least
     ``min_pressure_days`` days are pressure days and they are at least
     ``min_recurrence_fraction`` of the observed days.  A recording with fewer
     than ``min_pressure_days`` observed days is reported as not evaluable
@@ -358,9 +395,10 @@ class MemPressureRule(Rule):
     requires_rows = ("sys_rollup_1m", "sys_rollup_1m.psi_mem_max")
     requires_observed = (Capability.PSI,)
     what = (
-        "sys_rollup_1m の psi_mem_max が閾値超の状態が 1 日に一定時間以上途切れず続き、"
-        "その前後の swap_out_sum も一定量以上ある日が、観測が十分なローカル日"
-        "(観測が短くても圧迫のある日を含む) の過半数で反復するかを判定する"
+        "sys_rollup_1m の psi_mem_max が閾値超の状態が一定時間以上途切れず続いた圧迫を"
+        "日付をまたいでも 1 回と数え、その前後の swap_out_sum も一定量以上ある日が、"
+        "観測が十分なローカル日 (観測が短くても圧迫のある日を含む) の過半数で"
+        "反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
@@ -381,11 +419,27 @@ class MemPressureRule(Rule):
     min_swap_out_bytes: int = _MEM_PRESSURE_MIN_SWAP_OUT
     min_pressure_days: int = _MEM_PRESSURE_MIN_DAYS
 
-    def _pressure_days(
-        self, rollup_rows: Iterable[Mapping[str, Any]]
-    ) -> dict[str, tuple[int, int]]:
-        """Local day -> (minutes in sustained runs, swap-out near them) for each
-        day holding a sustained pressure run with enough swap-out."""
+    def _episode_days(self, episode: _Episode) -> set[str]:
+        """The local days an episode is pressure on.
+
+        The day holding most of its minutes (the earlier on a tie), and any other
+        day holding ``min_day_observed_hours`` of it, which is as much pressure
+        as a day needs observation to count.
+        """
+        minutes_by_day: dict[str, int] = {}
+        for bucket in range(episode.first, episode.last + 1):
+            day = _local_day(bucket * 60)
+            minutes_by_day[day] = minutes_by_day.get(day, 0) + 1
+        main_day = max(minutes_by_day, key=minutes_by_day.__getitem__)
+        need = self.min_day_observed_hours * 60
+        return {main_day} | {d for d, m in minutes_by_day.items() if m >= need}
+
+    def _pressure(self, rollup_rows: Iterable[Mapping[str, Any]]) -> _Pressure:
+        """Find the episodes on the whole timeline, then the days they make.
+
+        A day is a pressure day when the swap-out around its episodes reaches
+        ``min_swap_out_bytes``.
+        """
         swap_out_by_bucket: dict[int, int] = {}
         pressure_buckets: set[int] = set()
         for row in rollup_rows:
@@ -397,29 +451,29 @@ class MemPressureRule(Rule):
             if psi is not None and psi > self.psi_threshold:
                 pressure_buckets.add(bucket)
 
-        sustained_by_day: dict[str, set[int]] = {}
+        episodes_by_day: dict[str, list[_Episode]] = {}
         for run in _consecutive_runs(sorted(pressure_buckets)):
             if len(run) >= self.min_pressure_minutes:
-                for bucket in run:
-                    sustained_by_day.setdefault(_local_day(bucket * 60), set()).add(
-                        bucket
-                    )
+                episode = _Episode(run[0], run[-1])
+                for day in self._episode_days(episode):
+                    episodes_by_day.setdefault(day, []).append(episode)
 
-        days: dict[str, tuple[int, int]] = {}
-        for day, sustained in sustained_by_day.items():
-            near = {b + d for b in sustained for d in (-1, 0, 1)}
-            swap_out = sum(swap_out_by_bucket.get(b, 0) for b in near)
-            if (
-                len(sustained) >= self.min_pressure_minutes
-                and swap_out >= self.min_swap_out_bytes
-            ):
-                days[day] = (len(sustained), swap_out)
-        return days
+        def swap_out_around(episodes: Collection[_Episode]) -> int:
+            around = {b for e in episodes for b in e.surroundings}
+            return sum(swap_out_by_bucket.get(b, 0) for b in around)
+
+        days = {
+            day
+            for day, episodes in episodes_by_day.items()
+            if swap_out_around(episodes) >= self.min_swap_out_bytes
+        }
+        behind = {e for day in days for e in episodes_by_day[day]}
+        return _Pressure(
+            frozenset(days), sum(e.minutes for e in behind), swap_out_around(behind)
+        )
 
     def _judged_days(
-        self,
-        observed_minutes: Mapping[str, int],
-        pressure_days: Mapping[str, tuple[int, int]],
+        self, observed_minutes: Mapping[str, int], pressure_days: Collection[str]
     ) -> dict[str, bool]:
         """Day -> is it a pressure day, for the days the rule can judge."""
         need = self.min_day_observed_hours * 60
@@ -435,16 +489,20 @@ class MemPressureRule(Rule):
         A day needs ``min_day_observed_hours`` of PSI rows to count unless it is
         already a pressure day, so a recording of 24 hours can hold a single
         observed day, and "recurs on most days" cannot be judged from it.  The
-        answer assumes the recording goes on without gaps.
+        answer assumes the recording goes on without gaps and without more
+        pressure than the recording already holds.
         """
         rows = store.rows("sys_rollup_1m", since=window.start_ts, until=window.end_ts)
         observed = _observed_minutes_by_day(rows)
         if not observed:
             return 0.0
-        pressure = self._pressure_days(rows)
+        pressure_days = self._pressure(rows).days
 
         def enough() -> bool:
-            return len(self._judged_days(observed, pressure)) >= self.min_pressure_days
+            return (
+                len(self._judged_days(observed, pressure_days))
+                >= self.min_pressure_days
+            )
 
         if enough():
             return 0.0
@@ -471,9 +529,9 @@ class MemPressureRule(Rule):
         if all_psi_none:
             return []
 
-        pressure_by_day = self._pressure_days(rollup_rows)
+        pressure = self._pressure(rollup_rows)
         events_by_day = self._judged_days(
-            _observed_minutes_by_day(rollup_rows), pressure_by_day
+            _observed_minutes_by_day(rollup_rows), pressure.days
         )
 
         n_days = len(events_by_day)
@@ -484,9 +542,6 @@ class MemPressureRule(Rule):
         recurrence = detect_recurrence(events_by_day)
         if recurrence < self.min_recurrence_fraction:
             return []
-
-        total_swap_out = sum(pressure_by_day[d][1] for d in pressure_days)
-        total_pressure_minutes = sum(pressure_by_day[d][0] for d in pressure_days)
 
         # Compute representative peak PSI for the summary.
         peak_psi = max(
@@ -501,8 +556,8 @@ class MemPressureRule(Rule):
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
             "pressure_days": pressure_days,
-            "swap_out_total_bytes": total_swap_out,
-            "pressure_event_count": total_pressure_minutes,
+            "swap_out_total_bytes": pressure.swap_out,
+            "pressure_event_count": pressure.minutes,
             "min_pressure_minutes": self.min_pressure_minutes,
             "min_swap_out_bytes": self.min_swap_out_bytes,
             "min_day_observed_hours": self.min_day_observed_hours,
@@ -526,8 +581,8 @@ class MemPressureRule(Rule):
 
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"
-            f" {self.min_pressure_minutes}分以上途切れず続く日が {n_pressure_days}/{n_days} 日で反復"
-            f" (圧迫中のスワップアウト {humanize_bytes(total_swap_out)})"
+            f" {self.min_pressure_minutes}分以上途切れず続く日が {n_pressure_days}/{n_days} 日"
+            f" (圧迫中のスワップアウト {humanize_bytes(pressure.swap_out)})"
         )
 
         confidence = (
