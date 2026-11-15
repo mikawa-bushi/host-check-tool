@@ -262,7 +262,9 @@ class Engine:
            whose declared inputs (``requires_schema`` / ``requires_rows``,
            and ``Rule.missing_rows``) are missing for the window, or whose
            ``requires_observed`` no recording in the window could observe, is
-           not run and is listed in ``uncovered_rules``.
+           not run and is listed in ``uncovered_rules``.  A rule that ran but
+           left a part of its verdict unjudged says so through
+           ``Rule.coverage_notes``, which become quality notes.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
         5. Sort by severity → confidence.
@@ -307,6 +309,7 @@ class Engine:
         errored: list[str] = []
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
+        unjudged: list[str] = []
         coverage_cache: dict[tuple[str, str], bool] = {}
         unobserved = (
             [p for u in store.unobserved_periods() if (p := u.within(window))]
@@ -377,6 +380,7 @@ class Engine:
                     found = rule.report(measured)
                 else:
                     found = rule.evaluate(store, window)
+                unjudged.extend(rule.coverage_notes(store, window))
             except Exception as exc:
                 msg = (
                     f"ルール {rule.rule_id} で例外が発生しました: "
@@ -418,7 +422,11 @@ class Engine:
 
         # --- Step 6: build quality ---
         quality = self._build_quality(
-            store, window, events_in_window=has_data, unobserved=unobserved
+            store,
+            window,
+            events_in_window=has_data,
+            unobserved=unobserved,
+            unjudged=unjudged,
         )
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
@@ -571,8 +579,12 @@ class Engine:
         *,
         events_in_window: bool,
         unobserved: list[Unobserved],
+        unjudged: list[str],
     ) -> ObservationQuality:
-        """Assemble ObservationQuality from DB statistics over *window*."""
+        """Assemble ObservationQuality from DB statistics over *window*.
+
+        *unjudged* are the ``Rule.coverage_notes`` of the rules that ran.
+        """
         since, until = (
             (window.start_ts, window.end_ts) if events_in_window else (None, None)
         )
@@ -602,7 +614,7 @@ class Engine:
         )
         missing_io_pct = store.missing_io_ratio(window.start_ts, window.end_ts)
 
-        notes: list[str] = []
+        notes: list[str] = list(unjudged)
         if missing_io_pct is not None and missing_io_pct > 0.1:
             notes.append(
                 f"io_counters 欠損率 {missing_io_pct:.0%} — "

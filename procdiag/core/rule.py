@@ -120,6 +120,18 @@ class Rule:
         """
         return ()
 
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """What the rule ran without judging in *window*, for the report's notes.
+
+        Empty when it judged everything it looks at.  A rule that runs but has
+        a part the window cannot support (a forecast that needs more hours, a
+        directory whose scans never finished) overrides this; the engine adds
+        the notes of every rule that ran to the quality notes, so a result
+        without a finding says what it left unjudged instead of reading as
+        healthy.
+        """
+        return ()
+
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours of further recording the rule needs beyond ``min_observation_hours``.
 

@@ -111,16 +111,10 @@ class DiskFullRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-FULL-01 against the observation window."""
-        rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
-
-        by_mount: dict[str, list] = {}
-        for row in rows:
-            if row["used"] is not None and row["total"] is not None:
-                by_mount.setdefault(row["mountpoint"], []).append(row)
-
         findings: list[Finding] = []
-        for mountpoint, mrows in by_mount.items():
-            mrows = _one_filesystem(mrows)
+        for mountpoint, mrows in _current_filesystems(
+            store, window, _has_bytes
+        ).items():
             last = mrows[-1]
             used, total, capacity = last["used"], last["total"], usable_bytes(last)
             if capacity <= 0:
@@ -155,6 +149,7 @@ class DiskFullRule(Rule):
                 "avail_recorded": _column(last, "avail") is not None,
                 "warning_pct": self.warning_pct,
                 "critical_pct": self.critical_pct,
+                "critical": critical,
             }
 
             parts = []
@@ -185,6 +180,13 @@ class DiskFullRule(Rule):
 
         return findings
 
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """The mounts whose days-to-full forecast waits for more recording."""
+        mounts = _current_filesystems(store, window, _has_bytes)
+        return _forecast_waits(
+            self.rule_id, "満杯までの残り日数", mounts, window, self.min_trend_hours
+        )
+
 
 # A filesystem whose size changes by more than this from one sample to the
 # next is another one: a different USB stick or card at the same mount point,
@@ -207,6 +209,27 @@ def _one_filesystem(rows: list) -> list:
     while first > 0 and _same_size(rows[first - 1]["total"], rows[first]["total"]):
         first -= 1
     return rows[first:]
+
+
+def _has_bytes(row) -> bool:
+    return row["used"] is not None and row["total"] is not None
+
+
+def _has_inodes(row) -> bool:
+    return bool(row["inodes_total"]) and row["inodes_used"] is not None
+
+
+def _current_filesystems(store: "Storage", window: Window, usable) -> dict[str, list]:
+    """Each mount's ``disk_samples`` rows of the filesystem it has now.
+
+    Only the rows *usable* accepts are looked at.
+    """
+    by_mount: dict[str, list] = {}
+    rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
+    for row in rows:
+        if usable(row):
+            by_mount.setdefault(row["mountpoint"], []).append(row)
+    return {mount: _one_filesystem(rows) for mount, rows in by_mount.items()}
 
 
 def _column(row, name: str):
@@ -232,11 +255,41 @@ def _forecast(
     None unless *rows* cover *min_hours* of recording: a stick filled for a
     few minutes, or one large copy in an hour, is not a trend.
     """
-    hours = window.observed_hours_between(rows[0]["ts"], rows[-1]["ts"])
+    hours = _recorded_hours(rows, window)
     if not covers(hours, min_hours):
         return None, hours
     series = [(r["ts"], float(r[column])) for r in rows]
     return forecast_full(series, capacity, min_points=3), hours
+
+
+def _recorded_hours(rows: list, window: Window) -> float:
+    return window.observed_hours_between(rows[0]["ts"], rows[-1]["ts"])
+
+
+def _forecast_waits(
+    rule_id: str,
+    what: str,
+    mounts: dict[str, list],
+    window: Window,
+    min_hours: float,
+) -> tuple[str, ...]:
+    """The note naming the mounts whose forecast waits, or ``()`` for none.
+
+    Each is named with the hours of recording it still needs.  The usage level
+    is judged whatever the recording, so the note says only the forecast waits.
+    """
+    waits = []
+    for mount, rows in mounts.items():
+        hours = _recorded_hours(rows, window)
+        if not covers(hours, min_hours):
+            waits.append(f"{mount} (あと {max(min_hours - hours, 0.1):.1f}h)")
+    if not waits:
+        return ()
+    return (
+        f"{rule_id}: {what}の予測はまだ判定していません (使用率は判定済み)。"
+        f"今のファイルシステムの記録が {min_hours:g} 時間に届いていないマウント: "
+        + "、".join(waits),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +525,22 @@ class DiskGrowthRule(Rule):
         if not rows or any(_complete(row) for row in rows):
             return ()
         return ("dir_samples (時間内に終わった走査)",)
+
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """The directories none of whose scans in the window finished in time."""
+        rows = store.rows("dir_samples", since=window.start_ts, until=window.end_ts)
+        done = {row["path"] for row in rows if _complete(row)}
+        cut = dict.fromkeys(
+            row["path"]
+            for row in rows
+            if row["size_bytes"] is not None and row["path"] not in done
+        )
+        if not cut:
+            return ()
+        return (
+            f"{self.rule_id}: 走査が毎回時間内に終わらず増分を判定できません: "
+            + "、".join(cut),
+        )
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-GROWTH-01 against the observation window."""
@@ -750,16 +819,10 @@ class DiskInodeRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-INODE-01 against the observation window."""
-        rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
-
-        by_mount: dict[str, list] = {}
-        for row in rows:
-            if row["inodes_total"] and row["inodes_used"] is not None:
-                by_mount.setdefault(row["mountpoint"], []).append(row)
-
         findings: list[Finding] = []
-        for mountpoint, mrows in by_mount.items():
-            mrows = _one_filesystem(mrows)
+        for mountpoint, mrows in _current_filesystems(
+            store, window, _has_inodes
+        ).items():
             last = mrows[-1]
             total, used = last["inodes_total"], last["inodes_used"]
             used_pct = used / total * 100.0
@@ -803,6 +866,17 @@ class DiskInodeRule(Rule):
                 )
             )
         return findings
+
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """The mounts whose inode forecast waits for more recording."""
+        mounts = _current_filesystems(store, window, _has_inodes)
+        return _forecast_waits(
+            self.rule_id,
+            "inode が尽きるまでの残り日数",
+            mounts,
+            window,
+            self.min_trend_hours,
+        )
 
 
 # ---------------------------------------------------------------------------
