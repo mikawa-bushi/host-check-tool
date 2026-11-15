@@ -3,7 +3,9 @@
 Currently implements:
 
 - **MEM-LEAK-01**: Detect monotonically growing RSS in a process over the
-  observation window using linear regression (via ``trend.fit_linear``).
+  observation window using linear regression, each process of a program on
+  its own and followed across restarts (``trend.proc_instances``), reported
+  once per program (``trend.worst_process_per_program``).
   Fires WARNING when slope > 1 MB/h and R² > 0.9; CRITICAL when the slope
   exceeds the critical threshold.  Confidence is derived from R² and
   observation time.
@@ -33,6 +35,7 @@ from ..core import (
     Finding,
     Headline,
     MeasuredRule,
+    Measurement,
     MiB,
     Observation,
     Rule,
@@ -42,15 +45,17 @@ from ..core import (
 )
 from ..core.util import humanize_bytes
 from .trend import (
+    ProcInstance,
     baseline_deviation,
     confidence_from_fit,
     detect_recurrence,
-    fit_each,
-    fit_linear,
-    group_series,
     learn_baseline,
     observed_fit,
+    proc_details,
+    proc_instances,
+    proc_label,
     proc_trend_observations,
+    worst_process_per_program,
 )
 
 if TYPE_CHECKING:
@@ -96,21 +101,23 @@ def select_pss_targets(proc_rollup_rows: Iterable[Mapping[str, Any]]) -> list[in
     """Pick the proc_ids whose RSS grows fastest, as PSS scrutiny targets.
 
     *proc_rollup_rows* are ``proc_rollup_1m`` rows covering the last
-    ``PSS_PRECHECK_WINDOW_HOURS``.  Returns at most ``_PSS_MAX_TARGETS``
-    proc_ids, steepest RSS slope first.
+    ``PSS_PRECHECK_WINDOW_HOURS``.  Each process of a program is fitted on its
+    own (see :func:`~procdiag.diagnosis.trend.proc_instances`).  Returns at
+    most ``_PSS_MAX_TARGETS`` proc_ids, steepest RSS slope first.
     """
     candidates: list[tuple[float, int]] = []  # (slope_mb_h, proc_id)
-    for proc_id, _series, fit in fit_each(
-        group_series(proc_rollup_rows, key="proc_id", value="rss_avg"),
-        min_points=_PSS_PRECHECK_MIN_POINTS,
-        min_span_hours=_PSS_PRECHECK_MIN_SPAN_HOURS,
-        min_r2=_PSS_PRECHECK_MIN_R2,
-    ):
+    for instance in proc_instances(proc_rollup_rows, "rss_avg"):
+        fit = instance.fit(
+            min_points=_PSS_PRECHECK_MIN_POINTS,
+            min_span_hours=_PSS_PRECHECK_MIN_SPAN_HOURS,
+        )
+        if fit is None or fit.r2 < _PSS_PRECHECK_MIN_R2:
+            continue
         slope_mb_h = fit.slope_per_hour / MiB
         if slope_mb_h >= _PSS_PRECHECK_SLOPE_MB_H:
-            candidates.append((slope_mb_h, proc_id))
+            candidates.append((slope_mb_h, instance.proc_id))
     candidates.sort(reverse=True)
-    return [proc_id for _, proc_id in candidates[:_PSS_MAX_TARGETS]]
+    return list(dict.fromkeys(proc_id for _, proc_id in candidates))[:_PSS_MAX_TARGETS]
 
 
 def _is_python_process(name: str) -> bool:
@@ -164,6 +171,9 @@ class MemLeakRule(MeasuredRule):
             holes=window.holes,
         )
 
+    def report(self, measured: list[Measurement]) -> list[Finding]:
+        return worst_process_per_program(measured)
+
     def judge(
         self, store: "Storage", window: Window, obs: Observation
     ) -> Optional[Finding]:
@@ -196,8 +206,7 @@ class MemLeakRule(MeasuredRule):
         )
 
         evidence = {
-            "proc_id": proc_id,
-            "process_name": process_name,
+            **proc_details(obs),
             "slope_mb_per_h": slope_mb_h,
             "r2": fit.r2,
             "n": fit.n,
@@ -210,7 +219,7 @@ class MemLeakRule(MeasuredRule):
         }
 
         confidence = self._apply_pss_evidence(
-            store, window, proc_id, confidence, evidence
+            store, window, proc_id, obs.evidence["pids"], confidence, evidence
         )
 
         try:
@@ -225,7 +234,8 @@ class MemLeakRule(MeasuredRule):
                     confidence = Confidence.HIGH
 
         summary = (
-            f"{process_name}: RSS +{slope_mb_h:.1f} MB/h で単調増加"
+            f"{proc_label(process_name, obs.evidence['script'], obs.evidence['pid'])}:"
+            f" RSS +{slope_mb_h:.1f} MB/h で単調増加"
             f" (R²={fit.r2:.2f}, {fit.span_hours:.1f}h観測)"
         )
 
@@ -244,6 +254,7 @@ class MemLeakRule(MeasuredRule):
         store: "Storage",
         window: Window,
         proc_id: int,
+        pids: list[int],
         confidence: Confidence,
         evidence: dict,
     ) -> Confidence:
@@ -253,23 +264,27 @@ class MemLeakRule(MeasuredRule):
         (see :func:`select_pss_targets`).  A clearly rising PSS confirms the
         leak (HIGH); a flat PSS means the RSS growth is likely shared memory or
         page cache (LOW).  Without enough PSS samples *confidence* is returned
-        unchanged.  *evidence* is annotated in place.
+        unchanged.  *evidence* is annotated in place.  Only the processes in
+        *pids* count, each at its own level; with no PIDs (rows rolled up
+        before procdiag kept them) every process of the program does.
         """
-        pss_series = store.series(
+        rows = store.rows(
             "proc_samples",
-            "pss",
-            subject_col="proc_id",
-            subject=proc_id,
             since=window.start_ts,
             until=window.end_ts,
+            where="proc_id = ? AND pss IS NOT NULL",
+            params=(proc_id,),
         )
-        if len(pss_series) < _PSS_MIN_POINTS:
+        by_pid: dict[int, list[tuple[float, float]]] = {}
+        for row in rows:
+            if not pids or row["pid"] in pids:
+                by_pid.setdefault(row["pid"] if pids else 0, []).append(
+                    (row["ts"], float(row["pss"]))
+                )
+        if sum(len(points) for points in by_pid.values()) < _PSS_MIN_POINTS:
             return confidence
-        pss_fit = fit_linear(
-            pss_series,
-            min_points=_PSS_MIN_POINTS,
-            min_span_hours=0.0,
-            holes=window.holes,
+        pss_fit = ProcInstance(proc_id, list(by_pid.items())).fit(
+            min_points=_PSS_MIN_POINTS, min_span_hours=0.0, holes=window.holes
         )
         if pss_fit is None:
             return confidence

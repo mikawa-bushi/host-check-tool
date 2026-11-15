@@ -14,7 +14,9 @@ writes a single ``.tar.gz`` with:
 
 Process command lines may carry credentials (``--password=…``), so they are
 removed from the copied DB unless ``keep_cmdline`` is set; process *names* are
-kept, and no rule reads the command line, so the diagnosis is unaffected.
+kept.  The diagnosis does not depend on the command line: findings only name
+the script a program runs from it (``uploader.py``), which a report made from
+the copy then leaves out.
 """
 
 from __future__ import annotations

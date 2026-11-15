@@ -117,6 +117,10 @@ def humanize_duration(sec: float) -> str:
     return "".join(parts) if parts else "0秒"
 
 
+# Characters of a command line kept as its display sample.
+CMDLINE_SAMPLE_CHARS = 200
+
+
 def normalize_cmdline(
     cmdline: list[str], *, replace_digits: bool = True
 ) -> tuple[str, str]:
@@ -144,7 +148,7 @@ def normalize_cmdline(
     hash12 = hashlib.sha1(normalised.encode("utf-8", errors="replace")).hexdigest()[:12]
 
     # Keep the display sample short but recognisable.
-    display = raw_text[:200] if len(raw_text) > 200 else raw_text
+    display = raw_text[:CMDLINE_SAMPLE_CHARS]
 
     return hash12, display
 
@@ -248,14 +252,6 @@ def dumps_json(obj: Any) -> str:
 def shell_quote(value: object) -> str:
     """*value* as one shell word, safe to paste into a command line."""
     return shlex.quote(str(value))
-
-
-_UNIT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]{0,254}")
-
-
-def is_unit_name(name: object) -> bool:
-    """Whether *name* could be a systemd unit name (so ``systemctl restart`` fits)."""
-    return isinstance(name, str) and _UNIT_NAME.fullmatch(name) is not None
 
 
 class CounterDelta:
