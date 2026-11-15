@@ -25,9 +25,10 @@ from procdiag import storage
 from procdiag.cli import cli
 from procdiag.compare import Clear, Detected, Verdict
 from procdiag.config import ProcdiagConfig
-from procdiag.core import Confidence
+from procdiag.core import Confidence, Finding, Measurement, Observation, Severity
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.memory import select_pss_targets
+from procdiag.diagnosis.trend import worst_process_per_program
 from procdiag.storage import Storage, make_row
 
 _MiB = 1024**2
@@ -217,6 +218,29 @@ class TestEveryWorkerOfAPoolLeaks:
         assert select_pss_targets(rows) == [proc_id]
         store.close()
 
+    def test_a_pid_is_not_counted_as_another_process_of_itself(self):
+        def fired(pid, slope):
+            finding = Finding(
+                rule_id="MEM-LEAK-01",
+                severity=Severity.WARNING,
+                subject="svc",
+                summary=f"svc (PID {pid}): RSS +{slope}.0 MB/h",
+                evidence={"proc_id": 1, "pid": pid},
+                detected_at=(0.0, 1.0),
+                confidence=Confidence.MEDIUM,
+            )
+            observation = Observation("svc", "hash", float(slope), finding.evidence)
+            return Measurement(observation, finding)
+
+        (f,) = worst_process_per_program(
+            [fired(100, 5), fired(100, 4), fired(101, 3), fired(101, 2)]
+        )
+
+        assert f.evidence["pid"] == 100
+        assert f.evidence["other_processes"] == 1
+        assert f.evidence["other_pids"] == [101]
+        assert "他 1 プロセスも同様 (PID 101)" in f.summary
+
     def test_rows_without_a_pid_are_not_counted_as_another_process(self, tmp_path):
         start = _start(7)
         store = make_db(tmp_path, hours=7)
@@ -324,15 +348,25 @@ class TestLeakingProgramRestarted:
         assert _findings(store, ["MEM-LEAK-01"]) == []
         store.close()
 
-    def test_a_long_chain_of_restarts_shows_its_last_five_pids(self, tmp_path):
+    @pytest.mark.parametrize("rule", _LEAK_RULES)
+    def test_a_long_chain_of_restarts_shows_its_last_five_pids(self, tmp_path, rule):
         def processes(h):
             if h < 4:
                 return [(0, 9000 + int(h * 6), 100 * _MiB, 40, 10)]
-            return [(0, 9999, 100 * _MiB + 5 * _MiB * (h - 4), 40, 10)]
+            grown = h - 4
+            return [
+                (
+                    0,
+                    9999,
+                    100 * _MiB + 5 * _MiB * grown,
+                    40 + int(5 * grown),
+                    10 + int(5 * grown),
+                )
+            ]
 
         store, _ = _recording(tmp_path, 12, [("svc", "/opt/plc/svc")], processes)
 
-        (f,) = _findings(store, ["MEM-LEAK-01"])
+        (f,) = _findings(store, [rule])
 
         (detected,) = [
             line for line in f.proposal.splitlines() if line.startswith("[検出]")
@@ -502,8 +536,16 @@ def _oom_findings(store):
 
 class TestOomVictim:
     @staticmethod
-    def _oom(tmp_path, *, respawn, crisis=True, kernel_pid=1000, peak_rss=None):
-        """One hour at 10 s: plc-gateway (PID 1000, 3 GiB) is killed at 30 min."""
+    def _oom(
+        tmp_path,
+        *,
+        respawn,
+        crisis=True,
+        kernel_pid=1000,
+        peak_rss=None,
+        program=("plc-gateway", "/opt/plc/gateway --port 502"),
+    ):
+        """One hour at 10 s: the *program* (PID 1000, 3 GiB) is killed at 30 min."""
         t0 = time.time() // 60 * 60 - 2 * _HOUR
         kill = t0 + 1800
         store = make_db(tmp_path, hours=1)
@@ -511,7 +553,7 @@ class TestOomVictim:
             _host(t0 + i, crisis=crisis and kill - 60 <= t0 + i <= kill)
             for i in range(0, 3600, 10)
         ]
-        victim = _register(store, "plc-gateway", "/opt/plc/gateway --port 502", t0)
+        victim = _register(store, *program, t0)
         other = _register(store, "sshd", "/usr/sbin/sshd -D", t0)
         procs = []
         for i in range(0, 3600, 10):
@@ -525,7 +567,7 @@ class TestOomVictim:
         store.buffer("sys_samples", sys_rows)
         store.buffer("proc_samples", procs)
         store.buffer(
-            "kernel_events", [(kill, "oom", _oom_line(kernel_pid, "plc-gateway"))]
+            "kernel_events", [(kill, "oom", _oom_line(kernel_pid, program[0]))]
         )
         store.flush(reason="synth")
         return store
@@ -572,6 +614,19 @@ class TestOomVictim:
         assert self._run(store) == []
         store.close()
 
+    def test_the_report_names_the_script_of_the_victim(self, tmp_path):
+        program = ("python3", "/usr/bin/python3 /opt/plc/gateway.py --port 502")
+        store = self._oom(tmp_path, respawn=True, program=program)
+
+        (f,) = self._run(store)
+
+        (detected,) = [
+            line for line in f.proposal.splitlines() if line.startswith("[検出]")
+        ]
+        assert "python3 gateway.py (PID 1000) が消滅" in detected
+        assert "--port" not in f.proposal
+        store.close()
+
     def test_last_rss_is_the_last_sample_not_the_peak(self, tmp_path):
         store = self._oom(tmp_path, respawn=False, peak_rss=6 * _GiB)
 
@@ -588,6 +643,12 @@ class TestExplainOomKill:
 
         assert result.exit_code == 0, result.output
         assert "Killed process" in result.output
+
+    def test_it_says_the_program_not_the_last_process_must_have_run_ten_minutes(self):
+        result = CliRunner().invoke(cli, ["explain", "OOM-KILL-01"])
+
+        assert "最初の記録から 10 分以上" in result.output
+        assert "最後のプロセスが 10 分に満たなくても" in result.output
 
 
 class TestOomFindingsPerProgram:
@@ -706,6 +767,101 @@ class TestNoOomKillWhileTheProgramRuns:
     def test_a_planned_restart_is_not_an_oom_kill(self, tmp_path):
         runs = [(3100, 0, 5), (3101, 5, 12)]
         store = self._recorded(tmp_path, "plc-gateway", runs, {5 * 60 - 1})
+
+        assert _oom_findings(store) == []
+        store.close()
+
+
+class TestOomWithoutKernelLineJudgesTheProgramsSpan:
+    @staticmethod
+    def _recorded(tmp_path, runs, *, name="plc-gateway"):
+        """Twelve hours of an 8 GiB host and the program *name* (300 MiB, flat).
+
+        *runs* are ``(pid, first_tick, end_tick)`` in 30 s samples.  A 4 KiB
+        swap-out a minute before the last sample is the only memory crisis.
+        """
+        last_sample = max(end for _pid, _first, end in runs) - 1
+
+        def hours(tick):
+            return (tick + 0.5) / 120
+
+        return TestNoOomKillWhileTheProgramRuns._recorded(
+            tmp_path,
+            name,
+            [(pid, hours(first), hours(end)) for pid, first, end in runs],
+            {last_sample // 2 - 1},
+        )
+
+    @pytest.mark.parametrize("lived_min", [3, 5, 9])
+    def test_a_service_restarted_by_hand_that_dies_young_is_suspected(
+        self, tmp_path, lived_min
+    ):
+        runs = [(3100, 0, 600), (3101, 600, 600 + 2 * lived_min)]
+        store = self._recorded(tmp_path, runs)
+
+        (f,) = _oom_findings(store)
+
+        assert f.evidence["pid"] == 3101
+        assert f.confidence is Confidence.MEDIUM
+        assert f.evidence["lifetime_minutes"] == lived_min - 0.5
+        assert f.evidence["program_lifetime_minutes"] == 300 + lived_min - 0.5
+        store.close()
+
+    def test_a_crash_loop_that_ends_in_a_kill_is_suspected(self, tmp_path):
+        runs = [(5000 + k, 7 * k, 7 * k + 6) for k in range(85)]
+        store = self._recorded(tmp_path, runs, name="uploader")
+
+        (f,) = _oom_findings(store)
+
+        assert f.evidence["pid"] == 5084
+        assert f.evidence["lifetime_minutes"] == 2.5
+        assert f.evidence["program_lifetime_minutes"] == 296.5
+        store.close()
+
+    def test_the_report_says_the_program_ran_long_enough_not_the_process(
+        self, tmp_path
+    ):
+        store = self._recorded(tmp_path, [(3100, 0, 600), (3101, 600, 606)])
+
+        (f,) = _oom_findings(store)
+
+        assert "PID 3101" in f.summary
+        assert "生存 2.5分, プログラムとして 302.5分 動作," in f.summary
+        detected, basis = [
+            line
+            for line in f.proposal.splitlines()
+            if line.startswith(("[検出]", "[根拠]"))
+        ]
+        assert "生存期間 2.5 分、プログラムとしては 302.5 分)" in detected
+        assert "生存期間は 2.5分 だが、同じプログラムが 302.5分 >= 10分" in basis
+        store.close()
+
+    def test_the_program_span_is_not_mentioned_when_the_process_lived_long(
+        self, tmp_path
+    ):
+        store = self._recorded(tmp_path, [(3100, 0, 600), (3101, 600, 630)])
+
+        (f,) = _oom_findings(store)
+
+        assert f.evidence["lifetime_minutes"] == 14.5
+        assert "program_lifetime_minutes" not in f.evidence
+        assert "プログラムとして" not in f.summary
+        assert "プログラムとしては" not in f.proposal
+        assert "生存期間 14.5分 >= 10分 の長命プロセス" in f.proposal
+        store.close()
+
+    @pytest.mark.parametrize(
+        "runs",
+        [
+            [(3100, 720, 738)],
+            [(5000, 720, 726), (5001, 727, 733), (5002, 734, 740)],
+        ],
+        ids=["one process", "crash loop"],
+    )
+    def test_a_program_that_ran_under_ten_minutes_is_not_suspected(
+        self, tmp_path, runs
+    ):
+        store = self._recorded(tmp_path, runs)
 
         assert _oom_findings(store) == []
         store.close()
