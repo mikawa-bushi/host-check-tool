@@ -263,8 +263,11 @@ class Engine:
            and ``Rule.missing_rows``) are missing for the window, or whose
            ``requires_observed`` no recording in the window could observe, is
            not run and is listed in ``uncovered_rules``.  A rule that ran but
-           left a part of its verdict unjudged says so through
-           ``Rule.coverage_notes``, which become quality notes.
+           left a part of its verdict unjudged for lack of recording says so
+           through ``Rule.pending_parts``, which join ``skipped_rules`` (the
+           rule stays in ``evaluated_rules``); one that left a part unjudged
+           for another reason says so through ``Rule.coverage_notes``, which
+           become quality notes.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
         5. Sort by severity → confidence.
@@ -381,6 +384,16 @@ class Engine:
                 else:
                     found = rule.evaluate(store, window)
                 unjudged.extend(rule.coverage_notes(store, window))
+                pending = rule.pending_parts(store, window)
+                if pending:
+                    waits = "、".join(
+                        f"{p.part} {p.subject} あと {p.remaining_hours:.1f}h"
+                        for p in pending
+                    )
+                    reasoning.append(
+                        f"{rule.rule_id}: 記録が足りず判定していない部分があります ({waits})"
+                    )
+                    skipped.extend(pending)
             except Exception as exc:
                 msg = (
                     f"ルール {rule.rule_id} で例外が発生しました: "

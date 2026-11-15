@@ -154,12 +154,20 @@ class ObservationQuality:
 
 @dataclass
 class SkippedRule:
-    """A selected rule that could not run because the recording is too short."""
+    """A selected rule, or a part of one, that the recording is too short to judge.
+
+    Without ``part`` the whole rule did not run.  With ``part`` the rule ran
+    and judged what the recording supports, but left *part* (a forecast that
+    needs more hours of one mount, say) unjudged for ``subject``, so the host
+    is not yet cleared of what that part looks for.
+    """
 
     rule_id: str
     title: str
-    required_hours: float  # minimum observation the rule needs
+    required_hours: float  # minimum observation the rule (or part) needs
     remaining_hours: float  # how much longer to record before it can run
+    part: Optional[str] = None  # what the rule left unjudged; None for all of it
+    subject: Optional[str] = None  # what *part* is unjudged for (a mount point)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict representation."""
@@ -168,6 +176,8 @@ class SkippedRule:
             "title": self.title,
             "required_hours": self.required_hours,
             "remaining_hours": self.remaining_hours,
+            "part": self.part,
+            "subject": self.subject,
         }
 
 

@@ -39,6 +39,7 @@ from ..core import (
     MiB,
     Rule,
     Severity,
+    SkippedRule,
     Window,
     covers,
     register,
@@ -180,12 +181,10 @@ class DiskFullRule(Rule):
 
         return findings
 
-    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+    def pending_parts(self, store: "Storage", window: Window) -> list[SkippedRule]:
         """The mounts whose days-to-full forecast waits for more recording."""
         mounts = _current_filesystems(store, window, _has_bytes)
-        return _forecast_waits(
-            self.rule_id, "満杯までの残り日数", mounts, window, self.min_trend_hours
-        )
+        return _forecast_pending(self, mounts, window)
 
 
 # A filesystem whose size changes by more than this from one sample to the
@@ -266,30 +265,32 @@ def _recorded_hours(rows: list, window: Window) -> float:
     return window.observed_hours_between(rows[0]["ts"], rows[-1]["ts"])
 
 
-def _forecast_waits(
-    rule_id: str,
-    what: str,
-    mounts: dict[str, list],
-    window: Window,
-    min_hours: float,
-) -> tuple[str, ...]:
-    """The note naming the mounts whose forecast waits, or ``()`` for none.
+_FORECAST_PART = "残り日数の予測"
 
-    Each is named with the hours of recording it still needs.  The usage level
-    is judged whatever the recording, so the note says only the forecast waits.
+
+def _forecast_pending(
+    rule: "DiskFullRule | DiskInodeRule", mounts: dict[str, list], window: Window
+) -> list[SkippedRule]:
+    """One entry for each mount whose forecast the recording is too short for.
+
+    Each says how many more hours the mount's current filesystem needs.  The
+    usage level is judged whatever the recording, so only the forecast waits.
     """
-    waits = []
+    pending = []
     for mount, rows in mounts.items():
         hours = _recorded_hours(rows, window)
-        if not covers(hours, min_hours):
-            waits.append(f"{mount} (あと {max(min_hours - hours, 0.1):.1f}h)")
-    if not waits:
-        return ()
-    return (
-        f"{rule_id}: {what}の予測はまだ判定していません (使用率は判定済み)。"
-        f"今のファイルシステムの記録が {min_hours:g} 時間に届いていないマウント: "
-        + "、".join(waits),
-    )
+        if not covers(hours, rule.min_trend_hours):
+            pending.append(
+                SkippedRule(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    required_hours=rule.min_trend_hours,
+                    remaining_hours=max(rule.min_trend_hours - hours, 0.1),
+                    part=_FORECAST_PART,
+                    subject=mount,
+                )
+            )
+    return pending
 
 
 # ---------------------------------------------------------------------------
@@ -527,19 +528,26 @@ class DiskGrowthRule(Rule):
         return ("dir_samples (時間内に終わった走査)",)
 
     def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
-        """The directories none of whose scans in the window finished in time."""
+        """The directories cut-short scans leave without two complete ones.
+
+        Growth needs two complete scans.  A directory scanned to the end once
+        or never in the window is named, however many scans were cut short.
+        """
         rows = store.rows("dir_samples", since=window.start_ts, until=window.end_ts)
-        done = {row["path"] for row in rows if _complete(row)}
-        cut = dict.fromkeys(
-            row["path"]
-            for row in rows
-            if row["size_bytes"] is not None and row["path"] not in done
-        )
-        if not cut:
+        done: dict[str, int] = {}
+        cut: dict[str, int] = {}
+        for row in rows:
+            if row["size_bytes"] is None:
+                continue
+            counts = done if _complete(row) else cut
+            counts[row["path"]] = counts.get(row["path"], 0) + 1
+        short = [path for path in cut if done.get(path, 0) < 2]
+        if not short:
             return ()
         return (
-            f"{self.rule_id}: 走査が毎回時間内に終わらず増分を判定できません: "
-            + "、".join(cut),
+            f"{self.rule_id}: 走査が時間内に終わらず、完了した走査が 2 回に満たず"
+            "増分を判定できません: "
+            + "、".join(f"{p} (完了 {done.get(p, 0)} 回)" for p in short),
         )
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
@@ -867,16 +875,10 @@ class DiskInodeRule(Rule):
             )
         return findings
 
-    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+    def pending_parts(self, store: "Storage", window: Window) -> list[SkippedRule]:
         """The mounts whose inode forecast waits for more recording."""
         mounts = _current_filesystems(store, window, _has_inodes)
-        return _forecast_waits(
-            self.rule_id,
-            "inode が尽きるまでの残り日数",
-            mounts,
-            window,
-            self.min_trend_hours,
-        )
+        return _forecast_pending(self, mounts, window)
 
 
 # ---------------------------------------------------------------------------
