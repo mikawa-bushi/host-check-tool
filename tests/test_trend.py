@@ -235,6 +235,14 @@ def _hourly_timestamps(n_hours: int, minute: int = 15) -> list[float]:
 
 
 class TestDetectPeriodicity:
+    @pytest.fixture(autouse=True)
+    def _utc_host(self, monkeypatch):
+        monkeypatch.setenv("TZ", "UTC")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
     def test_daily_pattern(self):
         """Same time each day for 5 days should detect a daily period."""
         ts = _daily_timestamps(5, hour=14, minute=30)
