@@ -644,4 +644,4 @@ class TestProcessSampler:
         sampler.collect = _broken_collect  # type: ignore[method-assign]
         result = sampler.run(ctx)
         assert result == []
-        assert any("collect失敗" in note for note in ctx.notes)
+        assert any("collect失敗" in note.text for note in ctx.notes)

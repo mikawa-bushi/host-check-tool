@@ -152,8 +152,8 @@ class Recorder:
         self._session_id: Optional[int] = None
         self._flush_interval = 60.0
         self._retention_interval = 3600.0
-        # Samplers whose collect failure this session has already kept.
-        self._failed_samplers: set[str] = set()
+        # Keys of the notes this session has already kept.
+        self._noted: set[str] = set()
         self._ran = False
         self._dir_walk: Optional[_DirWalk] = None
 
@@ -271,19 +271,18 @@ class Recorder:
         return batches
 
     def _keep_failure_notes(self) -> None:
-        """Keep each sampler's first collect failure of this session in the DB.
+        """Keep the first note of each key (a sampler's collect failure) of this session in the DB.
 
-        Once per sampler: a sampler that fails on every tick must not fill the
-        DB with the same note.  ``check`` shows them in its quality notes.
+        Once per key: a sampler that fails on every tick must not fill the DB
+        with the same note.  ``check`` shows them in its quality notes.
         """
         notes, self._ctx.notes = self._ctx.notes, []
         for note in notes:
-            name = note.partition(":")[0]
-            if name in self._failed_samplers:
+            if note.key in self._noted:
                 continue
-            self._failed_samplers.add(name)
+            self._noted.add(note.key)
             try:
-                self._storage.record_event("sampler_failed", note)
+                self._storage.record_event("sampler_failed", note.text)
             except sqlite3.Error as exc:
                 logger.error("サンプラーの失敗を記録 DB に書き込めません: %s", exc)
 
