@@ -459,14 +459,22 @@ def _measured_state(gap: Optional[Unknown], m: Optional[Measurement]) -> SideSta
     return Clear(m.observation.value, dict(m.observation.evidence))
 
 
+def _badness(m: Measurement) -> tuple[int, float]:
+    severity = m.finding.severity if m.finding else None
+    return (_SEVERITY_RANK[severity] if severity else -1, m.observation.value)
+
+
 def _pair(
     before: list[Measurement], after: list[Measurement]
 ) -> list[tuple[Optional[Measurement], Optional[Measurement]]]:
     def key(m: Measurement) -> tuple[str, Optional[str]]:
         return m.observation.subject, m.observation.identity
 
-    b_by = {key(m): m for m in before}
-    a_by = {key(m): m for m in after}
+    # The processes of one program (side-by-side workers) are measured one by
+    # one, and the program is as bad as its worst process: sorted mildest
+    # first, the worst one is the last written under the program's key.
+    b_by = {key(m): m for m in sorted(before, key=_badness)}
+    a_by = {key(m): m for m in sorted(after, key=_badness)}
     pairs: list[tuple[Optional[Measurement], Optional[Measurement]]] = [
         (b_by[k], a_by[k]) for k in b_by if k in a_by
     ]

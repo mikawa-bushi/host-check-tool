@@ -186,8 +186,12 @@ class MeasuredRule(Rule):
             for obs in self.observe(store, window)
         ]
 
+    def report(self, measured: list[Measurement]) -> list[Finding]:
+        """The findings ``check`` shows for *measured*: each one that fires."""
+        return [m.finding for m in measured if m.finding]
+
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
-        return [m.finding for m in self.assess(store, window) if m.finding]
+        return self.report(self.assess(store, window))
 
 
 def resolve_overrides(

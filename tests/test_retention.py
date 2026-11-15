@@ -56,7 +56,7 @@ def _insert_proc_samples(
             (
                 ts,  # ts
                 proc_id,  # proc_id
-                1000 + i,  # pid (varies but proc_id is constant → same process)
+                1000,  # pid
                 float(5 + i % 5),  # cpu_pct
                 200_000_000,  # rss
                 None,  # pss

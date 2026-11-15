@@ -27,7 +27,7 @@ Design doc reference: §6.2 CPU-PERIODIC-01 / CPU-SINGLECORE-01 / CPU-SATURATION
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ..core import (
     Capability,
@@ -252,19 +252,19 @@ class CpuSinglecoreRule(Rule):
                 since=ep_start,
                 until=ep_end,
             )
-            cpu_by_proc: dict[int, float] = {}
+            cpu_by_proc: dict[tuple[int, Optional[int]], float] = {}
             for row in proc_rows:
                 if row["cpu_avg"] is not None:
-                    pid = row["proc_id"]
-                    cpu_by_proc[pid] = cpu_by_proc.get(pid, 0.0) + row["cpu_avg"]
+                    key = (row["proc_id"], row["pid"])
+                    cpu_by_proc[key] = cpu_by_proc.get(key, 0.0) + row["cpu_avg"]
 
-            top_procs_ids = sorted(
-                cpu_by_proc, key=lambda p: cpu_by_proc[p], reverse=True
-            )[:5]
+            top_procs = sorted(cpu_by_proc, key=lambda p: cpu_by_proc[p], reverse=True)
+            # A pool of workers is listed once, where its busiest process ranks.
+            top_programs = list(dict.fromkeys(proc_id for proc_id, _pid in top_procs))
 
             top_process_names: list[str] = []
             has_python = False
-            for proc_id in top_procs_ids:
+            for proc_id in top_programs[:5]:
                 name = store.proc_name(proc_id)
                 top_process_names.append(name)
                 if "python" in name.lower():
