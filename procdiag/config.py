@@ -150,11 +150,21 @@ class BudgetConfig(_Model):
     # Seconds after start excluded from the overhead average (start-up cost).
     warmup_sec: float = 60.0
 
-    @field_validator("overhead_budget_pct", "throttle_factor", "throttle_max_interval")
+    @field_validator("overhead_budget_pct", "throttle_max_interval")
     @classmethod
     def _positive_float(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"値は正の数でなければなりません: {v}")
+        return v
+
+    @field_validator("throttle_factor")
+    @classmethod
+    def _widening_factor(cls, v: float) -> float:
+        if v <= 1:
+            raise ValueError(
+                "throttle_factor は 1 より大きい数でなければなりません "
+                f"(自動減速で Tier-2b の間隔を何倍にするか): {v}"
+            )
         return v
 
     @field_validator("warmup_sec")
@@ -345,7 +355,7 @@ config = ProcdiagConfig(
 
     budget=BudgetConfig(
         overhead_budget_pct=1.0,   # 自己CPUオーバーヘッド上限 (%)
-        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数
+        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1 より大きい数)
         throttle_max_interval=60.0, # 自動減速で広げる Tier2b 間隔の上限 (秒)
         warmup_sec=60.0,           # 起動直後この秒数は自己負荷の判定から除外
     ),

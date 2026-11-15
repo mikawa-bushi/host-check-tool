@@ -10,7 +10,9 @@ Key design choices:
   ``cpu_percent()`` can return a meaningful diff (the first call on a fresh
   object always returns 0.0 or None on some platforms).  A PID's first sample
   holds its CPU use since it started instead: a batch job that started since
-  the previous scan is then a culprit of the spike it causes.
+  the previous scan is then a culprit of the spike it causes.  That value is
+  None for a process younger than a second and when the boot time cannot be
+  read.
 * **oneshot context** — all attributes are read inside ``Process.oneshot()``
   to minimise /proc round-trips.
 * **AccessDenied handling** — if I/O counters are denied, the ``io_read_delta``
@@ -85,22 +87,32 @@ def _read_pss_bytes(smaps_rollup: Path) -> Optional[int]:
         return None
 
 
-def _cpu_since_start(proc: psutil.Process, boot_time: float) -> Optional[float]:
+# The start time and the CPU time are both counted in ticks of 10 ms, so the
+# share of a process younger than this is mostly rounding (over 100 % was seen).
+_MIN_AGE_SEC = 1.0
+
+
+def _cpu_since_start(
+    proc: psutil.Process, boot_time: Optional[float]
+) -> Optional[float]:
     """CPU % of *proc* since it started, as ``cpu_percent()`` would measure it.
 
     ``cpu_percent()`` measures since its previous call on the same object, so
     the first read of a PID has nothing to compare with.  The age comes from
     the boot clock: ``create_time()`` adds the boot time of ``/proc/stat``,
     which is cut to whole seconds, so on the wall clock a process one second
-    old could look half as busy.
+    old could look half as busy.  Without a boot time (a ``/proc/stat`` that
+    has no ``btime`` line) there is no start time to measure from.
     """
+    if boot_time is None:
+        return None
     try:
         times = proc.cpu_times()
         started = proc.create_time() - boot_time
     except _DENIED_OR_ZOMBIE:
         return None
     age = time.clock_gettime(time.CLOCK_BOOTTIME) - started
-    if age <= 0:
+    if age < _MIN_AGE_SEC:
         return None
     return round((times.user + times.system) / age * 100.0, 1)
 
@@ -173,7 +185,11 @@ class ProcessSampler(Sampler):
         rows: list[tuple] = []
         zombies = 0
         read_fds = self._should_read_fds(ctx)
-        boot_time = psutil.boot_time()
+        boot_time: Optional[float]
+        try:
+            boot_time = psutil.boot_time()
+        except (RuntimeError, OSError):
+            boot_time = None
         self._refresh_pid_cache()
 
         for pid, proc in list(self._pid_cache.items()):
@@ -290,7 +306,7 @@ class ProcessSampler(Sampler):
         *,
         read_fds: bool,
         first_read: bool,
-        boot_time: float,
+        boot_time: Optional[float],
     ) -> _Reading:
         """Read one process's metrics inside a single ``oneshot()`` block.
 

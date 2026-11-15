@@ -41,7 +41,7 @@ config = ProcdiagConfig(
     ),
     budget=BudgetConfig(
         overhead_budget_pct=1.0,  # 自己CPUオーバーヘッド上限 (%)
-        throttle_factor=1.5,  # 超過時のTier2b間隔拡大係数
+        throttle_factor=1.5,  # 超過時のTier2b間隔拡大係数 (1 より大きい数)
         throttle_max_interval=60.0,  # 自動減速で広げる Tier2b 間隔の上限 (秒)
     ),
     retention=RetentionConfig(

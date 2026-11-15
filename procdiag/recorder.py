@@ -363,17 +363,21 @@ class Recorder:
             self._dir_walk.join(_DIR_WALK_WAIT_SEC)
             self._take_dir_walk()
 
-    def _take_dir_walk(self) -> None:
-        """Buffer the rows and notes of a finished walk, on the scheduler thread."""
+    def _take_dir_walk(self) -> bool:
+        """Buffer the rows and notes of a finished walk, on the scheduler thread.
+
+        Returns whether there are rows to flush.
+        """
         walk = self._dir_walk
         if walk is None or walk.running():
-            return
+            return False
         self._dir_walk = None
         for batch in walk.batches:
             self._storage.buffer(batch.table, batch.rows)
         if walk.ctx.notes:
             self._ctx.notes.extend(walk.ctx.notes)
             self._keep_failure_notes()
+        return bool(walk.batches)
 
     def _flush(self, reason: str) -> bool:
         """Write the buffered rows; on failure say why and keep them buffered."""
@@ -633,12 +637,20 @@ class Recorder:
         try:
             for name in _EVENT_SAMPLERS:
                 self._run_sampler(name)
-            if self._dir_walk is not None:
-                self._dir_walk.join(self._dir_walk.budget)
-            self._take_dir_walk()
         except Exception:
             logger.exception("シャットダウン例外")
         saved = self._flush("signal")
+        # A walk stuck on a mount holds this wait for its whole budget, which
+        # can be as long as the service's TimeoutStopSec: what is recorded is
+        # already written by now.
+        try:
+            walk = self._dir_walk
+            if walk is not None:
+                walk.join(walk.budget)
+                if self._take_dir_walk():
+                    saved = self._flush("interval")
+        except Exception:
+            logger.exception("シャットダウン例外")
         if saved:
             # Roll up the just-flushed final samples so the last (up to one
             # flush-interval + 1 min) of raw data is promoted to *_rollup_1m
