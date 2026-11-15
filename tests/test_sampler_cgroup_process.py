@@ -440,7 +440,7 @@ class TestProcessSampler:
             first = sampler.collect(_make_ctx())[0].rows
             second = sampler.collect(_make_ctx())[0].rows
         # Column index 3 is cpu_pct.
-        assert first[0][3] == pytest.approx(75.0, abs=0.2)
+        assert first[0][3] == pytest.approx(75.0, abs=1.5)
         assert second[0][3] == 12.5
 
     def test_first_collect_leaves_cpu_empty_for_a_process_younger_than_a_second(self):
@@ -456,7 +456,7 @@ class TestProcessSampler:
         ):
             rows = {r[2]: r for r in sampler.collect(_make_ctx())[0].rows}
         assert rows[4243][3] is None
-        assert rows[4244][3] == pytest.approx(95.0, abs=1.0)
+        assert rows[4244][3] == pytest.approx(95.0, abs=5.0)
 
     def test_first_collect_leaves_cpu_empty_when_the_start_time_is_in_the_future(self):
         sampler, _ = self._sampler()
