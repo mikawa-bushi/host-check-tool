@@ -328,6 +328,7 @@ config = ProcdiagConfig(
         kernel_log_interval=300.0,    # Tier3: カーネルログの異常 (秒)
         watch_dirs=[
             # WatchDir(path="/var/log", time_budget_sec=10),
+            # WatchDir(path="/var/log/journal"),  # DISK-JOURNAL-01 用 (/var/log だけでは測れない)
             # WatchDir(path="/opt/myapp/data"),
         ],
         cmdline_normalize=True,       # 数字引数をプレースホルダに置換してプロセス台帳爆発を防ぐ
