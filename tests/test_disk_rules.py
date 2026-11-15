@@ -10,11 +10,13 @@ import time
 from collections import namedtuple
 
 import pytest
+from click.testing import CliRunner
 from synth import add_dir_series, add_sys_baseline, disk_row, make_db
 
 import procdiag.samplers.disk as disk_mod
 import procdiag.snapshot as snap
 from procdiag import storage
+from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Severity
 from procdiag.core.sampler import RunContext
@@ -65,6 +67,24 @@ def _uncovered(diag):
 
 def _flat(start, minutes, **columns):
     return [{"ts": start + m * 60, **columns} for m in range(minutes + 1)]
+
+
+def _filling(start, hours, *, gb_per_hour, first_gb=50):
+    """A 100 GiB disk that fills at *gb_per_hour*, sampled every minute."""
+    rows = []
+    for m in range(int(hours * 60) + 1):
+        used = int((first_gb + gb_per_hour * m / 60) * _GiB)
+        rows.append(
+            {
+                "ts": start + m * 60,
+                "mountpoint": "/",
+                "total": 100 * _GiB,
+                "used": used,
+                "avail": 100 * _GiB - used,
+                "read_only": 0,
+            }
+        )
+    return rows
 
 
 class TestFullDisk:
@@ -387,6 +407,32 @@ class TestTruncatedScans:
         assert "DISK-GROWTH-01" in _uncovered(diag)
         assert "DISK-GROWTH-01" not in diag.evaluated_rules
 
+    def test_a_directory_every_scan_of_which_was_cut_short_is_named(self, tmp_path):
+        store, start = _recording(tmp_path, 24)
+        _dirs(
+            store,
+            [
+                (start + h * _HOUR, "/srv/grow", (1 + h // 4) * _GiB, 0)
+                for h in range(25)
+            ]
+            + [
+                (start + h * _HOUR, "/srv/archive", (20 + 2 * h) * _GiB, 1)
+                for h in range(25)
+            ]
+            + [
+                (start + h * _HOUR, "/srv/mixed", 5 * _GiB, 1 if h == 3 else 0)
+                for h in range(25)
+            ],
+        )
+
+        diag = _run(store, "DISK-GROWTH-01")
+
+        assert [f.subject for f in _found(diag, "DISK-GROWTH-01")] == ["/srv/grow"]
+        (note,) = [n for n in diag.quality.notes if "DISK-GROWTH-01" in n]
+        assert "走査が毎回時間内に終わらず増分を判定できません" in note
+        assert "/srv/archive" in note
+        assert "/srv/grow" not in note and "/srv/mixed" not in note
+
 
 class TestShortTrends:
     def test_one_copy_in_a_one_hour_recording_is_not_a_forecast(self, tmp_path):
@@ -515,6 +561,163 @@ class TestShortTrends:
         )
 
         assert _found(_run(store, "FS-READONLY-01"), "FS-READONLY-01") == []
+
+    def test_a_stick_plugged_in_for_an_hour_is_named_with_the_hours_it_needs(
+        self, tmp_path
+    ):
+        store = self._with_usb(tmp_path, [(600 + k, 32, 1, 0) for k in range(61)])
+
+        (note,) = [
+            n for n in _run(store, "DISK-FULL-01").quality.notes if "DISK-FULL-01" in n
+        ]
+
+        assert "/media/usb (あと 5.0h)" in note
+        assert "/ (あと" not in note
+
+    def test_another_stick_at_the_same_mount_point_is_not_inode_growth(self, tmp_path):
+        store, start = _recording(tmp_path, 24)
+        small = {"total": 8 * _GiB, "inodes_total": 500_000, "inodes_used": 10_000}
+        large = {"total": 64 * _GiB, "inodes_total": 4_000_000}
+        _disk(
+            store,
+            [
+                {"ts": start + m * 60, "mountpoint": "/media/usb", "used": _GiB}
+                | small
+                | {"read_only": 0}
+                for m in range(120, 541)
+            ]
+            + [
+                {"ts": start + m * 60, "mountpoint": "/media/usb", "used": _GiB}
+                | large
+                | {"inodes_used": 2_000_000, "read_only": 0}
+                for m in range(720, 1201)
+            ],
+        )
+
+        assert _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01") == []
+
+
+class TestForecastNotJudged:
+    @pytest.mark.parametrize("hours, wait", [(2, "4.0"), (5, "1.0"), (5.9, "0.1")])
+    def test_a_fast_filling_disk_in_a_short_recording_says_its_forecast_waits(
+        self, tmp_path, hours, wait
+    ):
+        store, start = _recording(tmp_path, hours)
+        _disk(store, _filling(start, hours, gb_per_hour=5))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert "DISK-FULL-01" in diag.evaluated_rules
+        (note,) = [n for n in diag.quality.notes if "DISK-FULL-01" in n]
+        assert "満杯までの残り日数の予測はまだ判定していません" in note
+        assert f"/ (あと {wait}h)" in note
+
+    def test_the_usage_level_is_judged_while_the_forecast_waits(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        used = int(92 * _GiB)
+        _disk(
+            store,
+            _flat(
+                start,
+                180,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=used,
+                avail=100 * _GiB - used,
+                read_only=0,
+            ),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.severity is Severity.WARNING
+        assert any("DISK-FULL-01" in n and "あと 3.0h" in n for n in diag.quality.notes)
+
+    def test_nothing_is_said_once_the_mount_is_recorded_for_six_hours(self, tmp_path):
+        store, start = _recording(tmp_path, 6)
+        _disk(store, _filling(start, 6, gb_per_hour=0.01))
+
+        diag = _run(store, "DISK-FULL-01", "DISK-INODE-01")
+
+        assert [n for n in diag.quality.notes if "DISK-" in n] == []
+
+    def test_an_inode_forecast_that_waits_is_said_too(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": "/",
+                    "total": 100 * _GiB,
+                    "used": 40 * _GiB,
+                    "inodes_total": 1_000_000,
+                    "inodes_used": 400_000 + 50_000 * m // 60,
+                    "read_only": 0,
+                }
+                for m in range(181)
+            ],
+        )
+
+        diag = _run(store, "DISK-INODE-01")
+
+        (note,) = [n for n in diag.quality.notes if "DISK-INODE-01" in n]
+        assert "inode が尽きるまでの残り日数の予測はまだ判定していません" in note
+        assert "/ (あと 3.0h)" in note
+
+    def test_check_says_it_in_text_json_and_html(self, tmp_path):
+        store, start = _recording(tmp_path, 5)
+        _disk(store, _filling(start, 5, gb_per_hour=5))
+        store.close()
+
+        def check(*args):
+            result = CliRunner().invoke(
+                cli, ["check", "--db", str(store.path), "--only", "DISK-FULL-01", *args]
+            )
+            assert result.exit_code == 0, result.output
+            return result.output
+
+        for out in (check("--no-color"), check("--format", "html")):
+            assert "満杯までの残り日数の予測はまだ判定していません" in out
+            assert "/ (あと 1.0h)" in out
+        (note,) = json.loads(check("--format", "json"))["quality"]["notes"]
+        assert "DISK-FULL-01" in note and "/ (あと 1.0h)" in note
+
+
+class TestLevelWording:
+    @staticmethod
+    def _at(tmp_path, pct):
+        store, start = _recording(tmp_path, 3)
+        used = int(100 * _GiB * pct / 100)
+        _disk(
+            store,
+            _flat(
+                start,
+                180,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=used,
+                avail=100 * _GiB - used,
+                read_only=0,
+            ),
+        )
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+        return f
+
+    def test_a_warning_just_under_the_critical_line_is_not_called_urgent(
+        self, tmp_path
+    ):
+        f = self._at(tmp_path, 94.96)
+
+        assert f.severity is Severity.WARNING
+        assert "緊急対応が必要です" not in f.proposal
+
+    def test_a_critical_disk_is_called_urgent(self, tmp_path):
+        f = self._at(tmp_path, 95.0)
+
+        assert f.severity is Severity.CRITICAL
+        assert "緊急対応が必要です" in f.proposal
 
 
 class TestJournalCoverage:
