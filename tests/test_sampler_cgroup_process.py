@@ -620,7 +620,7 @@ class TestProcessSampler:
             sampler._pid_cache = {}
             sampler._prev_io = {}
 
-            # First tick for PID 1234 — establishes baseline; cpu_pct=None.
+            # First tick for PID 1234: registers it and sets the cpu_percent baseline.
             b1 = sampler.collect(ctx)
 
         # Get the proc_id assigned to "testproc".

@@ -47,7 +47,8 @@ tests/fixtures/cgroup_tree/          # 擬似 /sys/fs/cgroup ツリー
 設計書 §4.4 を忠実に:
 - `psutil.Process` を **PIDキャッシュ** `dict[int, psutil.Process]` で保持・再利用
   (cpu_percent の差分計測のため)。消えたPIDは `NoSuchProcess` で除去。
-  新規PIDの初回 cpu_percent は記録しない(行ごと飛ばすのではなく cpu_pct=None で記録)
+  新規PIDの初回は cpu_percent の起点が無いので、起動からの CPU 時間÷経過時間を cpu_pct に記録する
+  (起動から1秒未満のPIDと、boot 時刻を読めない環境では cpu_pct=None。行は飛ばさない)
 - `Process.oneshot()` 内で name, cmdline, cpu_percent, memory_info.rss, num_threads,
   num_fds, io_counters, status を読む。`AccessDenied` は io列のみ None にして続行し、
   **欠損カウンタ**を自インスタンスに集計(`self.io_denied`/`self.io_total` —
