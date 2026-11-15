@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 import pytest
-from synth import add_proc_series, add_sys_baseline, make_db
+from synth import add_proc_series, add_sys_baseline, disk_row, make_db
 from test_recorder import FakeClock, _AdvancingSleep, _make_config, _make_samplers
 
 from procdiag.config import ProcdiagConfig, RulesConfig
@@ -33,7 +33,18 @@ def _window(hours: float = 2.0) -> Window:
 
 def _disk(store, ts, mp, *, inodes_total, inodes_used, read_only=0, total=100, used=10):
     store.buffer(
-        "disk_samples", [(ts, mp, total, used, inodes_total, inodes_used, read_only)]
+        "disk_samples",
+        [
+            disk_row(
+                ts=ts,
+                mountpoint=mp,
+                total=total,
+                used=used,
+                inodes_total=inodes_total,
+                inodes_used=inodes_used,
+                read_only=read_only,
+            )
+        ],
     )
 
 
@@ -103,6 +114,7 @@ class TestMigrationV4:
             ).run(
                 store,
                 only=[
+                    "DISK-FULL-01",
                     "DISK-INODE-01",
                     "FS-READONLY-01",
                     "UNCLEAN-SHUTDOWN-01",

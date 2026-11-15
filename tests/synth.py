@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from procdiag.storage import Storage
+from procdiag.storage import TABLE_COLUMNS, Storage
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +38,15 @@ from procdiag.storage import Storage
 
 _MB = 1024 * 1024
 _GB = 1024**3
+
+
+def disk_row(**columns: object) -> tuple:
+    """A ``disk_samples`` row from named columns; columns not named are NULL.
+
+    A column the schema does not have is left out, so a test may name what a
+    newer recorder records and still run against an older schema.
+    """
+    return tuple(columns.get(c) for c in TABLE_COLUMNS["disk_samples"])
 
 
 def make_db(tmp_path: Path, *, hours: float = 24.0) -> Storage:
@@ -278,8 +287,7 @@ def add_disk_series(
         ts = start_ts + i * 3600.0
         used = int(used_start + hourly_growth * i)
         used = min(used, total)
-        # inode / read-only columns (schema v4) are left NULL: not measured.
-        rows.append((ts, mountpoint, total, used, None, None, None))
+        rows.append(disk_row(ts=ts, mountpoint=mountpoint, total=total, used=used))
 
     store.buffer("disk_samples", rows)
     store.flush(reason="synth")
