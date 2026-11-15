@@ -407,7 +407,7 @@ class TestTruncatedScans:
         assert "DISK-GROWTH-01" in _uncovered(diag)
         assert "DISK-GROWTH-01" not in diag.evaluated_rules
 
-    def test_a_directory_every_scan_of_which_was_cut_short_is_named(self, tmp_path):
+    def test_a_directory_without_two_complete_scans_is_named(self, tmp_path):
         store, start = _recording(tmp_path, 24)
         _dirs(
             store,
@@ -420,6 +420,15 @@ class TestTruncatedScans:
                 for h in range(25)
             ]
             + [
+                (
+                    start + h * _HOUR,
+                    "/srv/nearly",
+                    (20 + 2 * h) * _GiB,
+                    0 if h == 7 else 1,
+                )
+                for h in range(25)
+            ]
+            + [
                 (start + h * _HOUR, "/srv/mixed", 5 * _GiB, 1 if h == 3 else 0)
                 for h in range(25)
             ],
@@ -429,8 +438,8 @@ class TestTruncatedScans:
 
         assert [f.subject for f in _found(diag, "DISK-GROWTH-01")] == ["/srv/grow"]
         (note,) = [n for n in diag.quality.notes if "DISK-GROWTH-01" in n]
-        assert "走査が毎回時間内に終わらず増分を判定できません" in note
-        assert "/srv/archive" in note
+        assert "完了した走査が 2 回に満たず増分を判定できません" in note
+        assert "/srv/archive" in note and "/srv/nearly" in note
         assert "/srv/grow" not in note and "/srv/mixed" not in note
 
 
@@ -567,12 +576,9 @@ class TestShortTrends:
     ):
         store = self._with_usb(tmp_path, [(600 + k, 32, 1, 0) for k in range(61)])
 
-        (note,) = [
-            n for n in _run(store, "DISK-FULL-01").quality.notes if "DISK-FULL-01" in n
-        ]
+        diag = _run(store, "DISK-FULL-01")
 
-        assert "/media/usb (あと 5.0h)" in note
-        assert "/ (あと" not in note
+        assert _pending(diag) == {("DISK-FULL-01", "/media/usb"): pytest.approx(5.0)}
 
     def test_another_stick_at_the_same_mount_point_is_not_inode_growth(self, tmp_path):
         store, start = _recording(tmp_path, 24)
@@ -597,9 +603,39 @@ class TestShortTrends:
         assert _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01") == []
 
 
+def _pending(diag):
+    """What each rule ran without judging yet: ``{(rule, mount): hours to wait}``."""
+    return {
+        (r.rule_id, r.subject): r.remaining_hours for r in diag.skipped_rules if r.part
+    }
+
+
+def _check(db, *args, only="DISK-FULL-01", code=0):
+    result = CliRunner().invoke(
+        cli, ["check", "--db", str(db), "--only", only, "--no-color", *args]
+    )
+    assert result.exit_code == code, result.output
+    return result.output
+
+
+def _inode_rows(start, hours):
+    return [
+        {
+            "ts": start + m * 60,
+            "mountpoint": "/",
+            "total": 100 * _GiB,
+            "used": 40 * _GiB,
+            "inodes_total": 1_000_000,
+            "inodes_used": 400_000 + 50_000 * m // 60,
+            "read_only": 0,
+        }
+        for m in range(int(hours * 60) + 1)
+    ]
+
+
 class TestForecastNotJudged:
-    @pytest.mark.parametrize("hours, wait", [(2, "4.0"), (5, "1.0"), (5.9, "0.1")])
-    def test_a_fast_filling_disk_in_a_short_recording_says_its_forecast_waits(
+    @pytest.mark.parametrize("hours, wait", [(2, 4.0), (5, 1.0), (5.9, 0.1)])
+    def test_a_fast_filling_disk_in_a_short_recording_is_not_fully_evaluated(
         self, tmp_path, hours, wait
     ):
         store, start = _recording(tmp_path, hours)
@@ -608,9 +644,8 @@ class TestForecastNotJudged:
         diag = _run(store, "DISK-FULL-01")
 
         assert "DISK-FULL-01" in diag.evaluated_rules
-        (note,) = [n for n in diag.quality.notes if "DISK-FULL-01" in n]
-        assert "満杯までの残り日数の予測はまだ判定していません" in note
-        assert f"/ (あと {wait}h)" in note
+        assert not diag.fully_evaluated
+        assert _pending(diag) == {("DISK-FULL-01", "/"): pytest.approx(wait, abs=0.05)}
 
     def test_the_usage_level_is_judged_while_the_forecast_waits(self, tmp_path):
         store, start = _recording(tmp_path, 3)
@@ -632,57 +667,349 @@ class TestForecastNotJudged:
 
         (f,) = _found(diag, "DISK-FULL-01")
         assert f.severity is Severity.WARNING
-        assert any("DISK-FULL-01" in n and "あと 3.0h" in n for n in diag.quality.notes)
+        assert _pending(diag) == {("DISK-FULL-01", "/"): pytest.approx(3.0, abs=0.05)}
 
-    def test_nothing_is_said_once_the_mount_is_recorded_for_six_hours(self, tmp_path):
+    def test_nothing_waits_once_the_mount_is_recorded_for_six_hours(self, tmp_path):
         store, start = _recording(tmp_path, 6)
         _disk(store, _filling(start, 6, gb_per_hour=0.01))
 
-        diag = _run(store, "DISK-FULL-01", "DISK-INODE-01")
+        diag = _run(store, "DISK-FULL-01")
 
-        assert [n for n in diag.quality.notes if "DISK-" in n] == []
+        assert diag.skipped_rules == []
+        assert diag.fully_evaluated
 
-    def test_an_inode_forecast_that_waits_is_said_too(self, tmp_path):
-        store, start = _recording(tmp_path, 3)
-        _disk(
-            store,
-            [
-                {
-                    "ts": start + m * 60,
-                    "mountpoint": "/",
-                    "total": 100 * _GiB,
-                    "used": 40 * _GiB,
-                    "inodes_total": 1_000_000,
-                    "inodes_used": 400_000 + 50_000 * m // 60,
-                    "read_only": 0,
-                }
-                for m in range(181)
-            ],
-        )
+    def test_no_inode_forecast_waits_once_the_mount_is_recorded_for_six_hours(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 6)
+        _disk(store, _inode_rows(start, 6))
 
         diag = _run(store, "DISK-INODE-01")
 
-        (note,) = [n for n in diag.quality.notes if "DISK-INODE-01" in n]
-        assert "inode が尽きるまでの残り日数の予測はまだ判定していません" in note
-        assert "/ (あと 3.0h)" in note
+        assert diag.skipped_rules == []
+        assert diag.fully_evaluated
 
-    def test_check_says_it_in_text_json_and_html(self, tmp_path):
+    def test_an_inode_forecast_that_waits_is_not_fully_evaluated_either(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        _disk(store, _inode_rows(start, 3))
+
+        diag = _run(store, "DISK-INODE-01")
+
+        assert "DISK-INODE-01" in diag.evaluated_rules
+        assert _pending(diag) == {("DISK-INODE-01", "/"): pytest.approx(3.0, abs=0.05)}
+
+    def test_only_the_mount_recorded_for_less_than_six_hours_waits(self, tmp_path):
+        store = TestShortTrends._with_usb(
+            tmp_path, [(600 + k, 32, 1, 0) for k in range(61)]
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert set(_pending(diag)) == {("DISK-FULL-01", "/media/usb")}
+
+    def test_the_hours_to_wait_follow_the_configured_min_trend_hours(self, tmp_path):
+        store, start = _recording(tmp_path, 1)
+        _disk(store, _filling(start, 1, gb_per_hour=5) + _inode_rows(start, 1))
+
+        diag = _run(
+            store,
+            "DISK-FULL-01",
+            "DISK-INODE-01",
+            overrides={
+                "DISK-FULL-01": {"min_trend_hours": 2.0},
+                "DISK-INODE-01": {"min_trend_hours": 3.0},
+            },
+        )
+
+        assert _pending(diag) == {
+            ("DISK-FULL-01", "/"): pytest.approx(1.0, abs=0.05),
+            ("DISK-INODE-01", "/"): pytest.approx(2.0, abs=0.05),
+        }
+        required = {r.rule_id: r.required_hours for r in diag.skipped_rules}
+        assert required == {"DISK-FULL-01": 2.0, "DISK-INODE-01": 3.0}
+
+    def test_a_lowered_min_trend_hours_judges_the_forecast_sooner(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        _disk(store, _filling(start, 3, gb_per_hour=5))
+
+        diag = _run(
+            store, "DISK-FULL-01", overrides={"DISK-FULL-01": {"min_trend_hours": 2.0}}
+        )
+
+        assert diag.skipped_rules == []
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+
+    def test_check_text_does_not_call_it_a_plain_no_problem(self, tmp_path):
         store, start = _recording(tmp_path, 5)
         _disk(store, _filling(start, 5, gb_per_hour=5))
         store.close()
 
-        def check(*args):
-            result = CliRunner().invoke(
-                cli, ["check", "--db", str(store.path), "--only", "DISK-FULL-01", *args]
-            )
-            assert result.exit_code == 0, result.output
-            return result.output
+        out = _check(store.path)
 
-        for out in (check("--no-color"), check("--format", "html")):
-            assert "満杯までの残り日数の予測はまだ判定していません" in out
-            assert "/ (あと 1.0h)" in out
-        (note,) = json.loads(check("--format", "json"))["quality"]["notes"]
-        assert "DISK-FULL-01" in note and "/ (あと 1.0h)" in note
+        lines = [line for line in out.splitlines() if line.strip()]
+        assert lines[0] == "診断: 評価できた範囲では問題は見つかりませんでした。"
+        assert lines[1] == (
+            "⚠ 評価範囲: 1 ルールを評価 / 一部が未判定 1 件"
+            " (あと最長 1.0 時間の記録で判定できます)"
+        )
+        (waiting,) = [line for line in lines if line.startswith("  未評価:")]
+        assert "DISK-FULL-01 (残り日数の予測: / あと 1.0h)" in waiting
+
+    def test_check_text_names_every_mount_that_waits(self, tmp_path):
+        store = TestShortTrends._with_usb(
+            tmp_path, [(600 + k, 32, 1, 0) for k in range(61)]
+        )
+        first = min(r["ts"] for r in store.rows("disk_samples"))
+        _disk(
+            store,
+            [
+                {
+                    "ts": first + (600 + k) * 60,
+                    "mountpoint": "/mnt/data",
+                    "total": 64 * _GiB,
+                    "used": 8 * _GiB,
+                    "read_only": 0,
+                }
+                for k in range(61)
+            ],
+        )
+        store.close()
+
+        out = _check(store.path)
+
+        (waiting,) = [line for line in out.splitlines() if line.startswith("  未評価:")]
+        assert "/media/usb あと 5.0h" in waiting and "/mnt/data あと 5.0h" in waiting
+        assert "/ あと" not in waiting
+
+    def test_check_json_carries_what_waits_in_skipped_rules(self, tmp_path):
+        store, start = _recording(tmp_path, 5)
+        _disk(store, _filling(start, 5, gb_per_hour=5))
+        store.close()
+
+        data = json.loads(_check(store.path, "--format", "json"))
+
+        (entry,) = data["skipped_rules"]
+        assert entry["rule_id"] == "DISK-FULL-01"
+        assert (entry["part"], entry["subject"]) == ("残り日数の予測", "/")
+        assert entry["required_hours"] == 6.0
+        assert entry["remaining_hours"] == pytest.approx(1.0, abs=0.05)
+        assert data["evaluated_rules"] == ["DISK-FULL-01"]
+
+    def test_check_json_marks_a_whole_skipped_rule_without_a_part(self, tmp_path):
+        store, start = _recording(tmp_path, 2)
+        _disk(store, _filling(start, 2, gb_per_hour=1))
+        store.close()
+
+        data = json.loads(_check(store.path, "--format", "json", only="MEM-LEAK-01"))
+
+        (entry,) = data["skipped_rules"]
+        assert entry["rule_id"] == "MEM-LEAK-01"
+        assert (entry["part"], entry["subject"]) == (None, None)
+
+    def test_check_html_is_not_the_green_badge_alone(self, tmp_path):
+        store, start = _recording(tmp_path, 5)
+        _disk(store, _filling(start, 5, gb_per_hour=5))
+        store.close()
+
+        out = _check(store.path, "--format", "html")
+
+        assert '<span class="badge-ok">' not in out
+        assert '<span class="badge-warn">問題なし (一部未評価)</span>' in out
+        assert "評価できた範囲では問題は見つかりませんでした" in out
+        assert "あと 1.0 時間" in out and "残り日数の予測" in out
+
+    def test_a_warning_and_a_pending_forecast_are_both_shown(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        used = int(92 * _GiB)
+        _disk(
+            store,
+            _flat(
+                start,
+                180,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=used,
+                avail=100 * _GiB - used,
+                read_only=0,
+            ),
+        )
+        store.close()
+
+        out = _check(store.path, code=1)
+
+        assert "[DISK-FULL-01]" in out
+        assert "DISK-FULL-01 (残り日数の予測: / あと 3.0h)" in out
+
+    def test_the_inode_forecast_that_waits_is_named_in_the_check(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        _disk(store, _inode_rows(start, 3))
+        store.close()
+
+        out = _check(store.path, only="DISK-INODE-01")
+
+        assert "DISK-INODE-01 (残り日数の予測: / あと 3.0h)" in out
+        assert "ルールすべてを評価" not in out
+
+
+def _resized(start, hours, *, flat_hours):
+    """A mount that was 100 GiB for *flat_hours*, then 200 GiB (another filesystem)."""
+    rows = []
+    for m in range(int(hours * 60) + 1):
+        total = 100 * _GiB if m <= flat_hours * 60 else 200 * _GiB
+        rows.append(
+            {
+                "ts": start + m * 60,
+                "mountpoint": "/",
+                "total": total,
+                "used": 40 * _GiB,
+                "avail": total - 40 * _GiB,
+                "read_only": 0,
+            }
+        )
+    return rows
+
+
+def _compare(before, after, *args):
+    result = CliRunner().invoke(
+        cli,
+        ["compare", str(before), str(after), "--only", "DISK-FULL-01", *args],
+    )
+    return result
+
+
+def _one_disk_db(directory, hours, rows):
+    directory.mkdir(parents=True, exist_ok=True)
+    store, start = _recording(directory, hours)
+    _disk(store, rows(start))
+    store.close()
+    return store.path
+
+
+class TestCompareForecastNotJudged:
+    def test_a_fix_is_not_resolved_when_the_after_forecast_waits(self, tmp_path):
+        before = _one_disk_db(
+            tmp_path / "b", 24, lambda s: _filling(s, 24, gb_per_hour=1, first_gb=20)
+        )
+        after = _one_disk_db(
+            tmp_path / "a", 24, lambda s: _resized(s, 24, flat_hours=23)
+        )
+
+        result = _compare(before, after, "--no-color")
+
+        assert result.exit_code == 3, result.output
+        rows = result.output.split("結果:")[0]
+        assert "？ 判定不能  [DISK-FULL-01]" in rows
+        assert "解消" not in rows
+        data = json.loads(_compare(before, after, "--format", "json").output)
+        (row,) = data["rows"]
+        assert (row["verdict"], row["after"]["why"]) == ("not_evaluable", "too_short")
+
+    def test_a_problem_is_not_new_when_the_before_forecast_waits(self, tmp_path):
+        before = _one_disk_db(
+            tmp_path / "b", 24, lambda s: _resized(s, 24, flat_hours=23)
+        )
+        after = _one_disk_db(
+            tmp_path / "a", 24, lambda s: _filling(s, 24, gb_per_hour=1, first_gb=20)
+        )
+
+        result = _compare(before, after, "--no-color")
+
+        assert result.exit_code == 1, result.output
+        rows = result.output.split("結果:")[0]
+        assert "新規" not in rows
+        data = json.loads(_compare(before, after, "--format", "json").output)
+        (row,) = data["rows"]
+        assert (row["verdict"], row["before"]["why"]) == ("not_evaluable", "too_short")
+
+    def test_two_short_periods_that_both_fill_fast_are_not_no_problem(self, tmp_path):
+        def filling(start):
+            return _filling(start, 5, gb_per_hour=5)
+
+        before = _one_disk_db(tmp_path / "b", 5, filling)
+        after = _one_disk_db(tmp_path / "a", 5, filling)
+
+        result = _compare(before, after, "--no-color")
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "評価できた範囲では、どちらの期間にも問題は検出されませんでした"
+            in result.output
+        )
+        for side in ("修正前", "修正後"):
+            section = result.output.split(f"{side}の未評価:")[1].splitlines()[1]
+            assert (
+                "DISK-FULL-01" in section and "残り日数の予測: / あと 1.0h" in section
+            )
+        data = json.loads(_compare(before, after, "--format", "json").output)
+        assert data["rows"] == []
+        for side in ("before", "after"):
+            (entry,) = data[side]["skipped_rules"]
+            assert (entry["rule_id"], entry["subject"]) == ("DISK-FULL-01", "/")
+
+    def test_a_mount_judged_in_both_periods_is_resolved_while_another_waits(
+        self, tmp_path
+    ):
+        before = _one_disk_db(
+            tmp_path / "b", 24, lambda s: _filling(s, 24, gb_per_hour=1, first_gb=20)
+        )
+
+        def after_rows(start):
+            root = _flat(
+                start,
+                24 * 60,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=30 * _GiB,
+                avail=70 * _GiB,
+                read_only=0,
+            )
+            stick = [
+                {
+                    "ts": start + (23 * 60 + k) * 60,
+                    "mountpoint": "/media/usb",
+                    "total": 32 * _GiB,
+                    "used": _GiB,
+                    "read_only": 0,
+                }
+                for k in range(61)
+            ]
+            return root + stick
+
+        after = _one_disk_db(tmp_path / "a", 24, after_rows)
+
+        result = _compare(before, after, "--no-color")
+
+        assert result.exit_code == 0, result.output
+        assert "✔ 解消  [DISK-FULL-01]" in result.output
+        data = json.loads(_compare(before, after, "--format", "json").output)
+        assert [(r["subject"], r["verdict"]) for r in data["rows"]] == [
+            ("/", "resolved")
+        ]
+        assert [r["subject"] for r in data["after"]["skipped_rules"]] == ["/media/usb"]
+
+    def test_a_fix_is_resolved_once_both_forecasts_are_judged(self, tmp_path):
+        before = _one_disk_db(
+            tmp_path / "b", 24, lambda s: _filling(s, 24, gb_per_hour=1, first_gb=20)
+        )
+        after = _one_disk_db(
+            tmp_path / "a",
+            24,
+            lambda s: _flat(
+                s,
+                24 * 60,
+                mountpoint="/",
+                total=100 * _GiB,
+                used=30 * _GiB,
+                avail=70 * _GiB,
+                read_only=0,
+            ),
+        )
+
+        result = _compare(before, after, "--no-color")
+
+        assert result.exit_code == 0, result.output
+        assert "✔ 解消  [DISK-FULL-01]" in result.output
 
 
 class TestLevelWording:
