@@ -23,8 +23,13 @@ OOM-KILL-01 design:
    runs, or whose process was replaced by another, has not lost a process to
    the OOM killer for all the samples can tell (a pool recycling its workers,
    a service restarted on purpose).
-2. Exclude short-lived processes (lifetime < ``MIN_LIFETIME_S`` seconds),
-   which are expected to exit.
+2. Exclude short-lived processes, which are expected to exit.  A recorded
+   kernel line needs no lifetime.  Without one the *program* must have been
+   recorded for at least ``MIN_LIFETIME_S`` seconds, from its first process to
+   the end of its last: a service restarted by hand whose new process dies
+   after 3 minutes, or a crash loop whose last process dies, is not a
+   short-lived helper.  The finding shows the last process's own lifetime and,
+   when only the program's passed, the program's.
 3. Exclude trivial consumers: the RSS of the last sample must be >= 1% of
    estimated total memory (``mem_used + mem_available`` from the nearest
    sys_sample).  This estimation is documented as approximate in the method
@@ -135,9 +140,10 @@ class OomKillRule(Rule):
     Queries ``proc_samples`` to find processes whose last recorded sample is
     significantly earlier than the window end (indicating the process exited
     while recording continued).  A recorded kernel OOM line naming the PID
-    confirms the kill; without one, the program must have no process left
-    and ``sys_samples`` must show memory-crisis indicators in a window around
-    the disappearance of its last one.
+    confirms the kill; without one, the program must have no process left,
+    must have been recorded for ``min_lifetime_s`` and ``sys_samples`` must show
+    memory-crisis indicators in a window around the disappearance of its last
+    process.
 
     An optional ``journalctl`` probe (``_read_oom_journal``) can elevate
     confidence from MEDIUM to HIGH when a matching OOM-kill log line is found.
@@ -159,8 +165,9 @@ class OomKillRule(Rule):
     what = (
         "記録したカーネルログの OOM の行 (Killed process <PID> / pid=<PID>) が"
         "消えたプロセスの PID を名指ししていれば、再起動されていても OOM kill とする。"
-        "その行が無いときはプログラムごとに見て、プロセスが 1 つも残っていなければ、"
-        "最後のプロセスの消滅タイミングと sys_samples のメモリ危機指標"
+        "その行が無いときはプログラムごとに見て、プロセスが 1 つも残っておらず、"
+        "プログラムが最初の記録から 10 分以上動いていれば (最後のプロセスが 10 分に"
+        "満たなくても)、最後のプロセスの消滅タイミングと sys_samples のメモリ危機指標"
         "(psi_mem_full10 / swap_out / mem_available 急減)の相関で OOM kill を検出する"
     )
     why = (
@@ -225,20 +232,22 @@ class OomKillRule(Rule):
         # The kernel's line names the process it killed, also one its supervisor
         # started again.  Without it, a program is judged by its last process:
         # one that was replaced by another of its program was not, for all we
-        # know, killed.
+        # know, killed.  The program's span from its first process, not that
+        # process's own lifetime, tells a short-lived helper from a service.
         by_program: dict[int, list] = {}
         for proc_row in proc_rows:
             by_program.setdefault(proc_row["proc_id"], []).append(proc_row)
-        candidates: list[tuple] = []  # (proc_row, kernel_line)
+        candidates: list[tuple] = []  # (proc_row, kernel_line, program_first_ts)
         for processes in by_program.values():
             last = max(processes, key=lambda proc: proc["last_ts"])
+            program_first_ts = min(proc["first_ts"] for proc in processes)
             for proc_row in processes:
                 kernel_line = self._kernel_line(oom_lines, proc_row)
                 if kernel_line is not None or proc_row is last:
-                    candidates.append((proc_row, kernel_line))
+                    candidates.append((proc_row, kernel_line, program_first_ts))
 
         findings: list[Finding] = []
-        for proc_row, kernel_line in candidates:
+        for proc_row, kernel_line, program_first_ts in candidates:
             proc_id = proc_row["proc_id"]
             pid = proc_row["pid"]
             first_ts: float = proc_row["first_ts"]
@@ -249,9 +258,10 @@ class OomKillRule(Rule):
             if gap <= self.gap_threshold_s:
                 continue
 
-            # --- Condition 2: process was not short-lived ---
+            # --- Condition 2: not a short-lived helper ---
             lifetime = last_ts - first_ts
-            if kernel_line is None and lifetime < self.min_lifetime_s:
+            program_lifetime = last_ts - program_first_ts
+            if kernel_line is None and program_lifetime < self.min_lifetime_s:
                 continue
 
             # --- Condition 3: process was a significant memory consumer ---
@@ -305,10 +315,15 @@ class OomKillRule(Rule):
                     f" 生存 {lifetime_minutes}分)"
                 )
             else:
+                program_span = ""
+                if lifetime < self.min_lifetime_s:
+                    program_minutes = round(program_lifetime / 60.0, 1)
+                    evidence["program_lifetime_minutes"] = program_minutes
+                    program_span = f" プログラムとして {program_minutes}分 動作,"
                 summary = (
                     f"OOM Kill 疑い: {label} が消滅"
                     f" (最終 RSS {evidence['last_rss_mb']:.1f} MB,"
-                    f" 生存 {lifetime_minutes}分,"
+                    f" 生存 {lifetime_minutes}分,{program_span}"
                     f" 危機指標: {evidence['crisis_indicator']}={evidence['crisis_value']})"
                 )
 
