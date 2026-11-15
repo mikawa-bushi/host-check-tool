@@ -333,6 +333,22 @@ class TestRenderHtml:
         assert "3" in out
         assert "テスト備考" in out
 
+    def test_throttle_events_are_said_to_count_widening_steps(self) -> None:
+        """One slowdown that widens the interval five times reads "5 回"."""
+        quality = _make_quality()
+        quality.throttle_events = 5
+        diag = Diagnosis(findings=[], healthy=True, quality=quality)
+        text = render_terminal(diag, color=False)
+        html = render_html(diag, _charts_empty())
+        assert "減速イベント  : 5 回 (間隔を広げた段の数)" in text
+        assert "<dt>減速イベント</dt><dd>5 回 (間隔を広げた段の数)</dd>" in html
+        quality.throttle_events = 0
+        quiet = render_terminal(
+            Diagnosis(findings=[], healthy=True, quality=quality), color=False
+        )
+        assert "減速イベント  : 0 回" in quiet
+        assert "間隔を広げた段" not in quiet
+
     def test_hostname_label_in_title(self) -> None:
         out = render_html(_healthy_diag(), hostname_label="ライン制御PC")
         assert "ライン制御PC" in out

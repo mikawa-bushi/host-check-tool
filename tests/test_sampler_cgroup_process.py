@@ -443,6 +443,53 @@ class TestProcessSampler:
         assert first[0][3] == pytest.approx(75.0, abs=0.2)
         assert second[0][3] == 12.5
 
+    def test_first_collect_leaves_cpu_empty_for_a_process_younger_than_a_second(self):
+        """CPU time and start time are ticks of 10 ms: a few ticks over a few ms is noise."""
+        sampler, _ = self._sampler()
+        blink = _mock_proc(4243, name="blink", cpu_seconds=0.05, age=0.02)
+        job = _mock_proc(4244, name="job", cpu_seconds=1.9, age=2.0)
+        with (
+            patch("psutil.pids", return_value=[4243, 4244]),
+            patch(
+                "psutil.Process", side_effect=lambda pid: {4243: blink, 4244: job}[pid]
+            ),
+        ):
+            rows = {r[2]: r for r in sampler.collect(_make_ctx())[0].rows}
+        assert rows[4243][3] is None
+        assert rows[4244][3] == pytest.approx(95.0, abs=1.0)
+
+    def test_first_collect_leaves_cpu_empty_when_the_start_time_is_in_the_future(self):
+        sampler, _ = self._sampler()
+        job = _mock_proc(4245, name="job", cpu_seconds=1.0, age=-3.0)
+        with (
+            patch("psutil.pids", return_value=[4245]),
+            patch("psutil.Process", return_value=job),
+        ):
+            rows = sampler.collect(_make_ctx())[0].rows
+        assert [r[2] for r in rows] == [4245]
+        assert rows[0][3] is None
+
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("line 'btime' not found in /proc/stat"), OSError("EIO")]
+    )
+    def test_collect_goes_on_when_the_boot_time_cannot_be_read(self, error):
+        """Without the boot time a first cpu_pct cannot be measured; the rows still are."""
+        sampler, _ = self._sampler()
+        job = _mock_proc(4246, name="job", cpu_seconds=3.0, age=4.0)
+        job.cpu_percent.return_value = 12.5
+        ctx = _make_ctx()
+        with (
+            patch("psutil.pids", return_value=[4246]),
+            patch("psutil.Process", return_value=job),
+            patch("psutil.boot_time", side_effect=error),
+        ):
+            first = sampler.run(ctx)
+            second = sampler.run(ctx)
+        assert ctx.notes == []
+        assert [r[2] for r in first[0].rows] == [4246]
+        assert first[0].rows[0][3] is None
+        assert second[0].rows[0][3] == 12.5
+
     def test_second_collect_cpu_pct_non_none(self):
         """On the second collect, cpu_pct for the current process is non-None."""
         sampler, _ = self._sampler()

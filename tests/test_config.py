@@ -75,6 +75,17 @@ def test_negative_overhead_budget_raises():
         BudgetConfig(overhead_budget_pct=-0.5)
 
 
+@pytest.mark.parametrize("factor", [1.0, 0.5, 0.0, -1.5])
+def test_throttle_factor_that_does_not_widen_the_interval_raises(factor):
+    """1.0 widens nothing and 0.5 halves the interval at every step."""
+    with pytest.raises(Exception, match="throttle_factor.*1 より大きい"):
+        BudgetConfig(throttle_factor=factor)
+
+
+def test_throttle_factor_above_one_is_allowed():
+    assert BudgetConfig(throttle_factor=1.01).throttle_factor == 1.01
+
+
 def test_negative_psi_threshold_raises():
     with pytest.raises(Exception, match="0以上"):
         TriggerConfig(psi_cpu_some10=-1.0)
@@ -216,3 +227,22 @@ def test_cli_reports_an_unreadable_config_file_and_exits_4(tmp_path):
         path.chmod(0o600)
     assert result.exit_code == 4, result.output
     assert "設定ファイルの読み込みに失敗しました" in result.output
+
+
+@pytest.mark.parametrize("factor", ["1.0", "0.5"])
+def test_cli_record_rejects_a_throttle_factor_that_does_not_widen_and_exits_4(
+    tmp_path, monkeypatch, factor
+):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "config.py"
+    path.write_text(
+        "from procdiag.config import ProcdiagConfig, BudgetConfig\n"
+        f"config = ProcdiagConfig(budget=BudgetConfig(throttle_factor={factor}))\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        cli, ["record", "--duration", "1s", "--config", str(path), "--db", "x.db"]
+    )
+    assert result.exit_code == 4, result.output
+    assert "throttle_factor" in result.output
+    assert not (tmp_path / "x.db").exists()

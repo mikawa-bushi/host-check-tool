@@ -6,8 +6,10 @@ from the OS (procdiag's own CPU reading, the process table) is faked here.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Callable
 from unittest.mock import MagicMock, patch
@@ -28,7 +30,7 @@ from test_recorder import (
 
 from procdiag import spikes
 from procdiag.config import ProcdiagConfig, SamplingConfig, WatchDir
-from procdiag.core.sampler import RunContext, SampleBatch
+from procdiag.core.sampler import Note, RunContext, SampleBatch
 from procdiag.recorder import Recorder
 from procdiag.samplers.process import ProcessSampler
 from procdiag.samplers.selfmeter import SelfMeter
@@ -38,6 +40,12 @@ from procdiag.storage import Storage
 def _count(db: Path, table: str) -> int:
     with Storage(db) as store:
         return store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def _peek(db: Path, sql: str) -> list[tuple]:
+    """Rows of *sql* as another process reading the DB of a running recorder sees them."""
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as con:
+        return con.execute(sql).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +132,42 @@ def test_spike_names_the_batch_job_that_started_just_before_it(
     store.close()
     assert top[0]["name"] == "batch-job"
     assert top[0]["cpu_pct"] == pytest.approx(97.5, abs=0.5)
+
+
+def test_process_samples_are_recorded_when_the_boot_time_cannot_be_read(tmp_path):
+    """psutil raises RuntimeError without a btime line in /proc/stat (some containers)."""
+    store = Storage(tmp_path / "noboot.db")
+    clock = FakeClock(0.0)
+    rec = Recorder(
+        _make_config(),
+        storage=store,
+        samplers={
+            "system": FakeSampler(),
+            "process": ProcessSampler(resolve_proc=store.proc_id_for),
+        },
+        trigger=FakeTrigger(fire_on_call=10**9),
+        selfmeter=FakeSelfmeter(),
+        duration=1.0,
+        clock=clock,
+        sleep=_AdvancingSleep(clock),
+    )
+    with (
+        patch("psutil.pids", return_value=list(_HOST)),
+        patch("psutil.Process", side_effect=lambda pid: _HOST[pid]),
+        patch(
+            "psutil.boot_time",
+            side_effect=RuntimeError("line 'btime' not found in /proc/stat"),
+        ),
+    ):
+        assert rec.run() == 0
+
+    scans = store.conn.execute("SELECT COUNT(*) FROM proc_samples").fetchone()[0]
+    failures = store.conn.execute(
+        "SELECT detail FROM ops_events WHERE kind = 'sampler_failed'"
+    ).fetchall()
+    store.close()
+    assert scans >= len(_HOST)
+    assert failures == []
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +377,19 @@ def test_stop_waits_for_a_directory_walk_no_longer_than_its_time_budget(tmp_path
     assert _count(tmp_path / "stuck.db", "sys_samples") >= 3
 
 
-def test_stop_keeps_a_directory_walk_that_ends_within_its_time_budget(tmp_path):
+@pytest.mark.parametrize("own_storage", [True, False])
+def test_stop_keeps_a_directory_walk_that_ends_within_its_time_budget(
+    tmp_path, own_storage
+):
+    """With a storage the caller passed in nothing flushes it after run()."""
+
     class _SlowWalk(FakeDiskSampler):
         def collect_dirs(self, ctx: RunContext) -> list[SampleBatch]:
             time.sleep(0.5)
             return super().collect_dirs(ctx)
 
+    db = tmp_path / "slow.db"
+    storage = None if own_storage else Storage(db)
     rec = Recorder(
         ProcdiagConfig(
             sampling=SamplingConfig(
@@ -346,11 +397,103 @@ def test_stop_keeps_a_directory_walk_that_ends_within_its_time_budget(tmp_path):
                 watch_dirs=[WatchDir(path="/var/log", time_budget_sec=2.0)],
             )
         ),
-        db_path=tmp_path / "slow.db",
+        db_path=db,
+        storage=storage,
         samplers={"system": FakeSampler(), "disk": _SlowWalk()},
         selfmeter=FakeSelfmeter(),
         duration=0.1,
     )
+    try:
+        assert rec.run() == 0
+        assert len(_peek(db, "SELECT 1 FROM dir_samples")) == 1
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+def test_stop_writes_what_is_recorded_before_it_waits_for_a_directory_walk(tmp_path):
+    """A stuck mount must not keep the samples back until the stop is killed."""
+    db = tmp_path / "flush-first.db"
+    seen: dict[str, int] = {}
+
+    class _WalkThatWaitsForTheStopFlush(FakeDiskSampler):
+        def collect_dirs(self, ctx: RunContext) -> list[SampleBatch]:
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                seen["sys_samples"] = len(_peek(db, "SELECT 1 FROM sys_samples"))
+                if seen["sys_samples"] >= 3:
+                    break
+                time.sleep(0.01)
+            return super().collect_dirs(ctx)
+
+    rec = Recorder(
+        ProcdiagConfig(
+            sampling=SamplingConfig(
+                system_interval=0.05,
+                watch_dirs=[WatchDir(path="/var/log", time_budget_sec=10.0)],
+            )
+        ),
+        db_path=db,
+        samplers={"system": FakeSampler(), "disk": _WalkThatWaitsForTheStopFlush()},
+        selfmeter=FakeSelfmeter(),
+        duration=0.3,
+    )
     assert rec.run() == 0
 
-    assert _count(tmp_path / "slow.db", "dir_samples") == 1
+    assert seen["sys_samples"] >= 3
+    assert _count(db, "dir_samples") == 1
+
+
+def test_a_walks_notes_are_kept_once_the_walk_is_taken_not_while_it_runs(tmp_path):
+    """The walk works on its own copy of the context, not the scheduler's."""
+    db = tmp_path / "notes.db"
+    walk_noted = threading.Event()
+    release = threading.Event()
+    kept_mid_walk: list[str] = []
+
+    class _NotingWalk(FakeDiskSampler):
+        def collect_dirs(self, ctx: RunContext) -> list[SampleBatch]:
+            ctx.notes.append(Note("dir", "dir: /var/log を読めません"))
+            walk_noted.set()
+            release.wait(5.0)
+            return super().collect_dirs(ctx)
+
+    class _NotingSystem(FakeSampler):
+        ticks_after_note = 0
+
+        def collect(self, ctx: RunContext) -> list[SampleBatch]:
+            if walk_noted.is_set():
+                self.ticks_after_note += 1
+                if self.ticks_after_note == 1:
+                    ctx.notes.append(Note("system", "system: 一時的な失敗"))
+                elif self.ticks_after_note == 2:
+                    kept_mid_walk.extend(
+                        d
+                        for (d,) in _peek(
+                            db,
+                            "SELECT detail FROM ops_events WHERE kind='sampler_failed'",
+                        )
+                    )
+                    release.set()
+            return super().collect(ctx)
+
+    rec = Recorder(
+        _make_config(system_interval=0.05, dir_scan_interval=3600.0),
+        db_path=db,
+        samplers={"system": _NotingSystem(), "disk": _NotingWalk()},
+        selfmeter=FakeSelfmeter(),
+        duration=1.0,
+    )
+    try:
+        assert rec.run() == 0
+    finally:
+        release.set()
+
+    assert kept_mid_walk == ["system: 一時的な失敗"]
+    kept = [
+        d
+        for (d,) in _peek(
+            db, "SELECT detail FROM ops_events WHERE kind='sampler_failed'"
+        )
+    ]
+    assert sorted(kept) == ["dir: /var/log を読めません", "system: 一時的な失敗"]
