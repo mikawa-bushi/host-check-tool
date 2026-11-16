@@ -218,15 +218,21 @@ def _shown_pct(value: float, *levels: float) -> float:
 # five of its usual steps) while the recorder ran may be where the next
 # filesystem starts.  It is only when the size changed by more than
 # ``_SAME_SIZE_TOLERANCE`` across the gap, or the usage is not where the trend
-# of the rows around it puts it, to within as much of the size: the same stick
-# plugged back in, or a ``df`` that hung for some minutes, goes on.
+# of the rows around it puts it, to within as much of the size or
+# ``_SCATTER_FACTOR`` times the scatter of the rows about the trend, whichever
+# is more: the same stick plugged back in, or a ``df`` that hung for some
+# minutes, goes on, and so does a disk that grows in bursts or whose usage is
+# noisy, which is that far off its trend by itself.
 # FS-READONLY-01 asks for the same size to within ``_SAME_SIZE_TOLERANCE`` before
 # it calls a switch to read-only one filesystem.
 _SAME_SIZE_TOLERANCE = 0.01
 _FILESYSTEM_DRIFT = 0.10
 _UNMOUNTED_SEC = 300.0
-# The rows on each side of a gap that give the trend of the usage there.
-_TREND_ROWS = 10
+# The rows on each side of a gap that give the trend of the usage there are those
+# within this long of it.  A job that runs every hour is only two periods of a
+# sawtooth in two hours, and its phase moves the line by more than the tolerance.
+_TREND_SEC = 4 * 3600.0
+_SCATTER_FACTOR = 3.0
 
 
 def _same_size(
@@ -239,32 +245,85 @@ def _recorder_was_down(window: Window, start: float, end: float) -> bool:
     return any(lo < end and hi > start for lo, hi in window.holes)
 
 
-def _used_per_second(rows: list) -> float:
-    rows = [r for r in rows if r["used"] is not None]
-    if len(rows) < 2 or rows[-1]["ts"] <= rows[0]["ts"]:
-        return 0.0
-    return (rows[-1]["used"] - rows[0]["used"]) / (rows[-1]["ts"] - rows[0]["ts"])
+class _Side(NamedTuple):
+    """The usage of the rows on one side of a gap, as sums about their own mean."""
+
+    n: int
+    mean_ts: float
+    mean_used: float
+    ts_ts: float
+    ts_used: float
+    used_used: float
 
 
-def _goes_on_across(rows: list, i: int) -> bool:
+def _about_mean(points: list[tuple[float, float]]) -> _Side:
+    n = len(points)
+    mean_ts = sum(t for t, _ in points) / n
+    mean_used = sum(u for _, u in points) / n
+    return _Side(
+        n,
+        mean_ts,
+        mean_used,
+        sum((t - mean_ts) ** 2 for t, _ in points),
+        sum((t - mean_ts) * (u - mean_used) for t, u in points),
+        sum((u - mean_used) ** 2 for _, u in points),
+    )
+
+
+def _beside(
+    rows: list, i: int, direction: int, unmounted: float
+) -> list[tuple[float, float]]:
+    """The ``(ts, used)`` of the rows within ``_TREND_SEC`` of one side of a gap.
+
+    From ``rows[i - 1]`` back (*direction* -1) or from ``rows[i]`` on (+1), up to
+    the next gap or change of size: those rows belong to another filesystem, or
+    would carry their own jump into the trend.
+    """
+    j = i - 1 if direction < 0 else i
+    first = rows[j]["ts"]
+    points = []
+    while abs(rows[j]["ts"] - first) <= _TREND_SEC:
+        if rows[j]["used"] is not None:
+            points.append((rows[j]["ts"], float(rows[j]["used"])))
+        k = j + direction
+        if not 0 <= k < len(rows):
+            break
+        if abs(rows[k]["ts"] - rows[j]["ts"]) > unmounted or not _same_size(
+            rows[k]["total"], rows[j]["total"], _FILESYSTEM_DRIFT
+        ):
+            break
+        j = k
+    return points
+
+
+def _goes_on_across(rows: list, i: int, unmounted: float) -> bool:
     """Whether the filesystem of ``rows[i - 1]`` is that of ``rows[i]``.
 
     The sizes agree to within ``_SAME_SIZE_TOLERANCE`` and the usage moved as the
-    rows on either side of the gap say it was moving.
+    rows on either side of the gap say it was moving.  The rate is one line
+    through the rows of both sides, each about its own mean, so that a jump
+    between them does not tilt it and the side with more rows decides it: a
+    single row after the gap goes on at the rate before it.  The jump is how far
+    the later rows lie from that line through the earlier ones.  It is allowed as
+    much as ``_SAME_SIZE_TOLERANCE`` of the size, or ``_SCATTER_FACTOR`` times the
+    scatter of the rows about the line when that is more.
     """
     prev, cur = rows[i - 1], rows[i]
     if not _same_size(prev["total"], cur["total"]):
         return False
     if prev["used"] is None or cur["used"] is None:
         return False
-    rate = (
-        _used_per_second(rows[max(0, i - _TREND_ROWS) : i])
-        + _used_per_second(rows[i : i + _TREND_ROWS])
-    ) / 2
-    expected = rate * (cur["ts"] - prev["ts"])
-    return (
-        abs(cur["used"] - prev["used"] - expected)
-        <= _SAME_SIZE_TOLERANCE * cur["total"]
+    before = _about_mean(_beside(rows, i, -1, unmounted))
+    after = _about_mean(_beside(rows, i, 1, unmounted))
+    spread = before.ts_ts + after.ts_ts
+    covariance = before.ts_used + after.ts_used
+    rate = covariance / spread if spread else 0.0
+    jump = after.mean_used - before.mean_used - rate * (after.mean_ts - before.mean_ts)
+    n = before.n + after.n
+    residual = before.used_used + after.used_used - rate * covariance
+    scatter = math.sqrt(max(residual, 0.0) / (n - 3)) if n > 3 else 0.0
+    return abs(jump) <= max(
+        _SAME_SIZE_TOLERANCE * cur["total"], _SCATTER_FACTOR * scatter
     )
 
 
@@ -275,7 +334,8 @@ def _one_filesystem(rows: list, window: Window) -> list:
     ``_FILESYSTEM_DRIFT`` between samples, and is still the same filesystem.
     """
     steps = sorted(b["ts"] - a["ts"] for a, b in zip(rows, rows[1:]))
-    unmounted = max(_UNMOUNTED_SEC, 5 * steps[len(steps) // 2]) if steps else 0.0
+    step = steps[len(steps) // 2] if steps else 0.0
+    unmounted = max(_UNMOUNTED_SEC, 5 * step)
     first = len(rows) - 1
     while first > 0:
         prev, cur = rows[first - 1], rows[first]
@@ -284,7 +344,7 @@ def _one_filesystem(rows: list, window: Window) -> list:
         if (
             cur["ts"] - prev["ts"] > unmounted
             and not _recorder_was_down(window, prev["ts"], cur["ts"])
-            and not _goes_on_across(rows, first)
+            and not _goes_on_across(rows, first, unmounted)
         ):
             break
         first -= 1
