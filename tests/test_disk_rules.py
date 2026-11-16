@@ -1625,8 +1625,11 @@ class TestFilesystemWhoseSizeDrifts:
         _disk(store, rows)
         return _run(store, "DISK-FULL-01")
 
-    def test_a_total_drifting_by_a_few_percent_still_gets_a_forecast(self, tmp_path):
-        (f,) = _found(self._tank(tmp_path, 0.004), "DISK-FULL-01")
+    @pytest.mark.parametrize("wobble", [0.004, 0.012])
+    def test_a_total_drifting_by_a_few_percent_still_gets_a_forecast(
+        self, tmp_path, wobble
+    ):
+        (f,) = _found(self._tank(tmp_path, wobble), "DISK-FULL-01")
 
         assert f.evidence["days_left"] == pytest.approx(7.4, abs=0.5)
 
