@@ -442,6 +442,29 @@ class Comparison:
         """No row to speak of, and rules that neither period was long enough to run."""
         return any(n.kind is NoteKind.NOT_COMPARABLE for n in self.notes)
 
+    @property
+    def hours_to_judge(self) -> Optional[float]:
+        """How long the after period must still be recorded for those rules to run.
+
+        The longest wait among the rules that blocked the verdict; once the after
+        recording is that long they run on one side at least, and the comparison
+        speaks for them.  None when no rule blocks it.
+        """
+        rules = {
+            rule
+            for n in self.notes
+            if n.kind is NoteKind.NOT_COMPARABLE
+            for rule in n.detail["rules"]
+        }
+        if self.after.result is None:
+            return None
+        waits = [
+            r.remaining_hours
+            for r in self.after.result.diagnosis.skipped_rules
+            if r.part is None and r.rule_id in rules
+        ]
+        return max(waits, default=None)
+
 
 def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
     if side.result is None or side.result.diagnosis.no_data:
@@ -603,7 +626,9 @@ _NOT_SAID = {
 }
 
 
-def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
+def _plain_state(
+    side: Side, other: Side, rule_id: str, subject: str, *, at_split: bool
+) -> SideState:
     gap = _rule_gap(side, rule_id)
     if gap is not None:
         return gap
@@ -637,12 +662,15 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
             + _NOT_SAID[side.name],
         )
     if side.name is SideName.AFTER:
+        wait = f"あと {max(theirs - mine, 0.1):.1f} 時間記録"
+        if at_split:  # --at fixes the before period; --before cannot go with it
+            way = f"{wait}してください"
+        else:
+            way = f"{wait}するか、--before で修正前を修正後と同じ長さに絞ってください"
         return Unknown(
             Why.TOO_SHORT,
             f"修正後の期間 {mine:.1f} 時間は修正前の {theirs:.1f} 時間より短いため、"
-            "検出が無くても直ったとは言えません "
-            f"(あと {max(theirs - mine, 0.1):.1f} 時間記録するか、"
-            "--before で修正前を修正後と同じ長さに絞ってください)",
+            f"検出が無くても直ったとは言えません ({way})",
         )
     return Unknown(
         Why.TOO_SHORT,
@@ -701,7 +729,9 @@ def _note_list(before: Side, after: Side, *, has_rows: bool) -> list[Note]:
     return notes
 
 
-def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Comparison:
+def build_comparison(
+    before: Side, after: Side, config: "ProcdiagConfig", *, at_split: bool = False
+) -> Comparison:
     rows: list[ComparisonRow] = []
     measured = {
         rid
@@ -728,8 +758,8 @@ def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Com
                 identity=None,
                 headline=None,
                 threshold=None,
-                before=_plain_state(before, after, rule_id, subject),
-                after=_plain_state(after, before, rule_id, subject),
+                before=_plain_state(before, after, rule_id, subject, at_split=at_split),
+                after=_plain_state(after, before, rule_id, subject, at_split=at_split),
             )
         )
     order = list(Verdict)
@@ -845,4 +875,6 @@ def run_compare(
         before = _evaluate_side(
             SideName.BEFORE, before_store, before_period, engine, only, skip
         )
-    return build_comparison(before, after, config)
+    return build_comparison(
+        before, after, config, at_split=isinstance(request, SplitRequest)
+    )

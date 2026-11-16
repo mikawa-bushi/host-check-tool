@@ -110,7 +110,11 @@ def _traceback_lines(exc: BaseException) -> list[str]:
         for frame in traceback.format_tb(exc.__traceback__)
         for line in frame.rstrip("\n").split("\n")
     ]
-    return lines + [m.rstrip("\n") for m in traceback.format_exception_only(exc)]
+    return [
+        "Traceback (most recent call last):",
+        *lines,
+        *(m.rstrip("\n") for m in traceback.format_exception_only(exc)),
+    ]
 
 
 def _make_jinja_env() -> Environment:

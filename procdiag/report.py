@@ -1352,18 +1352,20 @@ _BLOCKED_ADVICE = {
         "行に示した両方の値から判断してください。"
     ),
 }
-_OTHER_BLOCKED_ADVICE = "それ以外は、理由を行ごとに示しています。"
+_ROW_REASONS = "理由を行ごとに示しています。"
 
 
 def _blocked_conclusion(cmp: Comparison) -> str:
     """Why exit code 3, and for each reason whether recording longer helps."""
     blocked = cmp.blocked_rows
     if not blocked:
-        return "判定できません。記録を続けてから比べ直してください。"
+        hours = cmp.hours_to_judge
+        wait = f"あと最長 {hours:.1f} 時間、" if hours is not None else ""
+        return f"判定できません。{wait}記録を続けてから比べ直してください。"
     reasons = dict.fromkeys(r.why for r in blocked)
     advice = [_BLOCKED_ADVICE[w] for w in reasons if w in _BLOCKED_ADVICE]
     if any(w not in _BLOCKED_ADVICE for w in reasons):
-        advice.append(_OTHER_BLOCKED_ADVICE)
+        advice.append(f"それ以外は、{_ROW_REASONS}" if advice else _ROW_REASONS)
     return "判定できない検出があります。" + "".join(advice)
 
 

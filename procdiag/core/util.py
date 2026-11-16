@@ -249,17 +249,21 @@ def dumps_json(obj: Any) -> str:
     return _JSON_LEFT_RAW.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
 
-def shell_quote(value: object) -> str:
-    """*value* as one shell word, safe to paste into a command line.
+# A backtick, spliced in between the quoted parts of a word (\140 is its octal code).
+_BACKTICK_WORD = "\"$(printf '\\140')\""
 
-    A value with a backtick is written as ``$'...'`` (bash and zsh), so that no
-    backtick in the word can end the code span a suggested command sits in.
+
+def shell_quote(value: object) -> str:
+    """*value* as one shell word, the same in every POSIX shell.
+
+    Single quotes as :func:`shlex.quote` writes them, except that a backtick is
+    not written at all: a suggested command sits in a backtick code span, which
+    a backtick in the word would end.  It is spliced in as the output of
+    ``printf`` instead, which dash and bash both read.
     """
     text = str(value)
-    if "`" not in text:
-        return shlex.quote(text)
-    escaped = text.replace("\\", "\\\\").replace("'", "\\'")
-    return "$'" + escaped.replace("`", "\\x60") + "'"
+    quoted = _BACKTICK_WORD.join(shlex.quote(p) if p else "" for p in text.split("`"))
+    return quoted or "''"
 
 
 class CounterDelta:

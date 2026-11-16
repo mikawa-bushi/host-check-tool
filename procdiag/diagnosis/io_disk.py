@@ -865,7 +865,11 @@ class DiskInodeRule(Rule):
                 "inodes_total": total,
                 "used_pct": _shown_pct(used_pct, self.warning_pct, self.critical_pct),
                 "bytes_used_pct": (
-                    round(bytes_pct, 1) if bytes_pct is not None else None
+                    _shown_pct(
+                        bytes_pct, DiskFullRule.warning_pct, DiskFullRule.critical_pct
+                    )
+                    if bytes_pct is not None
+                    else None
                 ),
                 "days_left": days_left,
                 "warning_pct": self.warning_pct,

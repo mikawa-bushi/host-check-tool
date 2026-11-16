@@ -951,8 +951,9 @@ def quick(
     "--format",
     "fmt",
     type=click.Choice(["text", "json"]),
-    default="text",
-    help="出力フォーマット。",
+    default=None,
+    help="出力フォーマット (既定: --output の拡張子が .json なら json、"
+    "それ以外は text)。",
 )
 @click.option(
     "--output",
@@ -978,7 +979,7 @@ def compare(
     after_spec: Optional[str],
     only: Optional[str],
     skip: Optional[str],
-    fmt: str,
+    fmt: Optional[str],
     output: Optional[str],
     verbose: bool,
     no_color: bool,
@@ -1004,6 +1005,8 @@ def compare(
     if dbs and db_path:
         click.echo("エラー: --db と DB の位置引数は同時に指定できません", err=True)
         sys.exit(_EXIT_USAGE)
+    suffix = Path(output or "").suffix.lower()
+    fmt = fmt or ("json" if _FORMAT_BY_SUFFIX.get(suffix) == "json" else "text")
     cfg = _load_config(config_path, db_path)
     only_ids, skip_ids = _split_ids(only), _split_ids(skip)
     _validate_rules(cfg, only_ids, skip_ids)
