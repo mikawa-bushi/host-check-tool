@@ -418,8 +418,9 @@ def _one_step_notes(rule_id: str, what: str, mounts: list[str]) -> tuple[str, ..
     if not mounts:
         return ()
     return (
-        f"{rule_id}: {what}が一度の大きな増加 (コピー・展開など) で増えただけで、"
-        "傾向ではないため、満杯までの残り日数を判定していません: " + "、".join(mounts),
+        f"{rule_id}: {what}の増加の大半が短い間の一度の大きな増加で、そのあとは"
+        "増えていません。傾向とは見なせないため、満杯までの残り日数を判定していません"
+        " (増え続ければ、次の診断で判定します): " + "、".join(mounts),
     )
 
 

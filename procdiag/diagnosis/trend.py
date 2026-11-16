@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import statistics
 from bisect import bisect_left, bisect_right
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import accumulate
@@ -624,9 +624,9 @@ class Forecast:
 
     ``per_day`` is the growth per day of the fit behind ``days_left``, so the
     two always agree: ``days_left * per_day`` is what was left.  ``one_step``
-    says most of the growth happened at once (a copy, an unpacked archive), so
-    the line through it says how fast the one step was, not how fast the value
-    grows.
+    says most of the growth happened within a short time and the value has not
+    risen since, so the line through it says how fast the one step was, not how
+    fast the value grows.
     """
 
     days_left: float
@@ -635,24 +635,67 @@ class Forecast:
 
 
 # A growth is one step when this share of it falls in a window of this share of
-# the series' time.
+# the series' time and the value then stays where the step took it, for at least
+# as long as the window: it rises by less than this share of the step again.
+# Growth that goes on to the last samples, or comes and goes as a log does, is a
+# trend, not a step.
 _ONE_STEP_SHARE = 0.7
 _ONE_STEP_WINDOW = 1 / 6
+_ONE_STEP_AFTERMATH = 0.1
+
+
+def _biggest_rise(
+    points: Sequence[tuple[float, float]], width: float
+) -> tuple[float, int]:
+    """The biggest rise of the value within *width* seconds, and where it ends.
+
+    Returns the rise and the index of the first point at the value it rises to.
+    """
+    best, best_end = 0.0, 0
+    after: deque[int] = deque()  # indexes within *width* after i, falling values
+    last = 0
+    for i, (t, value) in enumerate(points):
+        while last + 1 < len(points) and points[last + 1][0] - t <= width:
+            last += 1
+            while after and points[after[-1]][1] < points[last][1]:
+                after.pop()
+            after.append(last)
+        while after and after[0] <= i:
+            after.popleft()
+        if after and points[after[0]][1] - value > best:
+            best, best_end = points[after[0]][1] - value, after[0]
+    return best, best_end
+
+
+def _largest_rise(points: Sequence[tuple[float, float]]) -> float:
+    """The most the value rises from an earlier point to a later one."""
+    low, best = points[0][1], 0.0
+    for _, value in points:
+        low = min(low, value)
+        best = max(best, value - low)
+    return best
 
 
 def _is_one_step(points: Sequence[tuple[float, float]]) -> bool:
-    """Whether most of the rise of *points* happens within a sixth of their time."""
+    """Whether *points* rose mostly within a sixth of their time, and then stayed.
+
+    The value that follows the step may fall (an archive unpacked and removed),
+    but must not rise by more than a tenth of the step: a log that is rotated
+    rises again after each drop, and growth that has just begun rises up to the
+    last sample.
+    """
     width = (points[-1][0] - points[0][0]) * _ONE_STEP_WINDOW
     total = points[-1][1] - points[0][1]
     if total <= 0 or width <= 0:
         return False
-    best = 0.0
-    end = 0
-    for i, (t, v) in enumerate(points):
-        while end + 1 < len(points) and points[end + 1][0] - t <= width:
-            end += 1
-        best = max(best, points[end][1] - v)
-    return best >= _ONE_STEP_SHARE * total
+    rise, end = _biggest_rise(points, width)
+    if rise < _ONE_STEP_SHARE * total:
+        return False
+    after = points[end:]
+    return (
+        after[-1][0] - after[0][0] >= width
+        and _largest_rise(after) <= _ONE_STEP_AFTERMATH * rise
+    )
 
 
 def forecast_full(

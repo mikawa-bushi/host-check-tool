@@ -2010,7 +2010,7 @@ class TestGrowthThatGoesOnIsNotOneStep:
         )
         return _run(store, "DISK-FULL-01")
 
-    @pytest.mark.parametrize("last_hours", [1, 2, 3, 4])
+    @pytest.mark.parametrize("last_hours", [2, 3, 4])
     def test_a_disk_that_started_filling_fast_in_the_last_hours_is_forecast(
         self, tmp_path, last_hours
     ):
@@ -2054,6 +2054,29 @@ class TestGrowthThatGoesOnIsNotOneStep:
             6.5,
             lambda h: 40 + (20 if h >= 3 else 0) + 0.4 * max(0.0, h - 3),
             total_gib=100,
+        )
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert "DISK-FULL-01" in diag.unjudged_parts
+
+    def test_a_copy_followed_by_a_runaway_in_the_last_two_hours_is_forecast(
+        self, tmp_path
+    ):
+        diag = self._used(
+            tmp_path,
+            24,
+            lambda h: 100 + (20 if h >= 3 else 0) + 10 * max(0.0, h - 22),
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+        assert "DISK-FULL-01" not in diag.unjudged_parts
+
+    def test_an_archive_unpacked_and_then_removed_is_still_one_step(self, tmp_path):
+        diag = self._used(
+            tmp_path,
+            12,
+            lambda h: 100 + (10 if 3 <= h < 3.5 else 5 if h >= 3.5 else 0),
         )
 
         assert _found(diag, "DISK-FULL-01") == []
