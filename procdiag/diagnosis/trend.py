@@ -885,20 +885,25 @@ def _binomial_tail(n: int, p: float, k: int) -> float:
 # ---------------------------------------------------------------------------
 
 
-def detect_recurrence(events_by_day: dict[str, bool]) -> float:
+def detect_recurrence(
+    events_by_day: dict[str, bool], weights: Optional[Mapping[str, float]] = None
+) -> float:
     """Return the fraction of days on which the event occurred.
 
     *events_by_day* maps date-string keys (YYYY-MM-DD) to a boolean indicating
     whether the event occurred on that day.  Used by MEM-PRESSURE-01 to
-    measure how often chronic memory pressure was observed.
+    measure how often chronic memory pressure was observed.  A day counts as
+    much as its entry in *weights* (1.0 when it has none), so a day observed
+    for only part of it, without the event, says less against it.
 
     Returns 0.0 for an empty dict.
     """
     if not events_by_day:
         return 0.0
-    total = len(events_by_day)
-    hits = sum(1 for v in events_by_day.values() if v)
-    return hits / total
+    weights = weights or {}
+    total = sum(weights.get(day, 1.0) for day in events_by_day)
+    hits = sum(weights.get(day, 1.0) for day, hit in events_by_day.items() if hit)
+    return hits / total if total > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
