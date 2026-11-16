@@ -25,6 +25,7 @@ Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
@@ -441,10 +442,13 @@ class MemPressureRule(Rule):
     holds the pressure.  Fires WARNING when at least ``min_pressure_days`` days
     are pressure days and they are at least ``min_recurrence_fraction`` of the
     observed days, where a pressure day counts as a day and any other day as
-    much as it was observed of the longest day in the recording (24 hours at
-    most), so a few quiet hours at an edge of the recording do not outweigh the
-    days that show the pattern, and a PC that runs only part of each day is not
-    read as quiet on the hours it was off.  A recording with fewer than
+    much as it was observed of the *typical day* (at most 1), so a few quiet
+    hours at an edge of the recording do not outweigh the days that show the
+    pattern, and a PC that runs only part of each day is not read as quiet on
+    the hours it was off.  The typical day is the median observed time of the
+    days observed for at least ``min_day_observed_hours`` (24 hours at most):
+    one long day in a recording of short ones does not make the short ones
+    count for little.  A recording with fewer than
     ``min_pressure_days`` observed days is reported as not evaluable
     (``recording_shortfall_hours``), never as healthy.
 
@@ -464,8 +468,8 @@ class MemPressureRule(Rule):
         "そのローカル日のうちまだ圧迫日でない最も早い日 (長く続いてその日の分だけで"
         "スワップのある日も) に数え、数えた swap_out_sum が一定量以上になった日を圧迫日とし、"
         "圧迫日が観測が十分なローカル日 (観測が短くても圧迫日を含み、圧迫のない日は"
-        "記録で最も長く観測できた日に対する観測できた長さの割合で数える) の過半数で"
-        "反復するかを判定する"
+        "観測が十分な日の観測時間の中央値に対する観測できた長さの割合で数える) の"
+        "過半数で反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
@@ -565,6 +569,13 @@ class MemPressureRule(Rule):
             if minutes >= need or day in pressure_days
         }
 
+    def _typical_day_minutes(self, observed_minutes: Mapping[str, int]) -> float:
+        """The median time observed of the days with ``min_day_observed_hours`` of it."""
+        need = self.min_day_observed_hours * 60
+        whole = [minutes for minutes in observed_minutes.values() if minutes >= need]
+        typical = statistics.median(whole) if whole else _DAY_MINUTES
+        return float(min(_DAY_MINUTES, typical))
+
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours still to record before ``min_pressure_days`` days are observed.
 
@@ -621,12 +632,12 @@ class MemPressureRule(Rule):
         if n_days < self.min_pressure_days or n_pressure_days < self.min_pressure_days:
             return []
         # A pressure day is a whole day.  A day without pressure counts as much
-        # as it was observed of the longest day in the recording, so a few hours
-        # at an edge do not outvote the days that show the pattern, and a PC that
-        # runs 8 hours a day has whole days of 8 hours.
-        full_day = float(min(_DAY_MINUTES, max(observed.values())))
+        # as it was observed of the typical day, so a few hours at an edge do not
+        # outvote the days that show the pattern, and a PC that runs 8 hours a day
+        # has whole days of 8 hours, with or without one long day among them.
+        typical_day = self._typical_day_minutes(observed)
         weights = {
-            day: 1.0 if hit else min(1.0, observed[day] / full_day)
+            day: 1.0 if hit else min(1.0, observed[day] / typical_day)
             for day, hit in events_by_day.items()
         }
         recurrence = detect_recurrence(events_by_day, weights)
@@ -646,7 +657,7 @@ class MemPressureRule(Rule):
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
             "observed_day_equivalents": round(sum(weights.values()), 2),
-            "full_day_hours": round(full_day / 60.0, 2),
+            "typical_day_hours": round(typical_day / 60.0, 2),
             "pressure_days": pressure_days,
             "swap_out_total_bytes": pressure.swap_out,
             "pressure_event_count": pressure.minutes,
