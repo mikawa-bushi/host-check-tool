@@ -52,7 +52,7 @@ from ..core import (
 )
 from ..core.result import blind_throughout, unobserved_hours
 from ..core.util import humanize_bytes, neutralize, shell_quote
-from ..plugins import load_extra_rules
+from ..plugins import load_extra_rules, plugin_failures
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
 if TYPE_CHECKING:
@@ -212,7 +212,7 @@ class Engine:
         names a disabled rule, or when no rule is left to run, so a mistake
         never quietly changes which rules a "no problem" verdict covers.
         """
-        self._load_extra_rules([])
+        load_problems = self._load_extra_rules([])
         disabled = set(self.config.rules.disabled)
         registry = all_rules()  # {rule_id: RuleClass}
         problems = [
@@ -226,7 +226,8 @@ class Engine:
             ),
         ]
         if problems:
-            raise ValueError("\n".join(problems))
+            # An ID that no rule has may be one of the rules that did not load.
+            raise ValueError("\n".join([*problems, *load_problems]))
 
         candidates: list[type[Rule]] = [
             cls for rule_id, cls in registry.items() if rule_id not in disabled
@@ -301,7 +302,7 @@ class Engine:
 
         # --- Step 0: load user-supplied extra rule modules ---
         # Their @register decorators must fire before select()/all_rules().
-        self._load_extra_rules(reasoning)
+        load_problems = self._load_extra_rules(reasoning)
 
         # --- Step 1: determine window ---
         if window is None:
@@ -337,6 +338,7 @@ class Engine:
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
         unjudged: list[str] = []
+        config_notes: list[str] = []
         unjudged_parts: dict[str, tuple[str, ...]] = {}
         coverage_cache: dict[tuple[str, str], bool] = {}
         unobserved = (
@@ -357,6 +359,7 @@ class Engine:
                 reasoning.append(
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
+                config_notes.append(config_error)
             eff_min = rule.min_observation_hours
             if not covers(observed_hours, eff_min):
                 reasoning.append(
@@ -470,6 +473,10 @@ class Engine:
             unobserved=unobserved,
             unjudged=unjudged,
         )
+        quality.notes[:0] = load_problems
+        quality.notes.extend(config_notes)
+        if has_data:
+            quality.notes.extend(_adjusted_config_notes(store, window))
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
         healthy = (
@@ -562,20 +569,29 @@ class Engine:
             )
         return None
 
-    def _load_extra_rules(self, reasoning: list[str]) -> None:
+    def _load_extra_rules(self, reasoning: list[str]) -> list[str]:
         """Import ``config.rules.extra_rules`` so their @register decorators fire.
 
         Load failures are recorded in *reasoning* (surfaced by ``--verbose`` and
         always present in the JSON report) and never abort the diagnosis.
+        Returns one sentence for each module or installed plugin that did not
+        load, for the quality notes: a rule that is not there is not evaluated,
+        and a report that says nothing about it reads as "checked and fine".
         """
-        extra = self.config.rules.extra_rules
-        if not extra:
-            return
-        for name, ok, msg in load_extra_rules(extra):
+        problems = [
+            f"プラグイン {name} を読み込めなかったため、そのルールは評価していません ({msg})"
+            for name, msg in plugin_failures()
+        ]
+        for name, ok, msg in load_extra_rules(self.config.rules.extra_rules):
             if not ok:
                 reasoning.append(f"追加ルール {name} の読み込みに失敗しました: {msg}")
+                problems.append(
+                    f"追加ルールのモジュール {name} を読み込めなかったため、"
+                    f"そのルールは評価していません ({msg})"
+                )
             elif self.verbose:
                 reasoning.append(f"追加ルール {name} を読み込みました")
+        return problems
 
     def _determine_window(
         self, store: "Storage", reasoning: list[str]
@@ -723,6 +739,22 @@ def _hole_seconds(store: "Storage") -> float:
     except (KeyError, TypeError, ValueError):
         return _MIN_HOLE_SECONDS
     return max(_MIN_HOLE_SECONDS, _HOLE_STEPS * interval)
+
+
+def _adjusted_config_notes(store: "Storage", window: Window) -> list[str]:
+    """Where a recording in *window* ran with other settings than its config file's.
+
+    A unit that restarts logs the same sentence in each session: one note,
+    from the first session that did.
+    """
+    first: dict[str, float] = {}
+    for ts, _, until, detail in store.session_events("config_adjusted"):
+        if ts <= window.end_ts and until > window.start_ts:
+            first.setdefault(detail, ts)
+    return [
+        f"記録の設定を調整して記録しました ({_local_minute(ts)} 以降): {detail}"
+        for detail, ts in first.items()
+    ]
 
 
 def _local_minute(ts: float) -> str:

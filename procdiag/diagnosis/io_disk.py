@@ -453,6 +453,7 @@ class IoBottleneckRule(Rule):
     psi_threshold: float = _IO_PSI_THRESHOLD
     min_duration_minutes: float = _IO_MIN_DURATION_MINUTES
     top_n: int = 5
+    positive_tunables = ("top_n",)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run IO-BOTTLENECK-01 against the observation window."""

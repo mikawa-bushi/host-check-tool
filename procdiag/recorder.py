@@ -624,6 +624,12 @@ class Recorder:
             )
         except Exception:
             logger.exception("セッション開始記録の例外")
+        notice = self._config.budget.throttle_notice()
+        if notice:
+            try:
+                self._storage.record_event("config_adjusted", notice)
+            except sqlite3.Error as exc:
+                logger.error("設定の調整を記録 DB に書き込めません: %s", exc)
 
         # Setup all samplers.
         for name, sampler in self._samplers.items():

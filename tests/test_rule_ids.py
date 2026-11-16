@@ -137,6 +137,32 @@ class TestOnlyAndSkip:
         assert result.exit_code == 4
         assert "disk-full-01" in result.output
 
+    @pytest.mark.parametrize("only", ["MYSITE-01", "FOO-01", "XYZ"])
+    def test_an_unrelated_id_gets_no_made_up_suggestion(self, disk_db, tmp_path, only):
+        result = _check(disk_db, _config(tmp_path), "--only", only)
+        assert result.exit_code == 4
+        assert "のことですか" not in result.output
+        assert "procdiag explain" in result.output
+
+    @pytest.mark.parametrize(
+        "only", ["DISK-FULL-1", "ZOMBIE-1", "MEM-LEAK-02", "cpu-saturation-01"]
+    )
+    def test_a_near_miss_still_gets_the_suggestion(self, disk_db, tmp_path, only):
+        result = _check(disk_db, _config(tmp_path), "--only", only)
+        assert result.exit_code == 4
+        assert "のことですか" in result.output
+
+    @pytest.mark.parametrize(
+        "only", ["DISK-FULL-01;MEM-LEAK-01", "DISK-FULL-01 MEM-LEAK-01"]
+    )
+    def test_ids_joined_with_something_but_a_comma_say_so(
+        self, disk_db, tmp_path, only
+    ):
+        result = _check(disk_db, _config(tmp_path), "--only", only)
+        assert result.exit_code == 4
+        assert "カンマ" in result.output
+        assert "のことですか" not in result.output
+
     @pytest.mark.parametrize(
         "only, exit_code", [("DISK-FULL-01", 1), ("DISK-FULL-1", 4)]
     )
@@ -184,6 +210,39 @@ class TestConfigFile:
         assert "DISK-FULL-1" in result.output
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            ["record", "--duration", "1s"],
+            ["status"],
+            ["doctor"],
+            ["snapshot"],
+            ["export"],
+            ["prune"],
+            ["bundle", "--out", "b.tar.gz"],
+            ["quick", "--duration", "1s"],
+        ],
+    )
+    def test_every_command_refuses_a_disabled_typo(
+        self, disk_db, tmp_path, monkeypatch, command
+    ):
+        monkeypatch.chdir(tmp_path)
+        config = _config(tmp_path, rules="disabled=['DISK-FULL-1']")
+        extra = [] if command[0] in ("snapshot", "quick") else ["--db", str(disk_db)]
+        result = CliRunner().invoke(cli, [*command, *extra, "--config", str(config)])
+        assert result.exit_code == 4, result.output
+        assert "DISK-FULL-1" in result.output
+        assert not (tmp_path / "b.tar.gz").exists()
+
+    def test_compare_refuses_a_disabled_typo(self, disk_db, tmp_path):
+        config = _config(tmp_path, rules="disabled=['DISK-FULL-1']")
+        result = CliRunner().invoke(
+            cli,
+            ["compare", str(disk_db), str(disk_db), "--config", str(config)],
+        )
+        assert result.exit_code == 4, result.output
+        assert "DISK-FULL-1" in result.output
+
+    @pytest.mark.parametrize(
         "encoding, header",
         [("utf-8-sig", ""), ("cp932", "# -*- coding: cp932 -*-\n")],
     )
@@ -215,6 +274,58 @@ class TestExtraRules:
             if f"追加ルール {plugin}" in line
         ]
         assert len(load_failures) == 1 and "DISK-FULL-01" in load_failures[0]
+
+    @pytest.mark.parametrize("fmt", ["text", "html", "json"])
+    def test_a_module_that_cannot_be_imported_is_said_without_verbose(
+        self, disk_db, tmp_path, fmt
+    ):
+        config = _config(tmp_path, rules="extra_rules=['site_missing_under_test']")
+        result = _check(disk_db, config, "--only", "DISK-FULL-01", "--format", fmt)
+        assert result.exit_code == 1
+        assert "site_missing_under_test" in result.output
+        assert "評価していません" in result.output
+
+    def test_a_rule_id_taken_by_a_builtin_is_said_without_verbose(
+        self, disk_db, tmp_path, plugin
+    ):
+        config = _config(tmp_path, rules=f"extra_rules=[{plugin!r}]")
+        result = _check(disk_db, config, "--only", "DISK-FULL-01")
+        assert result.exit_code == 1
+        assert plugin in result.output and "登録できません" in result.output
+
+    def test_a_disabled_id_from_a_module_that_failed_names_the_failure(
+        self, disk_db, tmp_path
+    ):
+        config = _config(
+            tmp_path,
+            rules="extra_rules=['site_missing_under_test'], disabled=['SITE-OWN-01']",
+        )
+        result = _check(disk_db, config)
+        assert result.exit_code == 4
+        assert "SITE-OWN-01" in result.output
+        assert "site_missing_under_test" in result.output
+
+    def test_an_entry_point_that_cannot_be_loaded_is_said(self, disk_db, tmp_path):
+        dist = tmp_path / "siteplug-0.1.dist-info"
+        dist.mkdir()
+        (dist / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: siteplug\nVersion: 0.1\n", encoding="utf-8"
+        )
+        (dist / "entry_points.txt").write_text(
+            "[procdiag.rules]\nsite = site_entry_missing_under_test\n",
+            encoding="utf-8",
+        )
+        source_root = str(Path(procdiag.__file__).parents[1])
+        result = subprocess.run(
+            [sys.executable, "-c", "from procdiag.cli import cli; cli()", "check"]
+            + ["--db", str(disk_db), "--config", str(_config(tmp_path))]
+            + ["--only", "DISK-FULL-01", "--no-color"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": f"{source_root}{os.pathsep}{tmp_path}"},
+        )
+        assert result.returncode == 1, result.stderr
+        assert "site_entry_missing_under_test" in result.stdout
 
     def test_later_engine_still_runs_the_builtin(self, disk_db, plugin):
         with Storage(disk_db, read_only=True) as store:
