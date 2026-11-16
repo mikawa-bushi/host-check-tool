@@ -295,24 +295,25 @@ class Recorder:
         for batch in batches:
             self._storage.buffer(batch.table, batch.rows)
         if self._ctx.notes:
-            self._keep_failure_notes()
+            self._keep_failure_notes(name)
         if len(self._ctx.unobserved) > len(self._unobserved_kept):
             self._keep_unobserved()
         return batches
 
-    def _keep_failure_notes(self) -> None:
+    def _keep_failure_notes(self, sampler: str) -> None:
         """Keep the first note of each key of this session in the DB.
 
         The notes are the samplers' collect failures and the watch dirs they
         cannot read.  Once per key: a sampler that fails on every tick must not
         fill the DB with the same note.  ``check`` shows them in its quality
         notes.  A plain string (what a custom sampler appended before notes had
-        keys) is keyed by the text before its first ``": "``, the sampler name.
+        keys) is keyed by *sampler*, the one that was running: its text may
+        change on every tick.
         """
         notes, self._ctx.notes = self._ctx.notes, []
         for note in notes:
             if isinstance(note, str):
-                note = Note(note.partition(": ")[0], note)
+                note = Note(sampler, note)
             if note.key in self._noted:
                 continue
             self._noted.add(note.key)
@@ -430,7 +431,7 @@ class Recorder:
             self._storage.buffer(batch.table, batch.rows)
         if walk.ctx.notes:
             self._ctx.notes.extend(walk.ctx.notes)
-            self._keep_failure_notes()
+            self._keep_failure_notes("disk")
         return bool(walk.batches)
 
     def _note_stuck_walk(self, walk: "_DirWalk") -> None:
@@ -451,7 +452,7 @@ class Recorder:
                 "終わるまで dir_samples を記録できません",
             )
         )
-        self._keep_failure_notes()
+        self._keep_failure_notes("disk")
 
     def _flush(self, reason: str) -> bool:
         """Write the buffered rows; on failure say why and keep them buffered."""
@@ -740,7 +741,7 @@ class Recorder:
                             "(マウント先が応答していない可能性)",
                         )
                     )
-                    self._keep_failure_notes()
+                    self._keep_failure_notes("disk")
         except Exception:
             logger.exception("シャットダウン例外")
         if saved:
