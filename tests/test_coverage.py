@@ -191,7 +191,5 @@ class TestExplicitWindow:
         engine = Engine(_cfg(6.0))
         assert engine.required_hours() == 24.0
         assert engine.required_hours(skip=["MEM-PRESSURE-01"]) == 12.0
-        assert (
-            engine.required_hours(skip=["MEM-PRESSURE-01", "DISK-GROWTH-01"]) == 6.0
-        )
+        assert engine.required_hours(skip=["MEM-PRESSURE-01", "DISK-GROWTH-01"]) == 6.0
         assert engine.required_hours(only=["SWAP-THRASH-01"]) == 0.0
