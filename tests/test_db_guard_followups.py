@@ -133,6 +133,24 @@ class TestAFloorTheBottomRungMeets:
         assert result["steps"] != []
         assert disk.free() >= floor
 
+    def test_it_says_so_when_the_cut_and_the_vacuum_do_not_meet_it(
+        self, template, tmp_path, monkeypatch
+    ):
+        db = _copy(template, tmp_path)
+        capacity = 3 * _on_disk(db)
+        bottom = _bottom_rung_size(db, tmp_path)
+        floor = int(capacity - 0.997 * bottom)
+        disk = _FakeDisk(db, capacity=capacity)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            result = store.enforce_size_budget(max_bytes=None, min_free_bytes=floor)
+            errors = store.rows("ops_events", where="kind = 'db_guard_error'")
+
+        assert result["steps"] != []
+        assert disk.free() < floor
+        assert any("届きません" in e["detail"] for e in errors)
+
     def test_the_guard_cuts_for_it_without_dbstat_too(
         self, template, tmp_path, monkeypatch
     ):
