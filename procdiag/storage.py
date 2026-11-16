@@ -1096,7 +1096,8 @@ class Storage:
         is judged by the least a VACUUM can leave, not by the estimate, which
         runs above the result: where the estimate says the floor is out of
         reach but its error leaves room, the guard cuts to the last rung and the
-        VACUUM shows whether the floor is met.
+        VACUUM shows whether the floor is met; when it is not, the guard says so
+        in a ``db_guard_error`` and tries again at the next hourly check.
 
         Parameters
         ----------
@@ -1228,6 +1229,14 @@ class Storage:
         vacuumed = self._vacuum(sizes[keep])
         wal_failure = self._truncate_wal()
         size_after = self._disk_bytes()
+        if vacuumed and not unreachable and min_free_bytes is not None:
+            free_after = free_bytes()
+            if free_after < min_free_bytes:
+                self._guard_event(
+                    "db_guard_error",
+                    f"VACUUM のあとも空きが下限に {(min_free_bytes - free_after) // 1024}KB"
+                    f" 届きません (空き {free_after // MiB}MB、下限 {min_free_bytes // MiB}MB)",
+                )
         wal_mb = self._wal_bytes() // MiB
         if wal_failure is None:
             wal_note = "WAL 切り詰め済み"
