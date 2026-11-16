@@ -24,6 +24,7 @@ from synth import (
     add_spike_events,
     add_sys_baseline,
     add_zombie_series,
+    disk_row,
     make_db,
 )
 
@@ -610,14 +611,11 @@ class TestObservationGuard:
         span = 6 * _HOUR - 0.014
         used_per_minute = 10 * _GB // (24 * 60)
         rows = [
-            (
-                start + span * i / 360,
-                "/var",
-                100 * _GB,
-                90 * _GB + used_per_minute * i,
-                None,
-                None,
-                None,
+            disk_row(
+                ts=start + span * i / 360,
+                mountpoint="/var",
+                total=100 * _GB,
+                used=80 * _GB + used_per_minute * i,
             )
             for i in range(361)
         ]

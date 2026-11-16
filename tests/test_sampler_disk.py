@@ -79,10 +79,10 @@ class TestDiskCollect:
         ctx = _make_ctx()
         batch = sampler.collect(ctx)[0]
         for row in batch.rows:
-            ts, mp, total, used, inodes_total, inodes_used, read_only = row
+            ts, mp, total, used, inodes_total, inodes_used, read_only, avail = row
             assert total > 0, f"{mp}: total={total}"
             assert used >= 0, f"{mp}: used={used}"
-            assert used <= total, f"{mp}: used={used} > total={total}"
+            assert used + avail <= total, f"{mp}: used={used} + avail={avail} > {total}"
             assert read_only in (0, 1)
             if inodes_total is not None:
                 assert 0 <= inodes_used <= inodes_total

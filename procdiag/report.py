@@ -28,7 +28,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import procdiag
 from procdiag.compare import (
@@ -49,6 +49,7 @@ from procdiag.core import (
     Confidence,
     CoverageGap,
     Diagnosis,
+    Finding,
     Headline,
     ObservationQuality,
     Severity,
@@ -60,6 +61,7 @@ from procdiag.core import (
 from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
 from procdiag.diagnosis.engine import holes_note
+from procdiag.diagnosis.io_disk import usable_bytes
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -99,6 +101,11 @@ def _finish(lines: List[str], color: bool) -> str:
     colour codes pass through, and only when colour was asked for.
     """
     return neutralized_lines(lines, allow=_OWN_SGR if color else ())
+
+
+def _related(f: Finding) -> List[str]:
+    """The findings folded into *f*, each with its summary (only IDs if unknown)."""
+    return [f"{c.rule_id} {c.summary}" for c in f.folded] or f.related
 
 
 def _confidence_ja(conf: "Confidence | str") -> str:
@@ -296,13 +303,16 @@ def _fill_system_series(
 
 
 def _mount_series(disk_rows: List[sqlite3.Row]) -> dict[str, List[Tuple[float, float]]]:
-    """Per-mountpoint used% series from ``disk_samples`` rows."""
+    """Per-mountpoint used% series from ``disk_samples``, as DISK-FULL-01 counts it."""
     mounts: dict[str, List[Tuple[float, float]]] = {}
     for row in disk_rows:
         mp, total, used = row["mountpoint"], row["total"], row["used"]
-        if mp is None or total is None or used is None or total == 0:
+        if mp is None or total is None or used is None:
             continue
-        mounts.setdefault(mp, []).append((float(row["ts"]), used / total * 100.0))
+        capacity = usable_bytes(row)
+        if capacity <= 0:
+            continue
+        mounts.setdefault(mp, []).append((float(row["ts"]), used / capacity * 100.0))
     return mounts
 
 
@@ -318,8 +328,9 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
     report always says how many did — a short recording must not read as
     "all clear" (most regression rules need 6–24 h of data).
     """
+    pending = [r for r in diag.skipped_rules if r.part is not None]
     n_eval = len(diag.evaluated_rules)
-    n_skip = len(diag.skipped_rules)
+    n_skip = len(diag.skipped_rules) - len(pending)
     n_err = len(diag.errored_rules)
     n_unc = len(diag.uncovered_rules)
     total = n_eval + n_skip + n_err + n_unc
@@ -327,9 +338,12 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
         return None
     if diag.fully_evaluated:
         return f"評価範囲: {total} ルールすべてを評価"
-    parts = [f"評価範囲: {total} ルール中 {n_eval} 件のみ評価"]
+    if n_skip + n_err + n_unc:
+        parts = [f"評価範囲: {total} ルール中 {n_eval} 件のみ評価"]
+    else:
+        parts = [f"評価範囲: {total} ルールを評価"]
     if n_skip:
-        longest = max(r.remaining_hours for r in diag.skipped_rules)
+        longest = max(r.remaining_hours for r in diag.skipped_rules if r.part is None)
         parts.append(
             f"観測時間不足で未評価 {n_skip} 件"
             f" (あと最長 {longest:.1f} 時間の記録で全ルールを評価できます)"
@@ -342,6 +356,12 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
             dict.fromkeys(Capability(n).label for r in blind for n in r.missing)
         )
         parts.append(f"記録時に {lacked} を観測できず未評価 {len(blind)} 件")
+    if pending:
+        longest = max(r.remaining_hours for r in pending)
+        parts.append(
+            f"一部が未判定 {len({r.rule_id for r in pending})} 件"
+            f" (あと最長 {longest:.1f} 時間の記録で判定できます)"
+        )
     if n_err:
         parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
     return " / ".join(parts)
@@ -365,11 +385,39 @@ def _skipped_by_wait(diag: Diagnosis) -> List[SkippedRule]:
     return sorted(diag.skipped_rules, key=lambda r: -r.remaining_hours)
 
 
+def _skipped_items(rules: List[SkippedRule]) -> List[Tuple[float, str, str]]:
+    """``(hours to wait, rule ID, what is unevaluated)`` in the order met.
+
+    A rule that did not run says how long to record.  A part of a rule that
+    ran names what it left unjudged with each mount's wait, the mounts of one
+    rule's part making one item.
+    """
+    groups: dict[Tuple[str, Optional[str]], List[SkippedRule]] = {}
+    for r in rules:
+        groups.setdefault((r.rule_id, r.part), []).append(r)
+    items: List[Tuple[float, str, str]] = []
+    for (rule_id, part), group in groups.items():
+        wait = max(r.remaining_hours for r in group)
+        if part is None:
+            detail = f"あと {wait:.1f}h"
+        else:
+            where = "、".join(
+                f"{r.subject} あと {r.remaining_hours:.1f}h" for r in group
+            )
+            detail = f"{part}: {where}"
+        items.append((wait, rule_id, detail))
+    return items
+
+
+def _skipped_what(r: SkippedRule) -> str:
+    """The rule's title, with the part and mount it left unjudged if only a part."""
+    return r.title if r.part is None else f"{r.title} ({r.part}: {r.subject})"
+
+
 def _skipped_list(diag: Diagnosis) -> str:
-    """``"MEM-PRESSURE-01 (あと 23.9h), MEM-LEAK-01 (あと 5.9h)"``."""
-    return ", ".join(
-        f"{r.rule_id} (あと {r.remaining_hours:.1f}h)" for r in _skipped_by_wait(diag)
-    )
+    """``"MEM-PRESSURE-01 (あと 23.9h), DISK-FULL-01 (残り日数の予測: / あと 4.0h)"``."""
+    items = sorted(_skipped_items(diag.skipped_rules), key=lambda i: -i[0])
+    return ", ".join(f"{rule_id} ({detail})" for _, rule_id, detail in items)
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +532,10 @@ def render_terminal(
             if f.proposal:
                 for pline in f.proposal.splitlines():
                     lines.append(f"     {pline}")
-            if f.related:
-                lines.append(
-                    f"     関連する検出 (同一原因とみられるもの): "
-                    f"{', '.join(f.related)}"
-                )
+            related = _related(f)
+            if related:
+                lines.append("     関連する検出 (同一原因とみられるもの):")
+                lines += [f"       {item}" for item in related]
 
     # --- Rule coverage ---
     coverage = _coverage_summary(diag)
@@ -991,7 +1038,7 @@ def _coverage_html(diag: Diagnosis) -> str:
     html = f"<p>{_esc(coverage)}</p>\n"
     if diag.skipped_rules:
         rows = "".join(
-            f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(r.title)}</td>"
+            f"<tr><td>{_esc(r.rule_id)}</td><td>{_esc(_skipped_what(r))}</td>"
             f"<td>{r.required_hours:.1f} 時間</td><td>あと {r.remaining_hours:.1f} 時間</td></tr>"
             for r in _skipped_by_wait(diag)
         )
@@ -1032,11 +1079,10 @@ def _proposal_section(diag: Diagnosis) -> str:
             proposal_html = "<p>（提案テンプレートなし）</p>"
 
         related_html = ""
-        if f.related:
-            related_html = (
-                f"<p><em>関連する検出 (同一原因とみられるもの): "
-                f"{_esc(', '.join(f.related))}</em></p>"
-            )
+        related = _related(f)
+        if related:
+            items = "".join(f"<li>{_esc(item)}</li>" for item in related)
+            related_html = f"<p><em>関連する検出 (同一原因とみられるもの):</em></p><ul>{items}</ul>"
 
         detail_html += f"""
 <div class="finding {f.severity.value}">
@@ -1232,7 +1278,7 @@ def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
         return []
     diag = side.result.diagnosis
     return (
-        [(r.rule_id, f"あと {r.remaining_hours:.1f}h") for r in diag.skipped_rules]
+        [(rule_id, detail) for _, rule_id, detail in _skipped_items(diag.skipped_rules)]
         + [(r.rule_id, r.detail) for r in diag.uncovered_rules]
         + [(rid, "実行エラー") for rid in diag.errored_rules]
     )
@@ -1247,7 +1293,13 @@ def _compare_conclusion(cmp: Comparison) -> str:
     if code == 3:
         return "判定できない検出があります。記録を続けてから比べ直してください。"
     if not cmp.rows:
-        return "どちらの期間にも問題は検出されませんでした。"
+        scope = (
+            ""
+            if cmp.before.result.diagnosis.fully_evaluated
+            and cmp.after.result.diagnosis.fully_evaluated
+            else "評価できた範囲では、"
+        )
+        return f"{scope}どちらの期間にも問題は検出されませんでした。"
     if all(r.verdict is Verdict.RESOLVED for r in cmp.rows):
         return "修正前に検出された問題はすべて解消しました。"
     if code == 2:

@@ -11,8 +11,8 @@ differences from the netdiag engine:
   longer than the recorded data (with a reasoning note); instantaneous rules
   (``min_observation_hours = 0.0``) still run on short recordings.
 - Findings are **folded**: DISK-GROWTH-01 findings that share a mount-point
-  with a DISK-FULL-01 finding are moved to ``Finding.related`` and removed
-  from the top-level list.
+  with a DISK-FULL-01 finding are moved to ``Finding.folded`` (their IDs to
+  ``Finding.related``) and removed from the top-level list.
 - Each rule's ``evaluate()`` is wrapped in try/except; a crashing rule is
   logged to ``reasoning`` but does not abort the diagnosis.
 - Proposals are rendered from Jinja2 templates stored next to this package.
@@ -259,10 +259,15 @@ class Engine:
            ``min_observation_hours``
            (``Rule.configure`` applies ``config.rules.min_observation_hours``,
            the one knob for the regression rules per design §6.3/§8).  A rule
-           whose declared inputs (``requires_schema`` / ``requires_rows``)
-           are missing for the window, or whose ``requires_observed`` no
-           recording in the window could observe, is not run and is listed in
-           ``uncovered_rules``.
+           whose declared inputs (``requires_schema`` / ``requires_rows``,
+           and ``Rule.missing_rows``) are missing for the window, or whose
+           ``requires_observed`` no recording in the window could observe, is
+           not run and is listed in ``uncovered_rules``.  A rule that ran but
+           left a part of its verdict unjudged for lack of recording says so
+           through ``Rule.pending_parts``, which join ``skipped_rules`` (the
+           rule stays in ``evaluated_rules``); one that left a part unjudged
+           for another reason says so through ``Rule.coverage_notes``, which
+           become quality notes.
         3. Render Jinja2 proposal templates into each Finding.
         4. Fold DISK-GROWTH-01 into DISK-FULL-01 (and any future fold pairs).
         5. Sort by severity → confidence.
@@ -307,12 +312,19 @@ class Engine:
         errored: list[str] = []
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
+        unjudged: list[str] = []
         coverage_cache: dict[tuple[str, str], bool] = {}
         unobserved = (
             [p for u in store.unobserved_periods() if (p := u.within(window))]
             if has_data
             else []
         )
+
+        def not_recorded(gap: UncoveredRule) -> None:
+            reasoning.append(
+                f"{gap.rule_id}: 入力データが無いため未評価 ({', '.join(gap.missing)})"
+            )
+            uncovered.append(gap)
 
         for rule_cls in rule_classes:
             rule, config_error = configure_rule(rule_cls, self.config)
@@ -337,13 +349,20 @@ class Engine:
                 continue
             gap = self._coverage_gap(store, rule, window, coverage_cache, unobserved)
             if gap is not None:
-                reasoning.append(
-                    f"{rule.rule_id}: 入力データが無いため未評価 "
-                    f"({', '.join(gap.missing)})"
-                )
-                uncovered.append(gap)
+                not_recorded(gap)
                 continue
             try:
+                missing = rule.missing_rows(store, window)
+                if missing:
+                    not_recorded(
+                        UncoveredRule(
+                            rule.rule_id,
+                            rule.title,
+                            CoverageGap.NOT_RECORDED,
+                            missing,
+                        )
+                    )
+                    continue
                 shortfall = rule.recording_shortfall_hours(store, window)
                 if shortfall > 0:
                     reasoning.append(
@@ -364,6 +383,17 @@ class Engine:
                     found = rule.report(measured)
                 else:
                     found = rule.evaluate(store, window)
+                unjudged.extend(rule.coverage_notes(store, window))
+                pending = rule.pending_parts(store, window)
+                if pending:
+                    waits = "、".join(
+                        f"{p.part} {p.subject} あと {p.remaining_hours:.1f}h"
+                        for p in pending
+                    )
+                    reasoning.append(
+                        f"{rule.rule_id}: 記録が足りず判定していない部分があります ({waits})"
+                    )
+                    skipped.extend(pending)
             except Exception as exc:
                 msg = (
                     f"ルール {rule.rule_id} で例外が発生しました: "
@@ -405,7 +435,11 @@ class Engine:
 
         # --- Step 6: build quality ---
         quality = self._build_quality(
-            store, window, events_in_window=has_data, unobserved=unobserved
+            store,
+            window,
+            events_in_window=has_data,
+            unobserved=unobserved,
+            unjudged=unjudged,
         )
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
@@ -558,8 +592,12 @@ class Engine:
         *,
         events_in_window: bool,
         unobserved: list[Unobserved],
+        unjudged: list[str],
     ) -> ObservationQuality:
-        """Assemble ObservationQuality from DB statistics over *window*."""
+        """Assemble ObservationQuality from DB statistics over *window*.
+
+        *unjudged* are the ``Rule.coverage_notes`` of the rules that ran.
+        """
         since, until = (
             (window.start_ts, window.end_ts) if events_in_window else (None, None)
         )
@@ -589,7 +627,7 @@ class Engine:
         )
         missing_io_pct = store.missing_io_ratio(window.start_ts, window.end_ts)
 
-        notes: list[str] = []
+        notes: list[str] = list(unjudged)
         if missing_io_pct is not None and missing_io_pct > 0.1:
             notes.append(
                 f"io_counters 欠損率 {missing_io_pct:.0%} — "
@@ -702,8 +740,8 @@ def fold(findings: list[Finding]) -> list[Finding]:
     """Absorb child findings into their parent Finding's ``related`` list.
 
     Currently: DISK-GROWTH-01 findings whose ``subject`` (mountpoint) matches
-    a DISK-FULL-01 finding are removed from the top-level list and their
-    ``rule_id`` is appended to the parent's ``related``.
+    a DISK-FULL-01 finding are removed from the top-level list, appended to
+    the parent's ``folded`` and their ``rule_id`` to its ``related``.
 
     The fold table ``_FOLD_INTO`` is a plain dict and can be extended for
     future rule relationships without changing this function.
@@ -728,6 +766,7 @@ def fold(findings: list[Finding]) -> list[Finding]:
         parent = parent_index.get((parent_rule_id, f.subject))
         if parent is not None:
             parent.related.append(f.rule_id)
+            parent.folded.append(f)
             # Do not add this finding to the kept list.
         else:
             # No parent to fold into — keep as-is.

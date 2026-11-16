@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import psutil
+from synth import disk_row
 
 from procdiag.config import ProcdiagConfig, SamplingConfig
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler, SystemSnapshot
@@ -349,7 +350,9 @@ class FakeDiskSampler(Sampler):
     def collect(self, ctx: RunContext) -> list[SampleBatch]:
         self.run_count += 1
         ts = 4000.0 + self.run_count
-        row = (ts, "/", 100 * 1024**3, 50 * 1024**3, None, None, 0)
+        row = disk_row(
+            ts=ts, mountpoint="/", total=100 * 1024**3, used=50 * 1024**3, read_only=0
+        )
         return [SampleBatch(table="disk_samples", rows=[row])]
 
     def collect_dirs(self, ctx: RunContext) -> list[SampleBatch]:

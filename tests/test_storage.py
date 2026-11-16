@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from synth import disk_row
 
 from procdiag.storage import (
     SCHEMA_VERSION,
@@ -189,7 +190,15 @@ def _proc_row(ts: float = 1.0, proc_id: int = 1, pid: int = 100):
 
 
 def _disk_row(ts: float = 1.0):
-    return (ts, "/", 100_000_000_000, 40_000_000_000, 1_000_000, 250_000, 0)
+    return disk_row(
+        ts=ts,
+        mountpoint="/",
+        total=100_000_000_000,
+        used=40_000_000_000,
+        inodes_total=1_000_000,
+        inodes_used=250_000,
+        read_only=0,
+    )
 
 
 def _dir_row(ts: float = 1.0):
@@ -297,8 +306,8 @@ def test_rows_with_where(tmp_db):
     tmp_db.buffer(
         "disk_samples",
         [
-            (1.0, "/", 100_000_000_000, 10_000_000_000, None, None, 0),
-            (2.0, "/var", 50_000_000_000, 5_000_000_000, None, None, 0),
+            disk_row(ts=1.0, mountpoint="/", total=10**11, used=10**10, read_only=0),
+            disk_row(ts=2.0, mountpoint="/var", total=5 * 10**10, used=5 * 10**9),
         ],
     )
     tmp_db.flush()

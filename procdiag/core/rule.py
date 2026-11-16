@@ -32,6 +32,7 @@ from .result import (
     Measurement,
     Observation,
     Severity,
+    SkippedRule,
     Window,
 )
 
@@ -110,6 +111,37 @@ class Rule:
             self.min_observation_hours = config.rules.min_observation_hours
         for name, value in resolved.items():
             setattr(self, name, value)
+
+    def missing_rows(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """Inputs beyond ``requires_rows`` the window has no rows of.
+
+        Empty when the input is there.  A rule that needs particular rows of a
+        table (one watched directory, a complete scan) overrides this, so a
+        window without them is listed as not recorded instead of healthy.
+        """
+        return ()
+
+    def pending_parts(self, store: "Storage", window: Window) -> list[SkippedRule]:
+        """The parts of the rule that ran without judging in *window*, yet.
+
+        Empty when it judged everything it looks at.  A rule that runs but
+        has a part the recording is too short for (a forecast that needs more
+        hours of a mount) overrides this and returns one :class:`SkippedRule`
+        with ``part`` and ``subject`` for each.  The engine lists them with
+        the rules it skipped, so a result without a finding is not read as
+        healthy and says how long to record.
+        """
+        return []
+
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """What the rule ran without judging in *window*, whatever recording helps.
+
+        Empty when it judged everything it looks at.  A rule that runs but
+        cannot judge a part for another reason (a directory whose scans never
+        finished) overrides this; the engine adds the notes of every rule that
+        ran to the quality notes.
+        """
+        return ()
 
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours of further recording the rule needs beyond ``min_observation_hours``.

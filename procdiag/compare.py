@@ -16,6 +16,7 @@ from .core import (
     MeasuredRule,
     Measurement,
     Severity,
+    SkippedRule,
     Window,
     configure_rule,
     get_rule,
@@ -423,7 +424,7 @@ def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
         return Unknown(Why.NO_DATA, "期間内に記録がありません")
     diag = side.result.diagnosis
     for r in diag.skipped_rules:
-        if r.rule_id == rule_id:
+        if r.rule_id == rule_id and r.part is None:
             return Unknown(
                 Why.TOO_SHORT,
                 f"記録が {diag.quality.span_hours:.1f} 時間のため未評価"
@@ -444,6 +445,20 @@ def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
     if rule_id in diag.errored_rules:
         return Unknown(Why.RULE_ERRORED, "ルールの実行中にエラーが発生しました")
     return None
+
+
+def _waiting_part(side: Side, rule_id: str, subject: str) -> Optional[SkippedRule]:
+    """The part of *rule_id* left unjudged for *subject* by a too short recording."""
+    if side.result is None:
+        return None
+    return next(
+        (
+            r
+            for r in side.result.diagnosis.skipped_rules
+            if r.rule_id == rule_id and r.part is not None and r.subject == subject
+        ),
+        None,
+    )
 
 
 def _measured_state(gap: Optional[Unknown], m: Optional[Measurement]) -> SideState:
@@ -558,6 +573,12 @@ def _observed_hours(side: Side, rule_id: str) -> float:
     return _span_hours(side) - blind
 
 
+_NOT_SAID = {
+    SideName.AFTER: "直ったとは言えません",
+    SideName.BEFORE: "無かったとは言えません",
+}
+
+
 def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
     gap = _rule_gap(side, rule_id)
     if gap is not None:
@@ -573,7 +594,15 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
     # neither does a part the recording could not observe.
     mine, theirs = _observed_hours(side, rule_id), _observed_hours(other, rule_id)
     if covers(mine, theirs):
-        return Clear(None)
+        waiting = _waiting_part(side, rule_id, subject)
+        if waiting is None:
+            return Clear(None)
+        return Unknown(
+            Why.TOO_SHORT,
+            f"{side.name.label}の期間では {subject} の{waiting.part}がまだ判定できていません"
+            f" ({waiting.required_hours:g} 時間の記録が必要、あと {waiting.remaining_hours:.1f} 時間)。"
+            f"検出が無くても{_NOT_SAID[side.name]}",
+        )
     blind = _blind(side, rule_id)
     if blind:
         labels = "、".join(dict.fromkeys(p.capability.label for p in blind))
@@ -581,11 +610,7 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
             Why.NOT_OBSERVED,
             f"{side.name.label}の期間のうち {labels} を観測できたのは {mine:.1f} 時間で、"
             f"{other.name.label}の {theirs:.1f} 時間より短いため、検出が無くても"
-            + (
-                "直ったとは言えません"
-                if side.name is SideName.AFTER
-                else "無かったとは言えません"
-            ),
+            + _NOT_SAID[side.name],
         )
     if side.name is SideName.AFTER:
         return Unknown(

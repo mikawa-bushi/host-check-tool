@@ -900,6 +900,7 @@ class TestDatabaseFromBeforePids:
         conn.executescript(
             "DROP TABLE proc_rollup_1m;"
             "DROP TABLE IF EXISTS proc_pid_rollup_1m;"
+            "ALTER TABLE disk_samples DROP COLUMN avail;"
             "CREATE TABLE proc_rollup_1m (ts_min REAL, proc_id INTEGER,"
             " cpu_avg REAL, cpu_max REAL, rss_avg INTEGER, rss_max INTEGER,"
             " fds_max INTEGER, threads_max INTEGER, PRIMARY KEY (ts_min, proc_id));"
@@ -997,7 +998,7 @@ class TestDatabaseFromBeforePids:
 
         with Storage(path) as store:
             pids = [r["pid"] for r in store.rows("proc_rollup_1m")]
-            assert store.meta()["schema_version"] == "5"
+            assert store.meta()["schema_version"] == str(storage.SCHEMA_VERSION)
         with Storage(path) as store:
             (f,) = _findings(store, ["MEM-LEAK-01"])
 
@@ -1018,7 +1019,7 @@ class TestDatabaseFromBeforePids:
 
         monkeypatch.setattr(sqlite3, "connect", nearly_full)
         with Storage(path) as store:
-            assert store.meta()["schema_version"] == "5"
+            assert store.meta()["schema_version"] == str(storage.SCHEMA_VERSION)
             (f,) = _findings(store, ["MEM-LEAK-01"])
 
         assert f.evidence["slope_mb_per_h"] == pytest.approx(5.0, rel=0.01)

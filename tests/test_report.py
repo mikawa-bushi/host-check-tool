@@ -19,6 +19,7 @@ import json
 import time
 
 import pytest
+from synth import disk_row
 
 from procdiag.core import (
     Confidence,
@@ -446,7 +447,11 @@ class TestBuildCharts:
             for i in range(5):
                 ts = base_ts + i * 60
                 used = 50_000_000_000 + i * 1_000_000
-                rows.append((ts, "/", 100_000_000_000, used, None, None, 0))
+                rows.append(
+                    disk_row(
+                        ts=ts, mountpoint="/", total=10**11, used=used, read_only=0
+                    )
+                )
             store.buffer("disk_samples", rows)
             store.flush()
 

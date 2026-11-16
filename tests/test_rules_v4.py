@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 import pytest
-from synth import add_proc_series, add_sys_baseline, make_db
+from synth import add_proc_series, add_sys_baseline, disk_row, make_db
 from test_recorder import FakeClock, _AdvancingSleep, _make_config, _make_samplers
 
 from procdiag.config import ProcdiagConfig, RulesConfig
@@ -33,7 +33,18 @@ def _window(hours: float = 2.0) -> Window:
 
 def _disk(store, ts, mp, *, inodes_total, inodes_used, read_only=0, total=100, used=10):
     store.buffer(
-        "disk_samples", [(ts, mp, total, used, inodes_total, inodes_used, read_only)]
+        "disk_samples",
+        [
+            disk_row(
+                ts=ts,
+                mountpoint=mp,
+                total=total,
+                used=used,
+                inodes_total=inodes_total,
+                inodes_used=inodes_used,
+                read_only=read_only,
+            )
+        ],
     )
 
 
@@ -53,6 +64,7 @@ def _make_v3_db(path, *, wal: bool = True) -> None:
         ("disk_samples", "inodes_total"),
         ("disk_samples", "inodes_used"),
         ("disk_samples", "read_only"),
+        ("disk_samples", "avail"),
         ("proc_registry", "fd_soft_limit"),
         ("proc_registry", "fd_hard_limit"),
     ):
@@ -103,6 +115,7 @@ class TestMigrationV4:
             ).run(
                 store,
                 only=[
+                    "DISK-FULL-01",
                     "DISK-INODE-01",
                     "FS-READONLY-01",
                     "UNCLEAN-SHUTDOWN-01",
@@ -136,17 +149,20 @@ class TestDiskInode:
         store.close()
 
     def test_fast_growth_warns_before_threshold(self, tmp_path):
+        from procdiag.diagnosis.io_disk import DiskInodeRule
+
         store = make_db(tmp_path)
         now = time.time()
-        for i in range(6):  # +10% of the table per 10 minutes → full in ~hours
+        for i in range(7):  # +10% of the table per hour → full in 3 hours
             _disk(
                 store,
-                now - (6 - i) * 600,
+                now - (6.5 - i) * _HOUR,
                 "/",
                 inodes_total=1000,
                 inodes_used=100 + i * 100,
             )
-        (f,) = self._eval(store)
+        store.flush()
+        (f,) = DiskInodeRule().evaluate(store, _window(7.0))
         assert f.evidence["days_left"] is not None and f.evidence["days_left"] < 1
         assert f.confidence == Confidence.MEDIUM  # forecast, below the level threshold
         store.close()

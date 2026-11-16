@@ -536,16 +536,28 @@ def find_sustained_episodes(
 # ---------------------------------------------------------------------------
 
 
-def extrapolate_full(
+@dataclass
+class Forecast:
+    """When a growing value reaches its capacity.
+
+    ``per_day`` is the growth per day of the fit behind ``days_left``, so the
+    two always agree: ``days_left * per_day`` is what was left.
+    """
+
+    days_left: float
+    per_day: float
+
+
+def forecast_full(
     series: list[tuple[float, float]],
     capacity: float,
     *,
     min_points: int = 12,
-) -> Optional[float]:
+) -> Optional[Forecast]:
     """Extrapolate a *used* series to predict when it hits *capacity*.
 
-    Returns the number of days from the last observation until full, or
-    ``None`` when the slope is ≤ 0 (shrinking or flat) or data is
+    ``days_left`` counts from the last observation (0.0 when it is already at
+    capacity).  ``None`` when the slope is ≤ 0 (shrinking or flat) or data is
     insufficient.
 
     Per design doc §6.2 DISK-FULL-01: if 7 days of data are available, the
@@ -567,18 +579,20 @@ def extrapolate_full(
     if fit is None or fit.slope_per_hour <= 0.0:
         return None
 
-    current_used = work_pts[-1][1]
-    remaining = capacity - current_used
-    if remaining <= 0.0:
-        # Already full — report 0 days.
-        return 0.0
+    per_day = fit.slope_per_hour * 24.0
+    remaining = max(0.0, capacity - work_pts[-1][1])
+    return Forecast(days_left=remaining / per_day, per_day=per_day)
 
-    # slope_per_hour → slope_per_day
-    slope_per_day = fit.slope_per_hour * 24.0
-    if slope_per_day <= 0.0:
-        return None
 
-    return remaining / slope_per_day
+def extrapolate_full(
+    series: list[tuple[float, float]],
+    capacity: float,
+    *,
+    min_points: int = 12,
+) -> Optional[float]:
+    """The ``days_left`` of :func:`forecast_full`."""
+    forecast = forecast_full(series, capacity, min_points=min_points)
+    return None if forecast is None else forecast.days_left
 
 
 # ---------------------------------------------------------------------------

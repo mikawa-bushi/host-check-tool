@@ -6,8 +6,10 @@ drive them at different intervals (``disk_interval`` for partition snapshots,
 
 * ``collect`` — fast path (60 s default).  Calls ``psutil.disk_partitions``
   and ``psutil.disk_usage`` for every *real* filesystem (pseudo-fs excluded),
-  plus ``os.statvfs`` for inode usage and the mount options for a read-only
-  flag — "space left but cannot write" (inode exhaustion, or a filesystem
+  keeping what a non-root process can still write (``avail``, df's Avail,
+  which leaves out the blocks ext4 reserves for root) next to ``total`` and
+  ``used``, plus ``os.statvfs`` for inode usage and the mount options for a
+  read-only flag — "space left but cannot write" (inode exhaustion, or a filesystem
   error that remounted it read-only) is invisible in byte counts alone.
   A mount whose mount point is a file (a bind-mounted ``/etc/hosts`` in a
   container) is not a filesystem to watch and is skipped (``is_watched_mount``,
@@ -119,6 +121,7 @@ class DiskSampler(Sampler):
                     mountpoint=part.mountpoint,
                     total=usage.total,
                     used=usage.used,
+                    avail=usage.free,
                     inodes_total=inodes_total,
                     inodes_used=inodes_used,
                     read_only=int(is_read_only(part.opts)),

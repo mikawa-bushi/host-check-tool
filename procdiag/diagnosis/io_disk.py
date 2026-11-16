@@ -2,21 +2,24 @@
 
 Currently implements:
 
-- **DISK-FULL-01**: Predict when a partition will reach capacity by fitting a
-  linear trend to ``disk_samples``.  Fires WARNING when fewer than 30 days
-  remain; CRITICAL when fewer than 7 days remain.
+- **DISK-FULL-01**: Report a partition that is full for non-root processes
+  (WARNING from 90% used, CRITICAL from 95%), or predict when it will be by
+  fitting a linear trend to ``disk_samples`` (WARNING when fewer than 30 days
+  remain; CRITICAL when fewer than 7 days remain).
 - **IO-BOTTLENECK-01**: Detect sustained I/O pressure from ``psi_io_some10``
   sustained above threshold for 15 minutes or more.  Ranks the processes that
   did the most I/O while it lasted from ``proc_samples``; falls back to
   ``cg_samples`` when per-process I/O counters are all NULL (non-root);
   silences when no fallback data exists.
 - **DISK-GROWTH-01**: Detect rapid directory growth from ``dir_samples`` whose
-  daily increment exceeds a configurable threshold.  When the directory
+  daily increment between complete scans exceeds a configurable threshold.
+  When the directory
   resides on the same mount-point as a DISK-FULL-01 finding the engine will
   fold this finding into that parent.
 - **DISK-JOURNAL-01**: Detect an oversized systemd journal directory by
   comparing the latest ``dir_samples`` size for paths under ``/var/log/journal``
-  to ``config.rules.journal_size_warn_gb``.
+  to ``config.rules.journal_size_warn_gb``.  Not evaluated when no such path
+  was measured (watching ``/var/log`` alone does not measure the journal).
 
 Design doc reference: §6.2 DISK-FULL-01 / DISK-GROWTH-01 / DISK-JOURNAL-01 /
 IO-BOTTLENECK-01.
@@ -26,7 +29,7 @@ from __future__ import annotations
 
 import datetime
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ..core import (
     Capability,
@@ -36,11 +39,13 @@ from ..core import (
     MiB,
     Rule,
     Severity,
+    SkippedRule,
     Window,
+    covers,
     register,
 )
 from .episodes import MINUTE, sustained_minutes
-from .trend import confidence_from_span, extrapolate_full
+from .trend import Forecast, confidence_from_span, forecast_full
 
 if TYPE_CHECKING:
     from ..config import ProcdiagConfig
@@ -52,6 +57,9 @@ if TYPE_CHECKING:
 
 _DISK_FULL_WARNING_DAYS: float = 30.0
 _DISK_FULL_CRITICAL_DAYS: float = 7.0
+# A forecast of DISK-FULL-01 / DISK-INODE-01 needs this much of the mount's
+# recording, the 6 hours the other trend rules need by default.
+_MIN_TREND_HOURS: float = 6.0
 
 # IO-BOTTLENECK-01
 _IO_PSI_THRESHOLD: float = 30.0
@@ -63,26 +71,32 @@ _DISK_GROWTH_THRESHOLD_BYTES_PER_DAY: int = 100 * MiB  # 100 MB/day
 
 @register
 class DiskFullRule(Rule):
-    """Predict disk-full events by extrapolating the used-space trend.
+    """Report a disk that is full or will soon be.
 
-    Queries ``disk_samples`` per mount-point, calls ``extrapolate_full`` to
-    estimate days until capacity is reached, and fires when the estimate
-    falls below the configured thresholds.
+    The usage is that of the space a non-root process can write (``used`` +
+    ``avail``, as df shows it): ext4 keeps 5% for root by default, and the
+    applications fail when the rest is gone.  The latest usage is checked
+    against ``warning_pct`` / ``critical_pct`` like ``snapshot`` does, and
+    the ``used`` series is extrapolated to that space with
+    :func:`~.trend.forecast_full` once the mount's current filesystem covers
+    ``min_trend_hours`` of recording.  Rows recorded before ``avail`` existed
+    count usage against ``total``.
     """
 
     rule_id = "DISK-FULL-01"
     category = "io_disk"
     title = "ディスク満杯予測"
     default_severity = Severity.WARNING
-    min_observation_hours = 1.0  # disk only needs a few readings
+    min_observation_hours = 0.0  # a full disk is decisive at once
     requires_rows = ("disk_samples",)
     what = (
-        "disk_samples の used 系列を線形外挿し、"
-        "capacity 到達までの残り日数を算出する"
+        "disk_samples の最新の使用率 (root 以外が書き込める容量に対する割合) を"
+        "確認し、used 系列を線形外挿して、その容量に届くまでの残り日数を算出する"
     )
     why = (
         "満杯になると書き込みエラー・サービス停止が発生する。"
-        "事前に傾向を検出して余裕を持って対処できるようにする"
+        "事前に傾向を検出して余裕を持って対処できるようにする。"
+        "root 用の予約領域はアプリケーションには使えないので、空きに数えない"
     )
     manual_commands = [
         "df -h",
@@ -92,93 +106,191 @@ class DiskFullRule(Rule):
     # Allow tests to override thresholds.
     warning_days: float = _DISK_FULL_WARNING_DAYS
     critical_days: float = _DISK_FULL_CRITICAL_DAYS
+    warning_pct: float = 90.0
+    critical_pct: float = 95.0
+    min_trend_hours: float = _MIN_TREND_HOURS
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-FULL-01 against the observation window."""
         findings: list[Finding] = []
-
-        # Fetch all disk samples within the window.
-        disk_rows = store.rows(
-            "disk_samples",
-            since=window.start_ts,
-            until=window.end_ts,
-        )
-
-        # Group by mountpoint.
-        by_mount: dict[str, list[tuple[float, float, float]]] = {}
-        for row in disk_rows:
-            mp = row["mountpoint"]
-            used = row["used"]
-            total = row["total"]
-            ts = row["ts"]
-            if used is not None and total is not None:
-                by_mount.setdefault(mp, []).append((ts, float(used), float(total)))
-
-        for mountpoint, triples in by_mount.items():
-            if not triples:
+        for mountpoint, mrows in _current_filesystems(
+            store, window, _has_bytes
+        ).items():
+            last = mrows[-1]
+            used, total, capacity = last["used"], last["total"], usable_bytes(last)
+            if capacity <= 0:
                 continue
-
-            capacity = triples[-1][2]  # total is stable; use latest value
-            series = [(t, used) for t, used, _ in triples]
-
-            days_left = extrapolate_full(series, capacity, min_points=3)
-            if days_left is None:
-                # Flat or shrinking — no finding.
-                continue
-
-            if days_left > self.warning_days:
-                continue
-
-            severity = (
-                Severity.CRITICAL
-                if days_left <= self.critical_days
-                else Severity.WARNING
+            used_pct = used / capacity * 100.0
+            writable = not _column(last, "read_only")
+            forecast, hours = _forecast(
+                mrows, window, "used", capacity, self.min_trend_hours
             )
 
-            # Estimate daily growth from the series endpoints.
-            if len(triples) >= 2:
-                t0, u0, _ = triples[0]
-                t1, u1, _ = triples[-1]
-                span_days = (t1 - t0) / 86400.0
-                daily_growth_bytes = (u1 - u0) / span_days if span_days > 0 else 0.0
-            else:
-                daily_growth_bytes = 0.0
+            if forecast is not None and forecast.days_left > self.warning_days:
+                forecast = None
+            by_level = writable and used_pct >= self.warning_pct
+            if not (by_level or forecast):
+                continue
+            critical = (writable and used_pct >= self.critical_pct) or (
+                forecast is not None and forecast.days_left <= self.critical_days
+            )
 
-            last_used = triples[-1][1]
-
+            free = capacity - used
             evidence = {
                 "mountpoint": mountpoint,
-                "days_left": days_left,
-                "daily_growth_bytes": daily_growth_bytes,
-                "used_bytes": last_used,
-                "total_bytes": capacity,
-                "used_gb": last_used / GiB,
-                "total_gb": capacity / GiB,
+                "days_left": forecast.days_left if forecast else None,
+                "daily_growth_bytes": forecast.per_day if forecast else None,
+                "used_pct": round(used_pct, 1),
+                "used_bytes": used,
+                "avail_bytes": free,
+                "total_bytes": total,
+                "used_gb": used / GiB,
+                "avail_gb": free / GiB,
+                "total_gb": total / GiB,
+                "avail_recorded": _column(last, "avail") is not None,
+                "warning_pct": self.warning_pct,
+                "critical_pct": self.critical_pct,
+                "critical": critical,
             }
 
-            summary = (
-                f"{mountpoint}: 残り {days_left:.1f}日で満杯"
-                f" ({daily_growth_bytes / GiB:.2f} GB/日の増加)"
-            )
-
-            # Confidence based on observation span and number of points
-            # (shared ladder; see trend.confidence_from_span).
-            span_hours = (triples[-1][0] - triples[0][0]) / 3600.0
-            confidence = confidence_from_span(span_hours, len(triples))
+            parts = []
+            if by_level:
+                parts.append(f"使用率 {used_pct:.1f}% (空き {free / GiB:.1f} GB)")
+            if forecast is not None:
+                parts.append(
+                    f"残り {forecast.days_left:.1f}日で満杯"
+                    f" ({forecast.per_day / GiB:.2f} GB/日の増加)"
+                )
 
             findings.append(
                 Finding(
                     rule_id=self.rule_id,
-                    severity=severity,
+                    severity=Severity.CRITICAL if critical else Severity.WARNING,
                     subject=mountpoint,
-                    summary=summary,
+                    summary=f"{mountpoint}: " + "、".join(parts),
                     evidence=evidence,
                     detected_at=(window.start_ts, window.end_ts),
-                    confidence=confidence,
+                    # A measured level is certain; a forecast only as its span.
+                    confidence=(
+                        Confidence.HIGH
+                        if by_level
+                        else confidence_from_span(hours, len(mrows))
+                    ),
                 )
             )
 
         return findings
+
+    def pending_parts(self, store: "Storage", window: Window) -> list[SkippedRule]:
+        """The mounts whose days-to-full forecast waits for more recording."""
+        mounts = _current_filesystems(store, window, _has_bytes)
+        return _forecast_pending(self, mounts, window)
+
+
+# A filesystem whose size changes by more than this from one sample to the
+# next is another one: a different USB stick or card at the same mount point,
+# or a resized partition.  A ZFS dataset's size drifts as the pool fills, a
+# little at a time.
+_SAME_SIZE_TOLERANCE = 0.01
+
+
+def _same_size(a: Optional[int], b: Optional[int]) -> bool:
+    return (
+        a is not None
+        and b is not None
+        and abs(a - b) <= _SAME_SIZE_TOLERANCE * max(a, b)
+    )
+
+
+def _one_filesystem(rows: list) -> list:
+    """The last of a mount's *rows*: those of the filesystem it has now."""
+    first = len(rows) - 1
+    while first > 0 and _same_size(rows[first - 1]["total"], rows[first]["total"]):
+        first -= 1
+    return rows[first:]
+
+
+def _has_bytes(row) -> bool:
+    return row["used"] is not None and row["total"] is not None
+
+
+def _has_inodes(row) -> bool:
+    return bool(row["inodes_total"]) and row["inodes_used"] is not None
+
+
+def _current_filesystems(store: "Storage", window: Window, usable) -> dict[str, list]:
+    """Each mount's ``disk_samples`` rows of the filesystem it has now.
+
+    Only the rows *usable* accepts are looked at.
+    """
+    by_mount: dict[str, list] = {}
+    rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
+    for row in rows:
+        if usable(row):
+            by_mount.setdefault(row["mountpoint"], []).append(row)
+    return {mount: _one_filesystem(rows) for mount, rows in by_mount.items()}
+
+
+def _column(row, name: str):
+    """``row[name]``, or None for a column an older DB does not have."""
+    return row[name] if name in row.keys() else None
+
+
+def usable_bytes(row) -> int:
+    """What a non-root process can fill on a ``disk_samples`` *row*.
+
+    ``used + avail``, as df counts it; ``total`` for a row recorded before
+    ``avail`` existed.
+    """
+    avail = _column(row, "avail")
+    return row["used"] + avail if avail is not None else row["total"]
+
+
+def _forecast(
+    rows: list, window: Window, column: str, capacity: float, min_hours: float
+) -> tuple[Optional[Forecast], float]:
+    """The forecast of one filesystem's *column* series, and the hours it covers.
+
+    None unless *rows* cover *min_hours* of recording: a stick filled for a
+    few minutes, or one large copy in an hour, is not a trend.
+    """
+    hours = _recorded_hours(rows, window)
+    if not covers(hours, min_hours):
+        return None, hours
+    series = [(r["ts"], float(r[column])) for r in rows]
+    return forecast_full(series, capacity, min_points=3), hours
+
+
+def _recorded_hours(rows: list, window: Window) -> float:
+    return window.observed_hours_between(rows[0]["ts"], rows[-1]["ts"])
+
+
+_FORECAST_PART = "残り日数の予測"
+
+
+def _forecast_pending(
+    rule: "DiskFullRule | DiskInodeRule", mounts: dict[str, list], window: Window
+) -> list[SkippedRule]:
+    """One entry for each mount whose forecast the recording is too short for.
+
+    Each says how many more hours the mount's current filesystem needs.  The
+    usage level is judged whatever the recording, so only the forecast waits.
+    """
+    pending = []
+    for mount, rows in mounts.items():
+        hours = _recorded_hours(rows, window)
+        if not covers(hours, rule.min_trend_hours):
+            pending.append(
+                SkippedRule(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    required_hours=rule.min_trend_hours,
+                    remaining_hours=max(rule.min_trend_hours - hours, 0.1),
+                    part=_FORECAST_PART,
+                    subject=mount,
+                )
+            )
+    return pending
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +490,10 @@ def _io_megabytes(read: int, write: int) -> dict[str, float]:
 class DiskGrowthRule(Rule):
     """Detect rapid directory growth from ``dir_samples``.
 
-    Computes the daily growth rate per ``path`` as ``(last - first) / days``.
+    Computes the daily growth rate per ``path`` as ``(last - first) / days``
+    over the complete scans: a scan cut short by its time budget
+    (``is_estimate``) counted only part of the directory.  A window whose scans
+    were all cut short is not evaluated.
     Fires INFO when the rate exceeds the threshold; escalates to WARNING when
     the rate exceeds twice the threshold.  When the directory lies on the
     same mount-point as a DISK-FULL-01 finding the engine will fold this
@@ -405,6 +520,36 @@ class DiskGrowthRule(Rule):
     threshold_bytes_per_day: int = _DISK_GROWTH_THRESHOLD_BYTES_PER_DAY
     warn_multiplier: float = 2.0
 
+    def missing_rows(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """A complete scan, when the window has scans of the watched directories."""
+        rows = store.rows("dir_samples", since=window.start_ts, until=window.end_ts)
+        if not rows or any(_complete(row) for row in rows):
+            return ()
+        return ("dir_samples (時間内に終わった走査)",)
+
+    def coverage_notes(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """The directories cut-short scans leave without two complete ones.
+
+        Growth needs two complete scans.  A directory scanned to the end once
+        or never in the window is named, however many scans were cut short.
+        """
+        rows = store.rows("dir_samples", since=window.start_ts, until=window.end_ts)
+        done: dict[str, int] = {}
+        cut: dict[str, int] = {}
+        for row in rows:
+            if row["size_bytes"] is None:
+                continue
+            counts = done if _complete(row) else cut
+            counts[row["path"]] = counts.get(row["path"], 0) + 1
+        short = [path for path in cut if done.get(path, 0) < 2]
+        if not short:
+            return ()
+        return (
+            f"{self.rule_id}: 走査が時間内に終わらず、完了した走査が 2 回に満たず"
+            "増分を判定できません: "
+            + "、".join(f"{p} (完了 {done.get(p, 0)} 回)" for p in short),
+        )
+
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-GROWTH-01 against the observation window."""
         dir_rows = store.rows(
@@ -416,11 +561,10 @@ class DiskGrowthRule(Rule):
         # Group by path.
         by_path: dict[str, list[tuple[float, int]]] = {}
         for row in dir_rows:
-            path = row["path"]
-            size = row["size_bytes"]
-            ts = row["ts"]
-            if size is not None:
-                by_path.setdefault(path, []).append((ts, int(size)))
+            if _complete(row):
+                by_path.setdefault(row["path"], []).append(
+                    (row["ts"], int(row["size_bytes"]))
+                )
 
         # Pre-fetch disk_samples to build a mountpoint → path mapping.
         disk_rows = store.rows(
@@ -472,11 +616,12 @@ class DiskGrowthRule(Rule):
                     mountpoint = mp
                     break
 
+            threshold_mb = self.threshold_bytes_per_day / MiB
             evidence = {
                 "path": path,
                 "daily_growth_mb": daily_growth / MiB,
                 "daily_growth_bytes": daily_growth,
-                "threshold_mb": self.threshold_bytes_per_day // MiB,
+                "threshold_mb": threshold_mb,
                 "observation_days": span_days,
                 "start_gb": size_start / GiB,
                 "end_gb": size_end / GiB,
@@ -488,7 +633,7 @@ class DiskGrowthRule(Rule):
 
             summary = (
                 f"{path}: 日次増分 {daily_growth / MiB:.0f} MB/日"
-                f" (閾値 {self.threshold_bytes_per_day // MiB} MB/日)"
+                f" (閾値 {round(threshold_mb, 2):g} MB/日)"
             )
 
             # Confidence based on observation span.
@@ -514,6 +659,11 @@ class DiskGrowthRule(Rule):
         return findings
 
 
+def _complete(row) -> bool:
+    """Whether a ``dir_samples`` row is a size: read, and not cut short."""
+    return row["size_bytes"] is not None and not row["is_estimate"]
+
+
 # ---------------------------------------------------------------------------
 # DISK-JOURNAL-01
 # ---------------------------------------------------------------------------
@@ -526,7 +676,9 @@ class DiskJournalRule(Rule):
     Queries ``dir_samples`` for paths beginning with ``/var/log/journal`` and
     fires WARNING when the latest size exceeds
     ``config.rules.journal_size_warn_gb``.  The proposal includes the
-    ``SystemMaxUse`` journald configuration snippet.
+    ``SystemMaxUse`` journald configuration snippet.  A window with watched
+    directories but no measured journal path is not evaluated: the size of
+    ``/var/log`` does not tell the journal's.
     """
 
     rule_id = "DISK-JOURNAL-01"
@@ -560,6 +712,17 @@ class DiskJournalRule(Rule):
         """
         self.journal_size_warn_gb = config.rules.journal_size_warn_gb
         super().configure(config)
+
+    def missing_rows(self, store: "Storage", window: Window) -> tuple[str, ...]:
+        """A measured journal path, when the window has watched directories."""
+        rows = store.rows("dir_samples", since=window.start_ts, until=window.end_ts)
+        if not rows or any(
+            row["path"].startswith(self.journal_path_prefix)
+            and row["size_bytes"] is not None
+            for row in rows
+        ):
+            return ()
+        return (f"dir_samples ({self.journal_path_prefix})",)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-JOURNAL-01 against the observation window."""
@@ -634,7 +797,8 @@ class DiskInodeRule(Rule):
     Millions of small files (spool, cache, session files) can use up a
     filesystem's inode table long before its bytes run out.  Byte-based
     DISK-FULL-01 cannot see that, so this rule checks the latest inode usage
-    per mount-point and extrapolates its growth like DISK-FULL-01 does.
+    per mount-point and extrapolates its growth like DISK-FULL-01 does, from
+    ``min_trend_hours`` of the mount's current filesystem.
     Filesystems without a fixed inode table (btrfs) record NULL and are skipped.
     """
 
@@ -659,26 +823,21 @@ class DiskInodeRule(Rule):
     critical_pct: float = 95.0
     warning_days: float = _DISK_FULL_WARNING_DAYS
     critical_days: float = _DISK_FULL_CRITICAL_DAYS
+    min_trend_hours: float = _MIN_TREND_HOURS
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-INODE-01 against the observation window."""
-        rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
-
-        by_mount: dict[str, list] = {}
-        for row in rows:
-            if row["inodes_total"] and row["inodes_used"] is not None:
-                by_mount.setdefault(row["mountpoint"], []).append(row)
-
         findings: list[Finding] = []
-        for mountpoint, mrows in by_mount.items():
+        for mountpoint, mrows in _current_filesystems(
+            store, window, _has_inodes
+        ).items():
             last = mrows[-1]
             total, used = last["inodes_total"], last["inodes_used"]
             used_pct = used / total * 100.0
-            days_left = extrapolate_full(
-                [(r["ts"], float(r["inodes_used"])) for r in mrows],
-                float(total),
-                min_points=3,
+            forecast, _ = _forecast(
+                mrows, window, "inodes_used", float(total), self.min_trend_hours
             )
+            days_left = forecast.days_left if forecast else None
             by_level = used_pct >= self.warning_pct
             by_trend = days_left is not None and days_left <= self.warning_days
             if not (by_level or by_trend):
@@ -716,6 +875,11 @@ class DiskInodeRule(Rule):
             )
         return findings
 
+    def pending_parts(self, store: "Storage", window: Window) -> list[SkippedRule]:
+        """The mounts whose inode forecast waits for more recording."""
+        mounts = _current_filesystems(store, window, _has_inodes)
+        return _forecast_pending(self, mounts, window)
+
 
 # ---------------------------------------------------------------------------
 # FS-READONLY-01
@@ -728,8 +892,9 @@ class FsReadOnlyRule(Rule):
 
     ext4/xfs remount themselves read-only (``errors=remount-ro``) when they
     hit an I/O or metadata error — every later write then fails although the
-    disk is not full.  A rw→ro transition is reported as CRITICAL; a root
-    filesystem that is read-only for the whole window as WARNING (other
+    disk is not full.  A rw→ro transition of one filesystem is reported as
+    CRITICAL (a write-protected card mounted where a stick was is not one); a
+    root filesystem that is read-only for the whole window as WARNING (other
     always-read-only mounts are assumed intentional).
     """
 
@@ -754,28 +919,28 @@ class FsReadOnlyRule(Rule):
         """Run FS-READONLY-01 against the observation window."""
         rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
 
-        flags: dict[str, list[tuple[float, int]]] = {}
+        flags: dict[str, list] = {}
         for row in rows:
             if row["read_only"] is not None:
-                flags.setdefault(row["mountpoint"], []).append(
-                    (row["ts"], row["read_only"])
-                )
+                flags.setdefault(row["mountpoint"], []).append(row)
 
         findings: list[Finding] = []
         for mountpoint, series in flags.items():
             switched_at = next(
                 (
-                    ts
-                    for (_, prev), (ts, cur) in zip(series, series[1:])
-                    if not prev and cur
+                    cur["ts"]
+                    for prev, cur in zip(series, series[1:])
+                    if not prev["read_only"]
+                    and cur["read_only"]
+                    and _same_size(prev["total"], cur["total"])
                 ),
                 None,
             )
-            still_ro = bool(series[-1][1])
+            still_ro = bool(series[-1]["read_only"])
             if switched_at is not None:
                 severity, confidence = Severity.CRITICAL, Confidence.HIGH
                 summary = f"{mountpoint}: 記録中に読み取り専用へ切り替わりました"
-            elif still_ro and all(flag for _, flag in series) and mountpoint == "/":
+            elif still_ro and all(r["read_only"] for r in series) and mountpoint == "/":
                 severity, confidence = Severity.WARNING, Confidence.MEDIUM
                 summary = "/: ルートファイルシステムが読み取り専用で稼働しています"
             else:
