@@ -42,6 +42,7 @@ from procdiag.compare import (
     SideState,
     Unknown,
     Verdict,
+    Why,
 )
 from procdiag.compare import exit_code as compare_exit_code
 from procdiag.core import (
@@ -1284,6 +1285,28 @@ def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
     )
 
 
+_BLOCKED_ADVICE = {
+    Why.TOO_SHORT: "記録時間が足りないものは、記録を続けてから比べ直してください。",
+    Why.PAIRED_BY_NAME: (
+        "名前だけで突き合わせたものは、記録を続けても判定できません。"
+        "行に示した両方の値から判断してください。"
+    ),
+}
+_OTHER_BLOCKED_ADVICE = "それ以外は、理由を行ごとに示しています。"
+
+
+def _blocked_conclusion(cmp: Comparison) -> str:
+    """Why exit code 3, and for each reason whether recording longer helps."""
+    blocked = cmp.blocked_rows
+    if not blocked:
+        return "判定できません。記録を続けてから比べ直してください。"
+    reasons = dict.fromkeys(r.why for r in blocked)
+    advice = [_BLOCKED_ADVICE[w] for w in reasons if w in _BLOCKED_ADVICE]
+    if any(w not in _BLOCKED_ADVICE for w in reasons):
+        advice.append(_OTHER_BLOCKED_ADVICE)
+    return "判定できない検出があります。" + "".join(advice)
+
+
 def _compare_conclusion(cmp: Comparison) -> str:
     code = compare_exit_code(cmp)
     if code == 1:
@@ -1291,7 +1314,7 @@ def _compare_conclusion(cmp: Comparison) -> str:
     if cmp.before.result is None or cmp.after.result is None:
         return "片方の期間に記録がないため比較できません。"
     if code == 3:
-        return "判定できない検出があります。記録を続けてから比べ直してください。"
+        return _blocked_conclusion(cmp)
     if not cmp.rows:
         scope = (
             ""
@@ -1435,6 +1458,7 @@ def _row_dict(row: ComparisonRow) -> dict:
         "title": row.title,
         "subject": row.subject,
         "identity": row.identity,
+        "after_identity": row.after_identity,
         "verdict": row.verdict.value,
         "why": row.why.value,
         "label": row.label,

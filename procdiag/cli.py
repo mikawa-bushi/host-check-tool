@@ -988,8 +988,10 @@ def compare(
     (例: '2026-10-28 09:00'、'2026-10-28T00:00Z')。
 
     終了コード: 0=修正後に critical・warning なし (修正前の検出はすべて判定できた) /
-    1=修正後に critical・warning あり / 2=修正後に info のみ /
-    3=判定できない検出がある・期間に記録がない / 4=前提条件エラー
+    1=修正後に critical・warning が残っている (「変化なし」「悪化」「改善
+    (しきい値以上)」を含む)・新たに出た / 2=修正後に info のみ /
+    3=判定できない検出がある・期間に記録がない・検出が無くてもどちらの期間も記録時間が
+    足りず評価できないルールがある / 4=前提条件エラー
     """
     from . import report as report_mod
     from .compare import CompareError, PeriodsRequest, plan_request, run_compare
