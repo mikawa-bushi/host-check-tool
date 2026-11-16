@@ -18,6 +18,7 @@ from click.testing import CliRunner
 from procdiag.cli import cli
 from procdiag.config import BudgetConfig, ProcdiagConfig
 from procdiag.doctor import run_doctor
+from procdiag.samplers.selfmeter import SelfMeter
 
 
 def _write_config(folder: Path, factor: float) -> Path:
@@ -56,6 +57,16 @@ def clamped(tmp_path_factory) -> Recording:
 @pytest.fixture(scope="module")
 def usable(tmp_path_factory) -> Recording:
     return _record(tmp_path_factory.mktemp("usable"), 1.5)
+
+
+def test_the_recorder_widens_the_interval_by_the_minimum_factor():
+    meter = SelfMeter(BudgetConfig(throttle_factor=1.05), process_interval=10.0)
+    meter.sample = lambda: (50.0, 1024)  # type: ignore[method-assign]
+
+    events = [meter.update(1000.0 + second) for second in range(65)]
+
+    assert "throttle_down" in events
+    assert meter.factor == pytest.approx(1.1)
 
 
 class TestRecord:
