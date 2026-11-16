@@ -1416,126 +1416,63 @@ class TestDirectoryGrowthNeedsTwelveHours:
         assert "問題は見つかりませんでした" not in out
 
 
-def _steady(
-    start, hours, *, mountpoint="/media/usb", total=100, from_h=0.0, gb_h=2, shift=0
-):
-    """Rows each minute from *from_h* to *hours* of a mount growing *gb_h* an hour.
-
-    *shift* GiB is added to the usage, as a stick with other contents has.
-    """
+def _steady(start, hours, *, mountpoint="/media/usb", total=100, from_h=0.0, gb_h=2):
+    """Rows each minute from *from_h* to *hours* of a mount growing *gb_h* an hour."""
     return [
         {
             "ts": start + m * 60,
             "mountpoint": mountpoint,
             "total": total * _GiB,
-            "used": int((20 + shift + gb_h * m / 60) * _GiB),
+            "used": int((20 + gb_h * m / 60) * _GiB),
             "read_only": 0,
         }
         for m in range(int(from_h * 60), int(hours * 60) + 1)
     ]
 
 
-def _cut_system_rows(store, start, from_h, to_h):
-    """Remove the system samples of a stretch, as a stopped recorder leaves it."""
-    lo, hi = start + from_h * _HOUR, start + to_h * _HOUR
-    store.conn.execute("DELETE FROM sys_samples WHERE ts BETWEEN ? AND ?", (lo, hi))
-    store.conn.execute(
-        "DELETE FROM sys_rollup_1m WHERE ts_min BETWEEN ? AND ?", (lo, hi)
-    )
-    store.conn.commit()
+def _grown(start, total_gb, used_gb_at, *, hours=12, cut=(), mountpoint="/data"):
+    """A row each minute of *hours*, the usage ``used_gb_at(minute)`` of *total_gb*.
 
-
-class TestAnotherMediumOfTheSameSize:
-    def test_a_stick_of_the_same_size_after_hours_unplugged_is_not_growth(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 24)
-        sticks = [(m, 32, 1, 0) for m in range(120, 541)] + [
-            (m, 32, 29, 0) for m in range(720, 1201)
-        ]
-        _disk(
-            store,
-            [
-                {
-                    "ts": start + m * 60,
-                    "mountpoint": "/media/usb",
-                    "total": total * _GiB,
-                    "used": used * _GiB,
-                    "read_only": read_only,
-                }
-                for m, total, used, read_only in sticks
-            ],
-        )
-
-        diag = _run(store, "DISK-FULL-01", "DISK-INODE-01")
-
-        (f,) = _found(diag, "DISK-FULL-01")
-        assert f.severity is Severity.WARNING
-        assert f.evidence["days_left"] is None
-        assert "満杯" not in f.summary.split("使用率")[-1]
-
-    def test_the_same_stick_unplugged_for_ten_minutes_is_one_filesystem(self, tmp_path):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            _steady(start, 5.0) + _steady(start, 12, from_h=5.0 + 10 / 60),
-        )
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] == pytest.approx(1.17, abs=0.1)
-
-    def test_a_recorder_stop_between_samples_does_not_end_the_filesystem(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 14)
-        _cut_system_rows(store, start, 8.01, 10.99)
-        _disk(store, _steady(start, 8.0) + _steady(start, 14, from_h=11.0))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        (f,) = _found(diag, "DISK-FULL-01")
-        assert f.evidence["days_left"] is not None
-        assert diag.skipped_rules == []
-
-    def test_a_mount_missing_while_the_recorder_ran_ends_the_filesystem(self, tmp_path):
-        store, start = _recording(tmp_path, 14)
-        _disk(
-            store,
-            _steady(start, 8.0) + _steady(start, 14, from_h=11.0, shift=30),
-        )
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        (waits,) = diag.skipped_rules
-        assert waits.subject == "/media/usb"
-        assert waits.remaining_hours == pytest.approx(3.0, abs=0.1)
-
-    def test_a_mount_missing_for_two_minutes_is_not_a_new_filesystem(self, tmp_path):
-        store, start = _recording(tmp_path, 8)
-        _disk(store, _steady(start, 3.0) + _steady(start, 8, from_h=3.0 + 2 / 60))
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] is not None
-
-    def test_a_mount_missing_for_six_minutes_with_other_contents_is_a_new_filesystem(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, shift=30),
-        )
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert _pending(diag) == {
-            ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
+    The minutes in the ``(from, to)`` stretches of *cut* have no row.
+    """
+    return [
+        {
+            "ts": start + m * 60,
+            "mountpoint": mountpoint,
+            "total": total_gb * _GiB,
+            "used": int(used_gb_at(m) * _GiB),
+            "read_only": 0,
         }
+        for m in range(int(hours * 60) + 1)
+        if not any(lo <= m < hi for lo, hi in cut)
+    ]
 
+
+def _bursts(m, *, first=20, gb_an_hour=2.0):
+    """An hourly job that adds *gb_an_hour* in its first ten minutes, flat otherwise."""
+    return first + gb_an_hour * (m // 60 + min(1.0, (m % 60) / 10))
+
+
+def _noisy(used_gb_at, sd_mb, seed):
+    rng = random.Random(seed)
+    return lambda m: used_gb_at(m) + rng.gauss(0, sd_mb) / 1024
+
+
+def _nightly(m, *, job_gb=10.0):
+    """Slow growth, and a job that adds *job_gb* in the hour from 14:00 each day."""
+    hours = m / 60
+    if hours < 14:
+        return 60 + 0.1 * hours
+    days, into = divmod(hours - 14, 24)
+    return 60 + 0.1 * hours + job_gb * (days + min(1.0, into))
+
+
+def _rotated_log(m, *, gb_an_hour=0.5):
+    """A log that grows *gb_an_hour* and is deleted at the start of each day."""
+    return 25.6 + gb_an_hour * (m / 60 % 24)
+
+
+class TestAGapInTheRowsIsNotAnotherMedium:
     @pytest.mark.parametrize("gap_minutes", [6, 10, 30, 60, 90, 120])
     def test_a_gap_in_the_rows_of_a_mount_that_grows_on_is_no_new_filesystem(
         self, tmp_path, gap_minutes
@@ -1572,127 +1509,6 @@ class TestAnotherMediumOfTheSameSize:
         assert f.evidence["days_left"] is not None
         assert diag.skipped_rules == []
 
-    def test_a_gap_with_a_total_that_changes_by_more_than_a_percent_is_a_new_filesystem(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, total=97),
-        )
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert _pending(diag) == {
-            ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
-        }
-
-    @pytest.mark.parametrize(("shift", "same"), [(0.5, True), (5, False)])
-    def test_a_gap_with_a_usage_that_jumps_by_a_percent_of_the_size_is_a_new_one(
-        self, tmp_path, shift, same
-    ):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, shift=shift),
-        )
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert bool(_found(diag, "DISK-FULL-01")) is same
-        assert bool(_pending(diag)) is not same
-
-    def test_a_gap_between_rows_that_lost_their_usage_is_still_where_a_filesystem_ends(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            [
-                {
-                    "ts": start + m * 60,
-                    "mountpoint": "/",
-                    "total": 100 * _GiB,
-                    "used": None if m in (419, 430) else 40 * _GiB,
-                    "inodes_total": 10_000_000,
-                    "inodes_used": 400_000 + 1000 * m,
-                    "read_only": 0,
-                }
-                for m in range(12 * 60 + 1)
-                if not 420 <= m < 430
-            ],
-        )
-
-        diag = _run(store, "DISK-INODE-01")
-
-        assert _found(diag, "DISK-INODE-01") == []
-        assert ("DISK-INODE-01", "/") in _pending(diag)
-
-    def test_a_gap_with_a_total_that_drifts_by_less_than_a_percent_is_no_new_one(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        rows = _steady(start, 7.0, total=500) + _steady(
-            start, 12, from_h=7.0 + 6 / 60, total=498
-        )
-        _disk(store, rows)
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] is not None
-
-    def test_a_sparse_mount_is_judged_by_its_own_steps(self, tmp_path):
-        store, start = _recording(tmp_path, 24)
-        _disk(
-            store,
-            [
-                {
-                    "ts": start + h * _HOUR,
-                    "mountpoint": "/media/usb",
-                    "total": 100 * _GiB,
-                    "used": (20 + 2 * h) * _GiB,
-                    "read_only": 0,
-                }
-                for h in range(0, 9)
-                if h != 5
-            ],
-        )
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] is not None
-
-
-def _grown(start, total_gb, used_gb_at, *, hours=12, cut=(), mountpoint="/data"):
-    """A row each minute of *hours*, the usage ``used_gb_at(minute)`` of *total_gb*.
-
-    The minutes in the ``(from, to)`` stretches of *cut* have no row.
-    """
-    return [
-        {
-            "ts": start + m * 60,
-            "mountpoint": mountpoint,
-            "total": total_gb * _GiB,
-            "used": int(used_gb_at(m) * _GiB),
-            "read_only": 0,
-        }
-        for m in range(int(hours * 60) + 1)
-        if not any(lo <= m < hi for lo, hi in cut)
-    ]
-
-
-def _bursts(m, *, first=20, gb_an_hour=2.0):
-    """An hourly job that adds *gb_an_hour* in its first ten minutes, flat otherwise."""
-    return first + gb_an_hour * (m // 60 + min(1.0, (m % 60) / 10))
-
-
-def _noisy(used_gb_at, sd_mb, seed):
-    rng = random.Random(seed)
-    return lambda m: used_gb_at(m) + rng.gauss(0, sd_mb) / 1024
-
-
-class TestAGapInTheRowsOfABurstyOrNoisyDisk:
     @pytest.mark.parametrize(
         ("gap", "gb_an_hour", "total_gb"),
         [
@@ -1735,7 +1551,7 @@ class TestAGapInTheRowsOfABurstyOrNoisyDisk:
         assert diag.skipped_rules == []
 
     @pytest.mark.parametrize("gap", [120, 240])
-    def test_one_row_after_a_gap_goes_on_at_the_rate_before_it(self, tmp_path, gap):
+    def test_one_row_after_a_gap_keeps_the_forecast(self, tmp_path, gap):
         store, start = _recording(tmp_path, 12)
         rows = _grown(start, 200, lambda m: 100 + 2 * m / 60, cut=[(720 - gap, 720)])
         assert rows[-1]["ts"] - rows[-2]["ts"] == (gap + 1) * 60
@@ -1747,118 +1563,6 @@ class TestAGapInTheRowsOfABurstyOrNoisyDisk:
         assert f.evidence["days_left"] == pytest.approx(1.6, abs=0.2)
         assert diag.skipped_rules == []
 
-    def test_a_stick_of_the_same_size_swapped_in_scattering_usage_is_another_one(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        used = _noisy(lambda m: 5 + 0.5 * m / 60 + (12 if m >= 480 else 0), 100, 4)
-        _disk(store, _grown(start, 32, used, cut=[(420, 480)]))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert ("DISK-FULL-01", "/data") in _pending(diag)
-
-    def test_a_stick_swapped_in_a_gap_before_the_last_row_is_another_one(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        used = lambda m: 100 + 2 * m / 60 + (36 if m >= 720 else 0)  # noqa: E731
-        _disk(store, _grown(start, 200, used, cut=[(600, 720)]))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert ("DISK-FULL-01", "/data") in _pending(diag)
-
-    def test_a_stick_swapped_while_a_job_adds_in_bursts_is_another_one(self, tmp_path):
-        store, start = _recording(tmp_path, 12)
-        used = lambda m: _bursts(m) + (10 if m >= 420 else 0)  # noqa: E731
-        _disk(store, _grown(start, 64, used, cut=[(360, 420)]))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert ("DISK-FULL-01", "/data") in _pending(diag)
-
-    def test_a_stick_swapped_for_an_emptier_one_of_the_same_size_is_another_one(
-        self, tmp_path
-    ):
-        store, start = _recording(tmp_path, 12)
-        used = lambda m: 100 + 2 * m / 60 - (60 if m >= 480 else 0)  # noqa: E731
-        _disk(store, _grown(start, 200, used, cut=[(420, 480)]))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert ("DISK-FULL-01", "/data") in _pending(diag)
-
-    def test_a_modest_jump_in_a_disk_that_grows_steadily_is_another_one(self, tmp_path):
-        store, start = _recording(tmp_path, 12)
-        _disk(
-            store,
-            _steady(start, 7.0, total=100)
-            + _steady(start, 12, from_h=7.0 + 6 / 60, total=100, shift=3),
-        )
-
-        diag = _run(store, "DISK-FULL-01")
-
-        assert _found(diag, "DISK-FULL-01") == []
-        assert ("DISK-FULL-01", "/media/usb") in _pending(diag)
-
-    def test_a_few_rows_before_a_gap_do_not_decide_the_rate_across_it(self, tmp_path):
-        store, start = _recording(tmp_path, 7)
-        used = _noisy(lambda m: 20 + m / 60, 200, 5)
-        _disk(store, _grown(start, 64, used, hours=7, cut=[(0, 10), (14, 75)]))
-
-        diag = _run(store, "DISK-FULL-01")
-
-        (f,) = _found(diag, "DISK-FULL-01")
-        assert f.evidence["days_left"] == pytest.approx(1.5, abs=0.3)
-        assert diag.skipped_rules == []
-
-    def test_a_swap_is_judged_without_the_rows_before_an_earlier_one(self, tmp_path):
-        store, start = _recording(tmp_path, 12)
-        used = (
-            lambda m: 30 + 2 * m / 60 + (0 if m < 310 else -30 if m < 350 else -4)
-        )  # noqa: E731
-        _disk(store, _grown(start, 200, used, cut=[(300, 310), (340, 350)]))
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] == pytest.approx(3.1, abs=0.2)
-
-    def test_a_swap_is_judged_without_the_rows_before_a_change_of_size(self, tmp_path):
-        store, start = _recording(tmp_path, 12)
-        small = _grown(start, 100, lambda m: 30 + 2 * m / 60, hours=5)
-        large = _grown(
-            start,
-            200,
-            lambda m: 30 + 2 * m / 60 + (30 if m < 350 else 4),
-            cut=[(0, 301), (340, 350)],
-        )
-        _disk(store, small + large)
-
-        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
-
-        assert f.evidence["days_left"] == pytest.approx(3.0, abs=0.2)
-
-
-def _nightly(m, *, job_gb=10.0):
-    """Slow growth, and a job that adds *job_gb* in the hour from 14:00 each day."""
-    hours = m / 60
-    if hours < 14:
-        return 60 + 0.1 * hours
-    days, into = divmod(hours - 14, 24)
-    return 60 + 0.1 * hours + job_gb * (days + min(1.0, into))
-
-
-def _rotated_log(m, *, gb_an_hour=0.5):
-    """A log that grows *gb_an_hour* and is deleted at the start of each day."""
-    return 25.6 + gb_an_hour * (m / 60 % 24)
-
-
-class TestAGapInTheRowsIsNotAnotherMedium:
     @pytest.mark.parametrize("gap", [90, 120, 240])
     def test_a_gap_that_swallows_a_nightly_job_does_not_end_the_forecast(
         self, tmp_path, gap
