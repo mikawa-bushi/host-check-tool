@@ -52,6 +52,13 @@ class TestExplain:
         assert "bogus" in result.stderr
         assert result.stdout == ""
 
+    def test_a_name_with_a_newline_cannot_forge_a_second_error_line(self):
+        result = CliRunner().invoke(cli, ["explain", "foo\nエラー: forged"])
+
+        assert result.exit_code == 4
+        assert len(result.stderr.strip().splitlines()) == 1
+        assert "foo" in result.stderr
+
     def test_a_rule_and_a_sampler_still_explain(self):
         assert CliRunner().invoke(cli, ["explain", "MEM-LEAK-01"]).exit_code == 0
         assert CliRunner().invoke(cli, ["explain", "system"]).exit_code == 0

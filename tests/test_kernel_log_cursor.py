@@ -321,6 +321,42 @@ class TestAJournalThatCameBackAfterTwoFailedReads:
         assert recording.kinds == []
         assert Capability.KERNEL_LOG in recording.ctx.unobserved
 
+    @pytest.mark.parametrize(
+        ("logged_after_the_vacuum", "kinds"),
+        [(_IO_ERROR, ["io_error"]), (_BOOT, [])],
+        ids=["an anomaly follows", "only a quiet line follows"],
+    )
+    def test_a_position_the_journal_no_longer_holds_keeps_it_unobserved(
+        self, journal, clock, logged_after_the_vacuum, kinds
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        journal.log(recording.after_tick(100), _IO_ERROR)
+        journal.fail_cursor_reads(2)
+        assert recording.ticks(2) == [False, False]
+        journal.vacuum()
+        journal.log(recording.after_tick(100), logged_after_the_vacuum)
+
+        assert recording.tick() is True
+
+        assert recording.kinds == kinds
+        assert Capability.KERNEL_LOG in recording.ctx.unobserved
+
+    def test_a_position_that_is_still_held_is_taken_back_after_other_lines_went(
+        self, journal, clock
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        journal.fail_cursor_reads(2)
+        journal.log(recording.after_tick(100), _IO_ERROR)
+        assert recording.ticks(2) == [False, False]
+        journal.log(recording.after_tick(100), _IO_ERROR)
+
+        assert recording.tick() is True
+
+        assert recording.kinds == ["io_error", "io_error"]
+        assert Capability.KERNEL_LOG not in recording.ctx.unobserved
+
     def test_a_journal_that_never_reads_stays_unobserved(self, journal, clock):
         journal.log(_T0 - 100, _BOOT)
         recording = _Recording(clock)
@@ -333,12 +369,15 @@ class TestAJournalThatCameBackAfterTwoFailedReads:
 
 class TestWhatTheRecorderKeepsOfIt:
     @staticmethod
-    def _recorded(journal, tmp_path, *, failing_reads: int):
+    def _recorded(journal, tmp_path, *, failing_reads: int, vacuum: bool = False):
         journal.log(time.time() - 10, _BOOT)
 
         def go_wrong() -> None:
             journal.fail_cursor_reads(failing_reads)
             journal.log(time.time(), _IO_ERROR)
+            if vacuum:
+                journal.vacuum()
+                journal.log(time.time(), _IO_ERROR)
 
         sampler = _ScriptedKernelLog({1: go_wrong})
         config = ProcdiagConfig(
@@ -379,6 +418,17 @@ class TestWhatTheRecorderKeepsOfIt:
         assert kinds == ["io_error"]
         assert Capability.KERNEL_LOG not in capabilities
         assert events == []
+
+    def test_a_position_the_journal_lost_leaves_the_unobserved_period(
+        self, journal, tmp_path
+    ):
+        capabilities, kinds, events = self._recorded(
+            journal, tmp_path, failing_reads=2, vacuum=True
+        )
+
+        assert kinds == ["io_error"]
+        assert Capability.KERNEL_LOG in capabilities
+        assert len(events) == 1
 
     def test_a_journal_that_stays_unreadable_is_kept_as_unobserved(
         self, journal, tmp_path
@@ -433,6 +483,38 @@ class TestAStreamOfLinesWhileThePositionKeepsFailing:
         recording.ticks(2)
 
         assert recording.kinds == ["io_error", "io_error"]
+
+
+class TestTwoLinesOfTheSameTimeAndText:
+    """``--since`` counts whole seconds, so a re-read returns lines already recorded."""
+
+    def test_the_second_of_two_identical_lines_is_not_taken_for_the_first(
+        self, journal, clock
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        assert recording.tick() is True
+        logged = recording.after_tick(_INTERVAL) - 0.3
+        journal.log(logged, _IO_ERROR)
+        assert recording.tick() is True
+        journal.fail_cursor_reads()
+        journal.log(logged, _IO_ERROR)
+
+        assert recording.ticks(3) == [False, False, True]
+
+        assert recording.kinds == ["io_error", "io_error"]
+
+    def test_a_line_read_twice_by_time_is_still_recorded_once(self, journal, clock):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        assert recording.tick() is True
+        journal.log(recording.after_tick(_INTERVAL) - 0.3, _IO_ERROR)
+        assert recording.tick() is True
+        journal.fail_cursor_reads()
+
+        assert recording.ticks(3) == [False, False, True]
+
+        assert recording.kinds == ["io_error"]
 
 
 class _ScriptedKernelLog(KernelLogSampler):
