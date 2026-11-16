@@ -215,12 +215,18 @@ def _shown_pct(value: float, *levels: float) -> float:
 # mount point, or a resized partition.  Another filesystem of nearly the same
 # size has no such mark, but it was not mounted while the one before it was
 # taken out, so a mount with no row for longer than ``_UNMOUNTED_SEC`` (and
-# five of its usual steps) while the recorder ran is where the next filesystem
-# starts.  FS-READONLY-01 asks for the same size to within
-# ``_SAME_SIZE_TOLERANCE`` before it calls a switch to read-only one filesystem.
+# five of its usual steps) while the recorder ran may be where the next
+# filesystem starts.  It is only when the size changed by more than
+# ``_SAME_SIZE_TOLERANCE`` across the gap, or the usage is not where the trend
+# of the rows around it puts it, to within as much of the size: the same stick
+# plugged back in, or a ``df`` that hung for some minutes, goes on.
+# FS-READONLY-01 asks for the same size to within ``_SAME_SIZE_TOLERANCE`` before
+# it calls a switch to read-only one filesystem.
 _SAME_SIZE_TOLERANCE = 0.01
 _FILESYSTEM_DRIFT = 0.10
 _UNMOUNTED_SEC = 300.0
+# The rows on each side of a gap that give the trend of the usage there.
+_TREND_ROWS = 10
 
 
 def _same_size(
@@ -231,6 +237,35 @@ def _same_size(
 
 def _recorder_was_down(window: Window, start: float, end: float) -> bool:
     return any(lo < end and hi > start for lo, hi in window.holes)
+
+
+def _used_per_second(rows: list) -> float:
+    rows = [r for r in rows if r["used"] is not None]
+    if len(rows) < 2 or rows[-1]["ts"] <= rows[0]["ts"]:
+        return 0.0
+    return (rows[-1]["used"] - rows[0]["used"]) / (rows[-1]["ts"] - rows[0]["ts"])
+
+
+def _goes_on_across(rows: list, i: int) -> bool:
+    """Whether the filesystem of ``rows[i - 1]`` is that of ``rows[i]``.
+
+    The sizes agree to within ``_SAME_SIZE_TOLERANCE`` and the usage moved as the
+    rows on either side of the gap say it was moving.
+    """
+    prev, cur = rows[i - 1], rows[i]
+    if not _same_size(prev["total"], cur["total"]):
+        return False
+    if prev["used"] is None or cur["used"] is None:
+        return False
+    rate = (
+        _used_per_second(rows[max(0, i - _TREND_ROWS) : i])
+        + _used_per_second(rows[i : i + _TREND_ROWS])
+    ) / 2
+    expected = rate * (cur["ts"] - prev["ts"])
+    return (
+        abs(cur["used"] - prev["used"] - expected)
+        <= _SAME_SIZE_TOLERANCE * cur["total"]
+    )
 
 
 def _one_filesystem(rows: list, window: Window) -> list:
@@ -246,8 +281,10 @@ def _one_filesystem(rows: list, window: Window) -> list:
         prev, cur = rows[first - 1], rows[first]
         if not _same_size(prev["total"], cur["total"], _FILESYSTEM_DRIFT):
             break
-        if cur["ts"] - prev["ts"] > unmounted and not _recorder_was_down(
-            window, prev["ts"], cur["ts"]
+        if (
+            cur["ts"] - prev["ts"] > unmounted
+            and not _recorder_was_down(window, prev["ts"], cur["ts"])
+            and not _goes_on_across(rows, first)
         ):
             break
         first -= 1
