@@ -483,6 +483,39 @@ class TestWorkerThatStartsNearTheEndOfARecording:
         assert f.evidence["pid"] == 1001
         store.close()
 
+    def test_a_leaker_with_a_hole_in_its_rows_has_stopped_when_it_is_the_usual_step_short(
+        self, tmp_path
+    ):
+        def processes(h):
+            minute = round(h * 60)
+            alive = []
+            if minute <= 469 and not 100 <= minute < 110:
+                alive.append((0, 1000, 100 * _MiB + 20 * _MiB * h, 50, 10))
+            if minute >= 468:
+                alive.append((0, 1001, 100 * _MiB, 50, 10))
+            return alive
+
+        store, _ = _recording(tmp_path, 8, [("svc", "/opt/plc/svc")], processes)
+
+        (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        assert f.evidence["pids"] == [1000, 1001]
+        store.close()
+
+    def test_a_process_seen_once_a_minute_before_the_end_may_still_be_running(self):
+        end = 100_000.0
+
+        def row(proc_id, pid, ts):
+            return {"proc_id": proc_id, "pid": pid, "ts_min": ts, "rss_avg": 1.0}
+
+        instances = proc_instances(
+            [row(1, 1, end - 60), row(1, 2, end - 60), row(1, 2, end)]
+            + [row(2, 9, end - 3600 + 60 * k) for k in range(61)],
+            "rss_avg",
+        )
+
+        assert len([i for i in instances if i.proc_id == 1]) == 2
+
     @pytest.mark.parametrize(
         ("seconds_before_end", "chained"), [(240, False), (330, True)]
     )

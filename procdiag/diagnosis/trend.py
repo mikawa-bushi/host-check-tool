@@ -253,8 +253,9 @@ _MIN_RUN_HOURS = 1.0
 # process of its program continues it: a restart that starts the new process
 # before the old one has exited.
 _RESTART_OVERLAP_SEC = 300.0
-# The rows of ``proc_rollup_1m`` are a minute apart at the closest.
-_MIN_STEP_SEC = 60.0
+# The time between the rows of a process that has only one, and the least that
+# can be between the rows of ``proc_rollup_1m``.
+_DEFAULT_STEP_SEC = 60.0
 
 
 @dataclass
@@ -291,7 +292,7 @@ class ProcInstance:
         """The usual time between the rows of the process running last."""
         points = self.runs[-1][1]
         steps = sorted(b[0] - a[0] for a, b in zip(points, points[1:]))
-        return max(_MIN_STEP_SEC, steps[len(steps) // 2]) if steps else _MIN_STEP_SEC
+        return steps[len(steps) // 2] if steps else _DEFAULT_STEP_SEC
 
     def stopped_before(self, start: float, end: float) -> bool:
         """Whether a process of the program starting at *start* may continue it.

@@ -1535,7 +1535,7 @@ class TestAnotherMediumOfTheSameSize:
             ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
         }
 
-    @pytest.mark.parametrize("gap_minutes", [6, 10, 30, 60])
+    @pytest.mark.parametrize("gap_minutes", [6, 10, 30, 60, 90, 120])
     def test_a_gap_in_the_rows_of_a_mount_that_grows_on_is_no_new_filesystem(
         self, tmp_path, gap_minutes
     ):
@@ -1586,6 +1586,47 @@ class TestAnotherMediumOfTheSameSize:
         assert _pending(diag) == {
             ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
         }
+
+    @pytest.mark.parametrize(("shift", "same"), [(0.5, True), (5, False)])
+    def test_a_gap_with_a_usage_that_jumps_by_a_percent_of_the_size_is_a_new_one(
+        self, tmp_path, shift, same
+    ):
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, shift=shift),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert bool(_found(diag, "DISK-FULL-01")) is same
+        assert bool(_pending(diag)) is not same
+
+    def test_a_gap_between_rows_that_lost_their_usage_is_still_where_a_filesystem_ends(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": "/",
+                    "total": 100 * _GiB,
+                    "used": None if m in (419, 430) else 40 * _GiB,
+                    "inodes_total": 10_000_000,
+                    "inodes_used": 400_000 + 1000 * m,
+                    "read_only": 0,
+                }
+                for m in range(12 * 60 + 1)
+                if not 420 <= m < 430
+            ],
+        )
+
+        diag = _run(store, "DISK-INODE-01")
+
+        assert _found(diag, "DISK-INODE-01") == []
+        assert ("DISK-INODE-01", "/") in _pending(diag)
 
     def test_a_gap_with_a_total_that_drifts_by_less_than_a_percent_is_no_new_one(
         self, tmp_path
@@ -2071,6 +2112,30 @@ class TestGrowthThatGoesOnIsNotOneStep:
         (f,) = _found(diag, "DISK-FULL-01")
         assert f.evidence["days_left"] is not None
         assert "DISK-FULL-01" not in diag.unjudged_parts
+
+    @pytest.mark.parametrize(("copy_hour", "one_step"), [(19, True), (21, False)])
+    def test_a_copy_needs_a_sixth_of_the_recording_after_it_to_be_one_step(
+        self, tmp_path, copy_hour, one_step
+    ):
+        diag = self._used(tmp_path, 24, lambda h: 100 + (20 if h >= copy_hour else 0))
+
+        assert bool(_found(diag, "DISK-FULL-01")) is not one_step
+        assert ("DISK-FULL-01" in diag.unjudged_parts) is one_step
+
+    def test_a_step_that_is_partly_undone_and_then_grows_again_is_a_trend(
+        self, tmp_path
+    ):
+        diag = self._used(
+            tmp_path,
+            24,
+            lambda h: 100
+            + (20 if h >= 3 else 0)
+            - (15 if h >= 4 else 0)
+            + (10 if h >= 12 else 0),
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
 
     def test_an_archive_unpacked_and_then_removed_is_still_one_step(self, tmp_path):
         diag = self._used(

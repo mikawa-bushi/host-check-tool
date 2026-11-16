@@ -1200,6 +1200,31 @@ class TestMemPressureEdgeDaysAreWeighedByTheirObservation:
         store.close()
 
 
+class TestMemPressureLongestDayIsAtMostTwentyFourHours:
+    def test_a_day_of_twenty_five_hours_does_not_shorten_the_days_of_twenty_four(
+        self, tmp_path, local_tz
+    ):
+        local_tz("America/New_York")
+        store = make_db(tmp_path)
+        midnight = time.mktime(datetime(2026, 10, 31).timetuple())
+        minutes = (24 + 25 + 24) * 60
+        pressure = {d * 1440 + 14 * 60 + k: 9.0 for d in (0, 1) for k in range(30)}
+        _pressure_recording(
+            store,
+            midnight,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 3)
+        assert f.evidence["recurrence_fraction"] == 0.67
+        assert f.evidence["full_day_hours"] == 24.0
+        store.close()
+
+
 class TestMemPressureOfAPcThatRunsPartOfEachDay:
     @staticmethod
     def _shifts(tmp_path, *, on_hour, hours_on, first_minute, minutes, pressure_days):
@@ -1375,7 +1400,7 @@ class TestMemPressureShowsTheRatioItUsed:
             line for line in f.proposal.splitlines() if line.startswith("[根拠]")
         )
         assert "圧迫日 2 / 観測日 4" in basis
-        assert "2.75 日分" in basis
+        assert "観測日 4 日は 2.75 日分になり" in basis
         assert "24 時間" in basis
 
     def test_whole_days_are_shown_as_plain_day_counts(self, tmp_path, local_tz):
