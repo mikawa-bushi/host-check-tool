@@ -13,9 +13,13 @@ lines logged while nothing was recording, or before a reboot, are read then.
 Capability-gated: reading the system journal needs root or the
 ``systemd-journal`` / ``adm`` group; without it the sampler records nothing.
 A DB recorded before this version has no cursor and starts after the newest
-message at setup.  A cursor the journal refuses (it is only a string in
-``meta``) does not stop the recording: the sampler reads on from the time of
-its last read, or from the newest message when it has none.
+message at setup.  A read from the saved cursor that fails (a timeout, a busy
+journal) does not move it: the run fails and the next one reads from the same
+place, so the lines logged meanwhile are neither lost nor read twice.  Only a
+cursor journalctl itself rejects, or one that failed on three runs in a row
+while the journal could be read without it, is replaced (the cursor is only a
+string in ``meta``): the sampler reads on from the start of its last read that
+worked, or from the newest message when it has not read yet.
 """
 
 from __future__ import annotations
@@ -29,6 +33,16 @@ from ..core.sampler import Note, RunContext, SampleBatch, Sampler, register_samp
 from ..storage import make_row
 
 CURSOR_KEY = "kernel_log_cursor"
+# The recorder keeps one note per key; the sampler's own collect failures use
+# its name, so this note needs a key of its own.
+CURSOR_NOTE_KEY = "kernel_log:cursor"
+# Failed reads from one cursor, in a row, before it is replaced although
+# journalctl did not call it invalid.  A timeout or a restarting journald lasts
+# a run or two; a cursor that is still unreadable after three runs (15 minutes
+# at the default interval) is not going to be read.  Nothing is lost meanwhile:
+# the replacement reads from the start of the last read that worked.
+_FAILED_READS_BEFORE_REPLACING = 3
+_READ_FAILED = "journalctl でカーネルログを読めませんでした"
 _CURSOR_REFUSED_NOTE = (
     "kernel_log: ジャーナルが読み取り位置を受け付けなかったため、"
     "前回の読み取り時刻から読み直しました"
@@ -68,6 +82,8 @@ class KernelLogSampler(Sampler):
         self._cursor = cursor
         # When the last read that worked began; None before the first one.
         self._read_at: Optional[float] = None
+        # Reads from the cursor that failed in a row; 0 once one works.
+        self._failed_reads = 0
 
     def setup(self, ctx: RunContext) -> None:
         """Enable only when the kernel journal is readable."""
@@ -87,12 +103,8 @@ class KernelLogSampler(Sampler):
         if not self._enabled:
             return []
         started = time.time()
-        events, cursor = kernlog.read_events(after_cursor=self._cursor)
-        if events is None and self._cursor:
-            events, cursor = self._read_without_cursor(ctx)
-        if events is None:
-            raise OSError("journalctl でカーネルログを読めませんでした")
-        self._cursor, self._read_at = cursor, started
+        events, cursor = self._read(ctx)
+        self._cursor, self._read_at = cursor or self._cursor, started
         position = make_row("meta", key=CURSOR_KEY, value=self._cursor)
         batches = [SampleBatch(table="meta", rows=[position])]
         if events:
@@ -103,26 +115,46 @@ class KernelLogSampler(Sampler):
             batches.append(SampleBatch(table="kernel_events", rows=rows))
         return batches
 
-    def _read_without_cursor(
+    def _read(self, ctx: RunContext) -> tuple[list[kernlog.KernelEvent], Optional[str]]:
+        """What was logged since the cursor, and the cursor to go on from.
+
+        Raises when the journal cannot be read; the cursor then stays where it
+        is, except when it is replaced (see :meth:`_read_past_cursor`).
+        """
+        try:
+            events, cursor = kernlog.read_events(after_cursor=self._cursor)
+        except kernlog.CursorRejected:
+            return self._read_past_cursor(ctx)
+        if events is not None:
+            self._failed_reads = 0
+            return events, cursor
+        self._failed_reads += 1
+        if self._failed_reads < _FAILED_READS_BEFORE_REPLACING:
+            raise OSError(_READ_FAILED)
+        return self._read_past_cursor(ctx)
+
+    def _read_past_cursor(
         self, ctx: RunContext
-    ) -> tuple[Optional[list[kernlog.KernelEvent]], Optional[str]]:
-        """Read on when the journal refuses the cursor: ``(events, cursor)``,
-        ``(None, None)`` when the journal cannot be read at all.
+    ) -> tuple[list[kernlog.KernelEvent], Optional[str]]:
+        """Read on without the cursor the journal will not read from.
 
         From the start of the last read that worked, so nothing in between is
-        lost.  With no such read (a cursor stored by an earlier recording) the
-        position moves to the newest message and this run fails: the next one
-        reads from there, and a journal that fails for another reason keeps
-        failing instead of being skipped over.
+        lost.  The cursor of the last line read replaces it; a read of no lines
+        has none, and the old cursor then stays (it still marks the last line
+        recorded, and no cursor would mean the next read starts at the whole
+        journal).  With no read that worked (a cursor stored by an earlier
+        recording) the position moves to the newest message and this run fails:
+        the next one reads from there, and a journal that fails for another
+        reason keeps failing instead of being skipped over.
         """
-        if self._read_at is not None:
-            events, cursor = kernlog.read_events(since=self._read_at)
-            if events is None:
-                return None, None
-            ctx.notes.append(Note("kernel_log", _CURSOR_REFUSED_NOTE))
-            return events, cursor
-        newest = kernlog.newest_cursor()
-        if newest is None:
-            return None, None
-        self._cursor = newest
-        raise OSError(_CURSOR_RESET_ERROR)
+        if self._read_at is None:
+            newest = kernlog.newest_cursor()
+            if newest is None:
+                raise OSError(_READ_FAILED)
+            self._cursor = newest
+            raise OSError(_CURSOR_RESET_ERROR)
+        events, cursor = kernlog.read_events(since=self._read_at)
+        if events is None:
+            raise OSError(_READ_FAILED)
+        ctx.notes.append(Note(CURSOR_NOTE_KEY, _CURSOR_REFUSED_NOTE))
+        return events, cursor
