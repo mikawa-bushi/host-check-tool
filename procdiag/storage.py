@@ -46,7 +46,7 @@ from .core.util import MiB, parse_duration, storable_text
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _Migration = Union[str, Callable[[sqlite3.Connection], None]]
 
@@ -113,10 +113,11 @@ _MIGRATIONS: Dict[int, List[_Migration]] = {
     # are.  The version still rises, because an older procdiag would neither
     # read the new table nor roll up into it.
     5: [f"CREATE TABLE IF NOT EXISTS proc_pid_rollup_1m {_PROC_PID_ROLLUP_1M}"],
-    # Only a new column, which SQLite adds without rewriting the table.  The
-    # version still rises, because an older procdiag would record rows
+    # Only a new column each, which SQLite adds without rewriting the table.
+    # The version still rises, because an older procdiag would record rows
     # without it.
     6: [_add_column("disk_samples", "avail", "INTEGER")],
+    7: [_add_column("disk_samples", "fs_uuid", "TEXT")],
 }
 
 
@@ -237,10 +238,12 @@ CREATE TABLE IF NOT EXISTS proc_samples (
 -- Tier3: ディスクサンプル
 -- avail は root 以外が書き込める空き (df の Avail)。used + avail は、ext4 などが
 -- root 用に予約した分だけ total より小さい
+-- fs_uuid はマウント元のデバイスのファイルシステムの UUID (/dev/disk/by-uuid)。
+-- 分からないときは NULL
 CREATE TABLE IF NOT EXISTS disk_samples (
   ts REAL, mountpoint TEXT, total INTEGER, used INTEGER,
   inodes_total INTEGER, inodes_used INTEGER, read_only INTEGER,
-  avail INTEGER,
+  avail INTEGER, fs_uuid TEXT,
   PRIMARY KEY (ts, mountpoint)
 );
 CREATE TABLE IF NOT EXISTS dir_samples (
@@ -371,6 +374,7 @@ TABLE_COLUMNS: Dict[str, List[str]] = {
         "inodes_used",
         "read_only",
         "avail",
+        "fs_uuid",
     ],
     "dir_samples": [
         "ts",
