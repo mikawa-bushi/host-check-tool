@@ -513,6 +513,9 @@ def _expiry_cutoffs(raw: str, rollup: Optional[str]) -> Tuple[float, Optional[fl
 
 # Headroom on the guard's post-VACUUM size estimate (see _size_after_vacuum).
 _VACUUM_ESTIMATE_MARGIN = 1.05
+# How far the pages in use can sit above what a VACUUM leaves (measured: 5% to
+# 33%): the least a VACUUM can leave when SQLite cannot report dbstat.
+_IN_USE_MAX_OVERSTATEMENT = 1.33
 
 # Share of the file the guard keeps reusable when it cannot VACUUM, so that
 # recording fills freed pages instead of extending the file.
@@ -962,11 +965,23 @@ class Storage:
         empty, so the file keeps its size until a VACUUM and the pages in use
         overstate the result (measured: 5% to 33% too high).  The bytes the
         b-trees actually use (``dbstat``), each b-tree rounded up to whole
-        pages as the VACUUM writes it, land within 3% below the real result
-        (measured on DBs of 1 to 14 MB) and cost a read of the file, with no
-        extra disk space and no rewrite.  The estimate carries a margin of 5%
-        for the rest and falls back to the pages in use when SQLite lacks
-        ``dbstat``.
+        pages as the VACUUM writes it, land 0.4% to 3% below the result on
+        DBs of 1 to 14 MB and cost a read of the file, with no extra disk
+        space and no rewrite.  The estimate adds a margin of 5% to that, which
+        puts it 2% to 5% above the result there, and falls back to the pages in
+        use when SQLite lacks ``dbstat``.  It is not a bound: on tables whose
+        rows nearly fill a page, or whose deletions are scattered, a VACUUM
+        leaves up to 1.5 times what it says (measured: 64% to 104% of the
+        result across such tables).
+        """
+        return self._vacuum_size_bounds()[1]
+
+    def _vacuum_size_bounds(self) -> Tuple[int, int]:
+        """``(least, likely)``: the least a VACUUM can leave, and the estimate.
+
+        *least* is the b-trees' bytes rounded up to pages, without the margin
+        (the pages in use over their largest overstatement when ``dbstat`` is
+        missing); a VACUUM left at least that much in every measurement.
         """
         page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
         free_pages = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
@@ -977,9 +992,9 @@ class Storage:
                 "SELECT SUM(pgsize - unused) FROM dbstat GROUP BY name"
             ).fetchall()
         except sqlite3.Error:
-            return in_use
+            return int(in_use / _IN_USE_MAX_OVERSTATEMENT), in_use
         used = sum(-(-(used or 0) // page_size) * page_size for (used,) in per_tree)
-        return min(in_use, int(used * _VACUUM_ESTIMATE_MARGIN))
+        return min(in_use, used), min(in_use, int(used * _VACUUM_ESTIMATE_MARGIN))
 
     def _truncate_wal(self, *, wait: bool = True) -> Optional[str]:
         """Checkpoint and truncate the ``-wal``; None when done, else why not.
@@ -1076,6 +1091,13 @@ class Storage:
         as leave ``_GUARD_HOLD_SLACK`` of the file reusable, enough that
         recording stops extending the file.
 
+        A free-space floor the last rung cannot meet is given up, since cutting
+        would lose the history for nothing, and only the size cap cuts.  That
+        is judged by the least a VACUUM can leave, not by the estimate, which
+        runs above the result: where the estimate says the floor is out of
+        reach but its error leaves room, the guard cuts to the last rung and the
+        VACUUM shows whether the floor is met.
+
         Parameters
         ----------
         max_bytes:
@@ -1131,11 +1153,14 @@ class Storage:
         def goal(size: int) -> bool:
             return fits(size) and (can_vacuum(size) or not low_disk)
 
-        def floor_out_of_reach(size: int) -> bool:
-            """Would the free space still fall short of the floor at *size*?"""
+        def floor_out_of_reach() -> bool:
+            """Would the free space fall short of the floor even if a VACUUM
+            left the least it can?  The estimate runs above the real size, so
+            a floor it misses may still be met."""
             if min_free_bytes is None:
                 return False
-            return free_bytes() + self._disk_bytes() - size < min_free_bytes
+            least = self._vacuum_size_bounds()[0]
+            return free_bytes() + self._disk_bytes() - least < min_free_bytes
 
         file_bytes = self.path.stat().st_size
         unreachable = False
@@ -1158,10 +1183,13 @@ class Storage:
                     keep = next(
                         (i for i, size in enumerate(sizes) if size <= target), keep
                     )
-                elif floor_out_of_reach(sizes[-1]):
-                    # The bottom rung does not return enough: cutting would
-                    # lose the history without ever reaching the floor, so only
-                    # the size cap decides how far to cut.
+                elif floor_out_of_reach():
+                    # Not even the least a VACUUM can leave at the bottom rung
+                    # returns enough: cutting would lose the history without
+                    # ever reaching the floor, so only the size cap decides how
+                    # far to cut.  When the estimate misses the floor but its
+                    # error leaves room, every rung stays and the VACUUM that
+                    # follows settles it.
                     unreachable = True
                     keep = next(
                         (
