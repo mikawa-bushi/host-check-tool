@@ -1415,14 +1415,19 @@ class TestDirectoryGrowthNeedsTwelveHours:
         assert "問題は見つかりませんでした" not in out
 
 
-def _steady(start, hours, *, mountpoint="/media/usb", total=100, from_h=0.0, gb_h=2):
-    """Rows each minute from *from_h* to *hours* of a mount growing *gb_h* an hour."""
+def _steady(
+    start, hours, *, mountpoint="/media/usb", total=100, from_h=0.0, gb_h=2, shift=0
+):
+    """Rows each minute from *from_h* to *hours* of a mount growing *gb_h* an hour.
+
+    *shift* GiB is added to the usage, as a stick with other contents has.
+    """
     return [
         {
             "ts": start + m * 60,
             "mountpoint": mountpoint,
             "total": total * _GiB,
-            "used": int((20 + gb_h * m / 60) * _GiB),
+            "used": int((20 + shift + gb_h * m / 60) * _GiB),
             "read_only": 0,
         }
         for m in range(int(from_h * 60), int(hours * 60) + 1)
@@ -1494,7 +1499,10 @@ class TestAnotherMediumOfTheSameSize:
 
     def test_a_mount_missing_while_the_recorder_ran_ends_the_filesystem(self, tmp_path):
         store, start = _recording(tmp_path, 14)
-        _disk(store, _steady(start, 8.0) + _steady(start, 14, from_h=11.0))
+        _disk(
+            store,
+            _steady(start, 8.0) + _steady(start, 14, from_h=11.0, shift=30),
+        )
 
         diag = _run(store, "DISK-FULL-01")
 
@@ -1511,9 +1519,14 @@ class TestAnotherMediumOfTheSameSize:
 
         assert f.evidence["days_left"] is not None
 
-    def test_a_mount_missing_for_six_minutes_is_a_new_filesystem(self, tmp_path):
+    def test_a_mount_missing_for_six_minutes_with_other_contents_is_a_new_filesystem(
+        self, tmp_path
+    ):
         store, start = _recording(tmp_path, 12)
-        _disk(store, _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60))
+        _disk(
+            store,
+            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, shift=30),
+        )
 
         diag = _run(store, "DISK-FULL-01")
 
@@ -1521,6 +1534,71 @@ class TestAnotherMediumOfTheSameSize:
         assert _pending(diag) == {
             ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
         }
+
+    @pytest.mark.parametrize("gap_minutes", [6, 10, 30, 60])
+    def test_a_gap_in_the_rows_of_a_mount_that_grows_on_is_no_new_filesystem(
+        self, tmp_path, gap_minutes
+    ):
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            _steady(start, 10.0, total=200)
+            + _steady(start, 12, total=200, from_h=10.0 + gap_minutes / 60),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] == pytest.approx(3.4, abs=0.4)
+        assert diag.skipped_rules == []
+
+    def test_three_gaps_of_six_minutes_in_twelve_hours_still_give_a_forecast(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        rows = [
+            row
+            for row in _steady(start, 12, total=200)
+            if not any(
+                g * _HOUR <= row["ts"] - start < (g + 0.1) * _HOUR for g in (2, 5, 8)
+            )
+        ]
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+        assert diag.skipped_rules == []
+
+    def test_a_gap_with_a_total_that_changes_by_more_than_a_percent_is_a_new_filesystem(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            _steady(start, 7.0) + _steady(start, 12, from_h=7.0 + 6 / 60, total=97),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert _pending(diag) == {
+            ("DISK-FULL-01", "/media/usb"): pytest.approx(1.1, abs=0.05)
+        }
+
+    def test_a_gap_with_a_total_that_drifts_by_less_than_a_percent_is_no_new_one(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        rows = _steady(start, 7.0, total=500) + _steady(
+            start, 12, from_h=7.0 + 6 / 60, total=498
+        )
+        _disk(store, rows)
+
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+
+        assert f.evidence["days_left"] is not None
 
     def test_a_sparse_mount_is_judged_by_its_own_steps(self, tmp_path):
         store, start = _recording(tmp_path, 24)
@@ -1633,6 +1711,124 @@ class TestOneFilesystemUnderSeveralMountPoints:
         ]
 
 
+class TestBindMountsThatDifferInWhatTheyShow:
+    @staticmethod
+    def _mounts(tmp_path, *mounts, hours=3, inodes_used=700_000):
+        """*mounts* are ``(path, read_only, used GiB, avail GiB)`` of a 100 GiB disk."""
+        store, start = _recording(tmp_path, hours)
+        rows = []
+        for m in range(hours * 60 + 1):
+            for path, read_only, used, avail in mounts:
+                rows.append(
+                    {
+                        "ts": start + m * 60,
+                        "mountpoint": path,
+                        "total": 100 * _GiB,
+                        "used": int(used * _GiB),
+                        "avail": int(avail * _GiB),
+                        "inodes_total": 1_000_000,
+                        "inodes_used": inodes_used,
+                        "read_only": read_only,
+                    }
+                )
+        _disk(store, rows)
+        return _run(store, "DISK-FULL-01", "DISK-INODE-01")
+
+    def test_a_full_disk_is_reported_when_a_read_only_bind_mount_has_the_shorter_path(
+        self, tmp_path
+    ):
+        diag = self._mounts(tmp_path, ("/mnt/data", 0, 97, 3), ("/mnt/a", 1, 97, 3))
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.severity is Severity.CRITICAL
+        assert f.subject == "/mnt/data"
+        assert f.evidence["also_mounted_at"] == ["/mnt/a"]
+        assert "97.0%" in f.summary
+
+    def test_a_full_disk_is_reported_when_a_read_only_bind_mount_has_the_longer_path(
+        self, tmp_path
+    ):
+        diag = self._mounts(
+            tmp_path, ("/mnt/data", 0, 97, 3), ("/mnt/data-ro", 1, 97, 3)
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.subject == "/mnt/data"
+        assert f.evidence["also_mounted_at"] == ["/mnt/data-ro"]
+
+    def test_the_check_exits_with_the_finding_not_with_no_problem(self, tmp_path):
+        store, start = _recording(tmp_path, 3)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": path,
+                    "total": 100 * _GiB,
+                    "used": 97 * _GiB,
+                    "avail": 3 * _GiB,
+                    "read_only": read_only,
+                }
+                for m in range(181)
+                for path, read_only in (("/mnt/data", 0), ("/mnt/a", 1))
+            ],
+        )
+        store.close()
+
+        out = _check(store.path, code=1)
+
+        assert "/mnt/data" in out and "97.0%" in out
+
+    def test_a_read_only_filesystem_that_is_full_is_not_a_full_disk(self, tmp_path):
+        diag = self._mounts(tmp_path, ("/mnt/a", 1, 97, 3), ("/mnt/b", 1, 97, 3))
+
+        assert _found(diag, "DISK-FULL-01") == []
+
+    def test_one_inode_finding_for_a_filesystem_whose_shorter_mount_is_read_only(
+        self, tmp_path
+    ):
+        diag = self._mounts(
+            tmp_path,
+            ("/mnt/data", 0, 40, 60),
+            ("/mnt/a", 1, 40, 60),
+            inodes_used=960_000,
+        )
+
+        (f,) = _found(diag, "DISK-INODE-01")
+        assert f.subject == "/mnt/data"
+        assert f.evidence["also_mounted_at"] == ["/mnt/a"]
+
+    def test_the_same_size_and_usage_with_other_reserved_space_is_another_filesystem(
+        self, tmp_path
+    ):
+        diag = self._mounts(tmp_path, ("/data1", 0, 96, 4), ("/data2", 0, 96, 0))
+
+        found = {f.subject: f for f in _found(diag, "DISK-FULL-01")}
+        assert sorted(found) == ["/data1", "/data2"]
+        assert found["/data2"].evidence["used_pct"] == 100.0
+        assert found["/data1"].evidence["also_mounted_at"] == []
+
+    def test_the_other_reserve_decides_whichever_path_is_the_shorter(self, tmp_path):
+        diag = self._mounts(tmp_path, ("/d1", 0, 96, 0), ("/data2", 0, 96, 4))
+
+        assert sorted(f.subject for f in _found(diag, "DISK-FULL-01")) == [
+            "/d1",
+            "/data2",
+        ]
+
+    def test_free_space_that_differs_by_a_write_between_two_reads_is_the_same(
+        self, tmp_path
+    ):
+        diag = self._mounts(
+            tmp_path,
+            ("/data", 0, 97, 3),
+            ("/srv/data", 0, 97 + 3 / 1024, 3 - 3 / 1024),
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["also_mounted_at"] == ["/srv/data"]
+
+
 class TestAGrowthThatIsOneStep:
     @staticmethod
     def _copy(tmp_path, hours, copies):
@@ -1667,6 +1863,7 @@ class TestAGrowthThatIsOneStep:
         assert diag.fully_evaluated is False
         (note,) = diag.unjudged_parts["DISK-FULL-01"]
         assert "一度の大きな増加" in note and "/" in note
+        assert "コピー" not in note and "展開" not in note
 
     def test_check_text_does_not_call_it_a_plain_no_problem(self, tmp_path):
         store, start = _recording(tmp_path, 6.5)
@@ -1791,6 +1988,125 @@ class TestAGrowthThatIsOneStep:
         assert _found(diag, "DISK-INODE-01") == []
         (note,) = diag.unjudged_parts["DISK-INODE-01"]
         assert "inode" in note
+
+
+class TestGrowthThatGoesOnIsNotOneStep:
+    @staticmethod
+    def _used(tmp_path, hours, used_gib, *, total_gib=200):
+        """A *total_gib* disk whose usage is ``used_gib(hour)``, sampled each minute."""
+        store, start = _recording(tmp_path, hours)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": "/data",
+                    "total": total_gib * _GiB,
+                    "used": int(used_gib(m / 60) * _GiB),
+                    "read_only": 0,
+                }
+                for m in range(int(hours * 60) + 1)
+            ],
+        )
+        return _run(store, "DISK-FULL-01")
+
+    @pytest.mark.parametrize("last_hours", [1, 2, 3, 4])
+    def test_a_disk_that_started_filling_fast_in_the_last_hours_is_forecast(
+        self, tmp_path, last_hours
+    ):
+        diag = self._used(
+            tmp_path,
+            24,
+            lambda h: 100 + 10 * max(0.0, h - (24 - last_hours)),
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+        assert f.evidence["days_left"] < 30
+        assert "DISK-FULL-01" not in diag.unjudged_parts
+
+    def test_the_runaway_of_the_last_four_hours_is_critical_with_its_days_left(
+        self, tmp_path
+    ):
+        diag = self._used(tmp_path, 24, lambda h: 100 + 10 * max(0.0, h - 20))
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.severity is Severity.CRITICAL
+        assert f.evidence["days_left"] == pytest.approx(3.4, abs=0.3)
+
+    def test_growth_that_goes_on_after_a_large_step_is_a_trend(self, tmp_path):
+        diag = self._used(
+            tmp_path,
+            6.5,
+            lambda h: 40 + (20 if h >= 3 else 0) + 4 * max(0.0, h - 3),
+            total_gib=100,
+        )
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+        assert "DISK-FULL-01" not in diag.unjudged_parts
+
+    def test_a_step_that_was_followed_by_a_rise_of_a_tenth_is_still_one_step(
+        self, tmp_path
+    ):
+        diag = self._used(
+            tmp_path,
+            6.5,
+            lambda h: 40 + (20 if h >= 3 else 0) + 0.4 * max(0.0, h - 3),
+            total_gib=100,
+        )
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert "DISK-FULL-01" in diag.unjudged_parts
+
+    @pytest.mark.parametrize("offset", [0, 6, 12, 18])
+    def test_a_log_rotation_sawtooth_keeps_its_forecast(self, tmp_path, offset):
+        def used(hour):
+            t = hour + offset
+            day = int(t // 24)
+            return 60 + day * 2 + (t % 24) / 24 * 10
+
+        diag = self._used(tmp_path, 72, used, total_gib=100)
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+        assert "DISK-FULL-01" not in diag.unjudged_parts
+
+    def test_a_copy_well_before_the_end_of_a_day_is_still_one_step(self, tmp_path):
+        diag = self._used(
+            tmp_path,
+            24,
+            lambda h: 100 + (40 if h >= 8 else 0),
+        )
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert "DISK-FULL-01" in diag.unjudged_parts
+
+    def test_inodes_that_keep_being_used_up_to_the_last_samples_are_forecast(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 24)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": "/",
+                    "total": 200 * _GiB,
+                    "used": 40 * _GiB,
+                    "inodes_total": 1_000_000,
+                    "inodes_used": 500_000 + int(60_000 * max(0.0, m / 60 - 20)),
+                    "read_only": 0,
+                }
+                for m in range(24 * 60 + 1)
+            ],
+        )
+
+        diag = _run(store, "DISK-INODE-01")
+
+        (f,) = _found(diag, "DISK-INODE-01")
+        assert f.evidence["days_left"] is not None
+        assert "DISK-INODE-01" not in diag.unjudged_parts
 
 
 class TestRowsWithoutUsedBytes:

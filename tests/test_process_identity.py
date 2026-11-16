@@ -28,7 +28,7 @@ from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Confidence, Finding, Measurement, Observation, Severity
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.memory import select_pss_targets
-from procdiag.diagnosis.trend import worst_process_per_program
+from procdiag.diagnosis.trend import proc_instances, worst_process_per_program
 from procdiag.storage import Storage, make_row
 
 _MiB = 1024**2
@@ -405,6 +405,107 @@ class TestLeakingProgramRestarted:
         assert "25 プロセス" in detected
         assert len(detected) < 300
         store.close()
+
+
+class TestWorkerThatStartsNearTheEndOfARecording:
+    @staticmethod
+    def _pool(tmp_path, minutes_before_end):
+        """A leaking worker through 8 h; a flat one of its program starts late."""
+
+        def processes(h):
+            alive = [
+                (0, 1000, 1500 * _MiB + 20 * _MiB * h, 50 + int(100 * h), 8 + int(h))
+            ]
+            if minutes_before_end and h >= 8 - minutes_before_end / 60:
+                alive.append((0, 1001, 100 * _MiB, 50, 8))
+            return alive
+
+        return _recording(tmp_path, 8, [("svc", "/opt/plc/svc")], processes)
+
+    @pytest.mark.parametrize("minutes_before_end", [1, 3, 4, 5, 10])
+    def test_the_leak_stays_with_the_worker_that_leaks(
+        self, tmp_path, minutes_before_end
+    ):
+        store, _ = self._pool(tmp_path, minutes_before_end)
+
+        found = {f.rule_id: f for f in _findings(store, _LEAK_RULES)}
+
+        assert sorted(found) == sorted(_LEAK_RULES)
+        for f in found.values():
+            assert f.evidence["pid"] == 1000
+            assert f.evidence["pids"] == [1000]
+            assert "PID 1000" in f.summary
+            assert "PID 1001" not in f.summary
+            assert "記録中に再起動されても" not in f.proposal
+        store.close()
+
+    @pytest.mark.parametrize("minutes_before_end", [1, 3, 4, 10])
+    def test_the_numbers_are_those_of_the_leaking_worker_alone(
+        self, tmp_path, minutes_before_end
+    ):
+        store, _ = self._pool(tmp_path, minutes_before_end)
+        with_newcomer = {f.rule_id: f for f in _findings(store, _LEAK_RULES)}
+        store.close()
+        store, _ = self._pool(tmp_path / "alone", 0)
+        alone = {f.rule_id: f for f in _findings(store, _LEAK_RULES)}
+        store.close()
+
+        for rule, f in with_newcomer.items():
+            for key in (
+                "current_fds",
+                "current_threads",
+                "days_to_soft_limit",
+                "days_to_hard_limit",
+                "days_to_oom",
+                "slope_fd_per_h",
+                "slope_thread_per_h",
+                "slope_mb_per_h",
+            ):
+                assert f.evidence.get(key) == alone[rule].evidence.get(key), (rule, key)
+
+    def test_a_replacement_that_starts_just_before_the_leaker_stops_is_a_restart(
+        self, tmp_path
+    ):
+        def processes(h):
+            minute = round(h * 60)
+            alive = []
+            if minute <= 477:
+                alive.append((0, 1000, 100 * _MiB + 20 * _MiB * h, 50, 10))
+            if minute >= 476:
+                alive.append((0, 1001, 100 * _MiB, 50, 10))
+            return alive
+
+        store, _ = _recording(tmp_path, 8, [("svc", "/opt/plc/svc")], processes)
+
+        (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        assert f.evidence["pids"] == [1000, 1001]
+        assert f.evidence["pid"] == 1001
+        store.close()
+
+    @pytest.mark.parametrize(
+        ("seconds_before_end", "chained"), [(240, False), (330, True)]
+    )
+    def test_a_sparsely_sampled_worker_is_running_until_a_step_before_the_end(
+        self, seconds_before_end, chained
+    ):
+        step = 300.0
+        end = 100_000.0
+
+        def rows(proc_id, pid, first, last, every):
+            ts = first
+            while ts <= last:
+                yield {"proc_id": proc_id, "pid": pid, "ts_min": ts, "rss_avg": 1.0}
+                ts += every
+
+        instances = proc_instances(
+            list(rows(1, 1000, end - 6 * 3600, end - seconds_before_end, step))
+            + list(rows(1, 1001, end - 180, end, step))
+            + list(rows(2, 2000, end - 6 * 3600, end, 60.0)),
+            "rss_avg",
+        )
+
+        assert (len([i for i in instances if i.proc_id == 1]) == 1) is chained
 
 
 class TestFindingsNameTheProcess:

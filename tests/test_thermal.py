@@ -6,10 +6,12 @@ import time
 from collections import namedtuple
 
 import pytest
+from click.testing import CliRunner
 from synth import add_sys_baseline, make_db
 
 import procdiag.samplers.thermal as thmod
 import procdiag.snapshot as snap
+from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig
 from procdiag.core import Severity, Window
 from procdiag.diagnosis import Engine
@@ -274,6 +276,14 @@ class TestThermalRunLength:
 
         assert "25 秒以上 (2 回以上) 続いた期間" in f.proposal
         assert "記録が途切れた前後は続いたと数えない" in f.proposal
+
+
+class TestExplainThermal:
+    def test_the_explanation_reads_as_a_sentence(self):
+        out = CliRunner().invoke(cli, ["explain", "THERMAL-01"]).output
+
+        assert "状態が 25 秒以上続いた期間を検出する" in out
+        assert "状態が25" not in out
 
 
 class TestThermalRule:
