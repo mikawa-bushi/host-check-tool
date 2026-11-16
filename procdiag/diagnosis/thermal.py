@@ -58,7 +58,7 @@ class ThermalThrottleRule(Rule):
     requires_rows = ("thermal_samples",)
     requires_observed = (Capability.THERMAL,)
     what = (
-        "高温 (80°C 以上) で CPU クロックが最大値の 85% 未満の状態が"
+        "高温 (80°C 以上) で CPU クロックが最大値の 85% 未満の状態が "
         "25 秒以上続いた期間を検出する (記録が途切れた前後は続いたと数えない)"
     )
     why = "PSI(需要)では区別できない物理的な熱制限を、温度×クロック比で識別するため"
