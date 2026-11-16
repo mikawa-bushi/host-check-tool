@@ -74,7 +74,7 @@ procdiag bundle
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 (`-o report.html` / `-o report.json` でファイルに) |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag status` | 記録期間・サンプル数・自己負荷を表示 (生サンプルが期限切れで 1 分集計だけ残った DB も期間を示す。サイズは `-wal` を含む) |
-| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
+| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) と、設定が書かれたとおり使われるか (自動減速の `throttle_factor`) を診断 |
 | `procdiag explain [RULE\|sampler]` | ルールまたはサンプラーの詳細を表示 (引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示) |
 | `procdiag export` | 記録データを CSV または JSON でエクスポート |
 | `procdiag prune` | 保持ポリシーの手動実行 (記録中にも実行できる) |
@@ -103,8 +103,12 @@ DB の場所 (`db_path`) と保持期間などを設定ファイルから解決�
 `check` は使った DB を観測品質の備考にも書くので、保存したレポートや JSON からも分かる。
 設定の DB を開かない `snapshot` / `quick` と、DB を 2 つ指定した `compare`、`--db` を指定したときは、警告しない。
 `--db` の相対パスはカレントフォルダからの位置、空の値 (`--db ""` / `--config ""`) はエラーになる。
-`status` / `check` / `export` / `bundle` など読むだけのコマンドは、DB のそばに `-wal` / `-shm` を残さない
-(記録が動いている間は、記録がそれらを使うので DB のそばにある)。
+`status` / `check` / `export` / `bundle` など読むだけのコマンドは、読む前に DB のそばに `-wal` / `-shm` が無かったときだけ、
+読み終えるときに SQLite に消させる。読む前からあるもの (記録が使っているもの) は消さない。
+次の場合は、空の `-wal` と `-shm` が残ることがある (データは入っていない)。読むコマンドが 2 つ重なって動き、
+先に始めた側が先に終わったとき。
+また、DB をシンボリックリンクの綴りで指定すると、本物の DB のそばの `-wal` を読む前の確認で見つけられず、
+記録が異常終了して残した `-wal` を、読み手が回復して消すことがある (回復した内容は DB に残る)。
 
 `--config` を省くと、カレントフォルダの `config.py` を読む。ただし、他のユーザーが書き換えられるファイル
 (自分と root 以外の所有、誰でも書き込める、誰でも書き込めるフォルダにあって sticky ビットが無い) は実行せず、
@@ -195,7 +199,7 @@ procdiag compare before.db after.db --format json --output compare.json
 
 どのコマンドも、Ctrl-C で中断したときは `130` で終わる (click の `Aborted!` と `1` ではない。`1` は異常検出と読まれるため)。
 `record` と `quick` の記録中の Ctrl-C は、これまでどおり安全に止めて終わる。
-引数なしの `procdiag` はヘルプを出して `0` で終わる (click の版によらない)。
+引数なしの `procdiag` と `procdiag service` はヘルプを出して `0` で終わる (click の版によらない)。
 
 `procdiag quick` も同じ番号を返す。診断のほか、最初の snapshot に warning / critical があるときも `1` になる。
 `--duration` が不正なとき、`--out` が空でないディレクトリのとき、出力先を使えないとき、レポートを書けなかったときは `4`。レポートを書けなかったときは、診断の結果より `4` を優先する。
@@ -298,7 +302,9 @@ rules=RulesConfig(
 ),
 ```
 
-`tol_sec` / `max_findings` / `top_n` / `max_samples` のように 0 以下では意味がない項目に 0 以下を書いたときも、起動時にエラーになる。
+`max_findings` (OOM-KILL-01) / `top_n` (IO-BOTTLENECK-01) / `max_samples` (KERNEL-ERROR-01) のように、0 以下では所見や根拠が消える項目に
+0 以下を書いても、起動時にはエラーにしない (0.6 までの設定で記録が止まらないように)。その項目だけ既定値で評価し、
+同じルールの他の上書きは使う。`check` は何を使わなかったかを観測品質の備考に出す。
 `rules.disabled` も同じで、存在しないルール ID を書くと起動時にエラーになる。
 `check` / `compare` の `--only` / `--skip` では、ルール ID を `procdiag explain` の一覧どおり
 大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に
