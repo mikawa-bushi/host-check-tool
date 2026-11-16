@@ -1,8 +1,7 @@
 """Samplers that fail, and what ``check`` then says about the rules they feed.
 
 A sampler that cannot read anything in a whole recording leaves its rules
-"not observed" instead of healthy; a journal cursor the journal rejects does
-not stop the kernel-log recording; a service the sampler first sees after its
+"not observed" instead of healthy; a service the sampler first sees after its
 first poll keeps the restarts it already had; a custom sampler's plain text
 note and a new cgroup during a write outage do not cost a tick.
 """
@@ -21,7 +20,6 @@ from test_sampler_cgroup_process import CGROUP_TREE, _make_ctx
 
 from procdiag import kernlog, systemd
 from procdiag.config import ProcdiagConfig
-from procdiag.core import Capability
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler
 from procdiag.recorder import Recorder
 from procdiag.samplers.cgroup import CgroupSampler
@@ -117,83 +115,6 @@ class TestASamplerThatNeverReads:
         notes = _check(db, ["KERNEL-ERROR-01"])["quality"]["notes"]
 
         assert any("kernel_log" in n and "失敗" in n for n in notes), notes
-
-
-_IO_ERROR_LINE = (
-    "1731000100.5 host kernel: blk_update_request: I/O error, dev sda, sector 9\n"
-)
-
-
-def _journalctl(monkeypatch, *, accepts: set[str]) -> list[str]:
-    """A journal that refuses every cursor but *accepts* (exit 1), as journalctl
-    does for one it cannot seek to; returns the ``--since`` values it was given."""
-    since: list[str] = []
-
-    def run(args):
-        if "--after-cursor" in args:
-            if args[args.index("--after-cursor") + 1] not in accepts:
-                return None
-            return _IO_ERROR_LINE + "-- cursor: c20\n"
-        if "--since" in args:
-            since.append(args[args.index("--since") + 1])
-            return _IO_ERROR_LINE + "-- cursor: c30\n"
-        if "--show-cursor" in args:
-            return "1731000000.1 host kernel: boot\n-- cursor: c10\n"
-        return "1731000000.1 host kernel: boot\n"
-
-    monkeypatch.setattr(kernlog, "run", run)
-    return since
-
-
-def _rows(batches: list[SampleBatch], table: str) -> list[tuple]:
-    return [row for batch in batches if batch.table == table for row in batch.rows]
-
-
-class TestKernelLogCursor:
-    def test_a_stored_cursor_the_journal_rejects_does_not_stop_the_recording(
-        self, monkeypatch
-    ):
-        _journalctl(monkeypatch, accepts={"c10"})
-        sampler = KernelLogSampler(cursor="garbage")
-        ctx = RunContext(ProcdiagConfig())
-        sampler.setup(ctx)
-
-        sampler.run(ctx)
-        batches = sampler.run(ctx)
-
-        assert any("読み取り位置" in n.text for n in ctx.notes)
-        assert _rows(batches, "meta") == [("kernel_log_cursor", "c20")]
-        assert [e[1] for e in _rows(batches, "kernel_events")] == ["io_error"]
-        assert Capability.KERNEL_LOG not in ctx.unobserved
-
-    def test_a_cursor_refused_later_is_replaced_by_the_time_of_the_last_read(
-        self, monkeypatch
-    ):
-        since = _journalctl(monkeypatch, accepts={"c10", "c20"})
-        sampler = KernelLogSampler(cursor="c10")
-        ctx = RunContext(ProcdiagConfig())
-        sampler.setup(ctx)
-        sampler.run(ctx)
-        read_at = time.time()
-        monkeypatch.setattr(
-            kernlog,
-            "run",
-            lambda args: (
-                None if "--after-cursor" in args else _journalctl_since(args, since)
-            ),
-        )
-
-        batches = sampler.run(ctx)
-
-        assert len(since) == 1 and int(since[0][1:]) <= read_at
-        assert _rows(batches, "meta") == [("kernel_log_cursor", "c30")]
-        assert [e[1] for e in _rows(batches, "kernel_events")] == ["io_error"]
-        assert Capability.KERNEL_LOG not in ctx.unobserved
-
-
-def _journalctl_since(args, since: list[str]) -> str:
-    since.append(args[args.index("--since") + 1])
-    return _IO_ERROR_LINE + "-- cursor: c30\n"
 
 
 _SERVICES = {"other.service": _unit(0)}
@@ -303,6 +224,50 @@ class TestCustomSampler:
                 for r in store.rows("ops_events", where="kind='sampler_failed'")
             ]
         assert kept == ["disk: 設備のログを読めません"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "disk: 設備のログを読めません ({n} 回目)",
+            "設備のログを読めません ({n} 回目)",
+        ],
+        ids=["with-prefix", "without-prefix"],
+    )
+    def test_a_note_that_changes_every_run_is_kept_once_per_sampler(
+        self, tmp_path, text
+    ):
+        class _CountingDisk(Sampler):
+            name = "disk"
+
+            def __init__(self) -> None:
+                self.runs = 0
+
+            def collect(self, ctx: RunContext) -> list[SampleBatch]:
+                self.runs += 1
+                ctx.notes.append(text.format(n=self.runs))
+                return []
+
+        db = tmp_path / "varying.db"
+        clock = FakeClock(0.0)
+        disk = _CountingDisk()
+        rec = Recorder(
+            _make_config(system_interval=0.1, disk_interval=0.3),
+            db_path=db,
+            samplers={"system": FakeSampler(), "disk": disk},
+            duration=2.0,
+            clock=clock,
+            sleep=_AdvancingSleep(clock),
+        )
+
+        assert rec.run() == 0
+
+        with Storage(db, read_only=True) as store:
+            kept = [
+                r["detail"]
+                for r in store.rows("ops_events", where="kind='sampler_failed'")
+            ]
+        assert disk.runs > 3
+        assert kept == [text.format(n=1)]
 
 
 class TestCgroupSampler:

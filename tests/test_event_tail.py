@@ -9,10 +9,14 @@ reader to look at the kernel log names all boots, not just the running one.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from synth import add_sys_baseline, make_db
 from test_observation import _add_kernel_errors
 from test_rules_v4 import _svc
 
+import procdiag
 import procdiag.snapshot as snap
 from procdiag.config import ProcdiagConfig
 from procdiag.core.result import Window
@@ -80,7 +84,9 @@ class TestEventsAfterTheLastSample:
 
 
 class TestWhereToLookInTheKernelLog:
-    def test_every_hint_reaches_back_past_the_running_boot(self, tmp_path, monkeypatch):
+    def test_the_kernel_error_hints_reach_back_past_the_running_boot(
+        self, tmp_path, monkeypatch
+    ):
         store, last = _recorded_hours(tmp_path)
         _add_kernel_errors(store, last - 600.0)
         finding = _diagnose(store, "KERNEL-ERROR-01").findings[0]
@@ -101,3 +107,18 @@ class TestWhereToLookInTheKernelLog:
         for command in KernelLogSampler.manual_commands:
             if command.startswith("journalctl -k"):
                 assert "-b all" in command, command
+
+    def test_no_hint_in_the_package_reads_only_the_running_boot(self):
+        package = Path(procdiag.__file__).parent
+        sources = [*package.rglob("*.py"), *package.rglob("*.j2")]
+        only_this_boot = []
+        for source in sources:
+            for command in re.findall(
+                r"journalctl [^`'\"|\n]*", source.read_text(encoding="utf-8")
+            ):
+                words = command.split()
+                if "-k" in words and "-b" not in words:
+                    only_this_boot.append(f"{source.name}: {command.strip()}")
+
+        assert sources
+        assert only_this_boot == []

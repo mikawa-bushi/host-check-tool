@@ -191,6 +191,20 @@ class TestStartRefusal:
         assert result.exit_code == 1
         assert "記録を開始します" not in result.output
 
+    def test_the_start_message_is_printed_once_for_a_recording_that_starts(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            Recorder, "_build_samplers", lambda self: {"system": FakeSampler()}
+        )
+
+        result = CliRunner().invoke(
+            cli, ["record", "--duration", "1s", "--db", str(tmp_path / "ok.db")]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.output.count("記録を開始します") == 1
+
 
 class TestConfigThatIsNotUtf8:
     def test_a_watch_dir_whose_name_is_not_utf8_does_not_stop_the_recording(

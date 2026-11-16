@@ -8,6 +8,7 @@ WAL truncation is not blamed on a reader.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -99,6 +100,75 @@ class TestAFloorTheDbCannotReturn:
 
             assert result["steps"] == ["raw_24h"]
         assert _on_disk(db) <= budget
+
+
+def _bottom_rung_size(db: Path, tmp_path: Path) -> int:
+    """File size once the last rung of the ladder has cut and a VACUUM has run."""
+    probe = tmp_path / "bottom.db"
+    shutil.copy(db, probe)
+    with Storage(probe) as store:
+        store.retention("6h", "14d")
+        store.conn.execute("VACUUM")
+        store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    size = probe.stat().st_size
+    probe.unlink()
+    return size
+
+
+class TestAFloorTheBottomRungMeets:
+    @pytest.mark.parametrize("spare", [0.0, 0.02])
+    def test_the_guard_cuts_until_it_is_met_when_the_estimate_says_it_is_out_of_reach(
+        self, template, tmp_path, monkeypatch, spare
+    ):
+        db = _copy(template, tmp_path)
+        capacity = 3 * _on_disk(db)
+        bottom = _bottom_rung_size(db, tmp_path)
+        floor = int(capacity - (1 + spare) * bottom)
+        disk = _FakeDisk(db, capacity=capacity)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            result = store.enforce_size_budget(max_bytes=None, min_free_bytes=floor)
+
+        assert result["steps"] != []
+        assert disk.free() >= floor
+
+    def test_the_guard_cuts_for_it_without_dbstat_too(
+        self, template, tmp_path, monkeypatch
+    ):
+        db = _copy(template, tmp_path)
+        capacity = 3 * _on_disk(db)
+        bottom = _bottom_rung_size(db, tmp_path)
+        floor = int(capacity - 1.02 * bottom)
+        disk = _FakeDisk(db, capacity=capacity)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            real = _failing(store, "dbstat", "no such table: dbstat")
+            try:
+                result = store.enforce_size_budget(max_bytes=None, min_free_bytes=floor)
+            finally:
+                store.conn = real
+
+        assert result["steps"] != []
+        assert disk.free() >= floor
+
+    def test_a_floor_even_the_estimates_margin_cannot_reach_is_still_given_up(
+        self, template, tmp_path, monkeypatch
+    ):
+        db = _copy(template, tmp_path)
+        capacity = 3 * _on_disk(db)
+        bottom = _bottom_rung_size(db, tmp_path)
+        disk = _FakeDisk(db, capacity=capacity)
+        monkeypatch.setattr("procdiag.storage.shutil.disk_usage", disk)
+
+        with Storage(db) as store:
+            result = store.enforce_size_budget(
+                max_bytes=None, min_free_bytes=int(capacity - 0.85 * bottom)
+            )
+
+            assert result["steps"] == []
+            assert _span(store, "proc_samples", "ts") / _HOUR > 39
 
 
 class TestReaderHoldingTheWal:
