@@ -11,6 +11,7 @@ import threading
 import time
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,7 @@ from procdiag import spikes
 from procdiag.config import ProcdiagConfig, SamplingConfig, WatchDir
 from procdiag.core.sampler import Note, RunContext, SampleBatch
 from procdiag.recorder import Recorder
+from procdiag.samplers import process as process_mod
 from procdiag.samplers.process import ProcessSampler
 from procdiag.samplers.selfmeter import SelfMeter
 from procdiag.storage import Storage
@@ -53,6 +55,25 @@ def _peek(db: Path, sql: str) -> list[tuple]:
 # ---------------------------------------------------------------------------
 
 
+# What the boot clock reads for every process scan of these tests.  The age of
+# a fake process is measured against it, not against the host's clock, which
+# keeps moving while the test runs.
+_BOOT_CLOCK = 100_000.0
+
+
+@pytest.fixture(autouse=True)
+def _frozen_boot_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        process_mod,
+        "time",
+        SimpleNamespace(
+            time=time.time,
+            clock_gettime=lambda _clock: _BOOT_CLOCK,
+            CLOCK_BOOTTIME=time.CLOCK_BOOTTIME,
+        ),
+    )
+
+
 def _fake_process(pid: int, name: str, *, cpu_seconds: float, age: float) -> MagicMock:
     """A process that started *age* seconds ago and has used *cpu_seconds* since."""
     p = MagicMock(spec=psutil.Process)
@@ -65,9 +86,7 @@ def _fake_process(pid: int, name: str, *, cpu_seconds: float, age: float) -> Mag
     p.cpu_times.return_value = MagicMock(user=cpu_seconds, system=0.0)
     # psutil adds the boot time of /proc/stat (whole seconds) to the start
     # time since boot.
-    p.create_time.return_value = (
-        psutil.boot_time() + time.clock_gettime(time.CLOCK_BOOTTIME) - age
-    )
+    p.create_time.return_value = psutil.boot_time() + _BOOT_CLOCK - age
     p.memory_info.return_value = MagicMock(rss=10 * 1024**2)
     p.num_threads.return_value = 1
     p.num_fds.return_value = 3
