@@ -105,6 +105,15 @@ class RunContext:
         self.capabilities[capability.value] = False
         self.unobserved[capability] = reason
 
+    def observed(self, capability: Capability) -> None:
+        """Take back :meth:`lacks`: a sampler read what its failed reads would have.
+
+        Only for a sampler whose later read covers the stretch the failed ones
+        left blank (a journal read from where the last one ended).
+        """
+        if self.unobserved.pop(capability, None) is not None:
+            self.capabilities[capability.value] = True
+
 
 # A sampler that feeds a capability and has not read once by its second failed
 # run in a row has not observed it in this recording.

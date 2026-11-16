@@ -77,6 +77,11 @@ class _KernelLog(Sampler):
                 self.running -= 1
 
 
+@pytest.fixture(autouse=True)
+def _the_wait_of_a_real_recording(monkeypatch):
+    monkeypatch.setattr(recorder_mod, "_EVENT_READ_WAIT_SEC", 0.1)
+
+
 def _config() -> ProcdiagConfig:
     return ProcdiagConfig(
         sampling=SamplingConfig(

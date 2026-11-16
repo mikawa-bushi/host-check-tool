@@ -19,11 +19,19 @@ place, so the lines logged meanwhile are neither lost nor read twice.  Only a
 cursor journalctl itself rejects, or one that failed on three runs in a row
 while the journal could be read without it, is replaced (the cursor is only a
 string in ``meta``): the sampler reads on from the start of its last read that
-worked, or from the newest message when it has not read yet.
+worked, or from the newest message when it has not read yet.  That read starts
+at a whole second, so the lines of the last one that fall in it are dropped, not
+recorded twice.
+
+Two failed reads before any worked make the recording "not observed" for
+KERNEL-ERROR-01; a read from the same position that works later takes that back
+(it returns what the failed ones would have), unless the position moved to the
+newest message, past lines nothing read.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
@@ -84,6 +92,11 @@ class KernelLogSampler(Sampler):
         self._read_at: Optional[float] = None
         # Reads from the cursor that failed in a row; 0 once one works.
         self._failed_reads = 0
+        # Lines of the reads so far that a read from the start of the last one's
+        # second would return again: ``--since`` counts whole seconds.
+        self._tail: set[kernlog.KernelEvent] = set()
+        # Whether the position moved to the newest message, past lines nothing read.
+        self._skipped = False
 
     def setup(self, ctx: RunContext) -> None:
         """Enable only when the kernel journal is readable."""
@@ -105,6 +118,11 @@ class KernelLogSampler(Sampler):
         started = time.time()
         events, cursor = self._read(ctx)
         self._cursor, self._read_at = cursor or self._cursor, started
+        floor = math.floor(started)
+        self._tail = {e for e in (*self._tail, *events) if e.ts >= floor}
+        if not self._skipped:
+            # Failed reads left nothing unread: this one began where they did.
+            ctx.observed(Capability.KERNEL_LOG)
         position = make_row("meta", key=CURSOR_KEY, value=self._cursor)
         batches = [SampleBatch(table="meta", rows=[position])]
         if events:
@@ -152,9 +170,10 @@ class KernelLogSampler(Sampler):
             if newest is None:
                 raise OSError(_READ_FAILED)
             self._cursor = newest
+            self._skipped = True
             raise OSError(_CURSOR_RESET_ERROR)
         events, cursor = kernlog.read_events(since=self._read_at)
         if events is None:
             raise OSError(_READ_FAILED)
         ctx.notes.append(Note(CURSOR_NOTE_KEY, _CURSOR_REFUSED_NOTE))
-        return events, cursor
+        return [e for e in events if e not in self._tail], cursor

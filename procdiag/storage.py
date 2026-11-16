@@ -1877,9 +1877,21 @@ class Storage:
             "SELECT * FROM sessions ORDER BY started_ts"
         ).fetchall()
 
-    def record_unobserved(self, capability: Capability, reason: str) -> None:
-        """Note that the running session cannot observe *capability*."""
-        self.record_event("unobserved", f"{capability.value}: {reason}")
+    def record_unobserved(self, capability: Capability, reason: str) -> int:
+        """Note that the running session cannot observe *capability*.
+
+        Returns the event's id, for :meth:`forget_unobserved`.
+        """
+        with self.conn:
+            return self._insert_event("unobserved", f"{capability.value}: {reason}")
+
+    def forget_unobserved(self, event_id: int) -> None:
+        """Take back what :meth:`record_unobserved` noted, for a sampler that read after all."""
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM ops_events WHERE rowid = ? AND kind = 'unobserved'",
+                (event_id,),
+            )
 
     def unobserved_periods(self) -> List[Unobserved]:
         """When the recordings in this DB could not observe what, and why.
@@ -1978,16 +1990,17 @@ class Storage:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _insert_event(self, kind: str, detail: str) -> None:
-        """Insert an ops_event inside the caller's transaction (no commit).
+    def _insert_event(self, kind: str, detail: str) -> int:
+        """Insert an ops_event inside the caller's transaction (no commit); its id.
 
         The detail may name a host path or process (stored as
         :func:`storable_text`).
         """
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, ?)",
             (time.time(), kind, storable_text(detail)),
         )
+        return int(cur.lastrowid)
 
 
 # ---------------------------------------------------------------------------

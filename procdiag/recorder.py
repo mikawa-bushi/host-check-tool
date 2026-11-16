@@ -12,7 +12,9 @@ Key design decisions (mirroring netdiag/Watcher):
   returns; calling ``run()`` from a worker thread is safe but no signal
   handling occurs.  A SIGHUP that ``nohup`` set to be ignored stays ignored.
 - ``run()`` can be called once per Recorder, like ``threading.Thread.start``.
-- Watch-dir walks run on their own thread (see ``_job_dir_scan``).
+- Watch-dir walks and the reads of the service and kernel-log samplers (which
+  wait on systemctl / journalctl) run on their own threads (see
+  ``_job_dir_scan`` and ``_job_event_read``).
 - The scheduler uses ``time.monotonic`` as its clock so suspend/resume gaps
   are visible in ops_events without distorting wall-clock timestamps.
 - A single ``threading.Event`` (``_stop``) coordinates graceful shutdown
@@ -50,8 +52,17 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Samplers that record what happened since their previous read (up to one
-# 5-minute interval ago): stopping reads them once more to keep that tail.
+# 5-minute interval ago): stopping reads them once more to keep that tail.  They
+# wait on systemctl / journalctl, which can hang for the 10 seconds of their
+# timeout, so each read runs on its own thread (see ``_job_event_read``).
 _EVENT_SAMPLERS = ("service", "kernel_log")
+# How long the job that starts such a read waits for it.  A read that ends this
+# soon is kept in the same tick; a slower one no longer holds the 1 s sampling.
+_EVENT_READ_WAIT_SEC = 0.1
+# What the stop waits for a read that is still running, at most.  A hung
+# journalctl and a hung systemctl wait one after the other, and the walk waits
+# too, within the service's TimeoutStopSec.
+_STOP_READ_WAIT_MAX_SEC = service.TIMEOUT_STOP_SEC / 6
 
 # How long the dir job waits for the walk it started.  A walk that ends this
 # soon (a small or missing directory) is kept in the same tick, as when walks
@@ -167,9 +178,12 @@ class Recorder:
         self._retention_interval = 3600.0
         # Keys of the notes and capabilities this session has already kept.
         self._noted: set[str] = set()
-        self._unobserved_kept: set[Capability] = set()
+        # Capability -> id of the ``unobserved`` event kept for it (None: not written).
+        self._unobserved_kept: dict[Capability, Optional[int]] = {}
         self._ran = False
         self._dir_walk: Optional[_DirWalk] = None
+        # The reads of the event samplers that are running, by sampler name.
+        self._event_reads: dict[str, _EventRead] = {}
 
     # ------------------------------------------------------------------
     # Sampler / collaborator factory (T09 wiring)
@@ -296,7 +310,7 @@ class Recorder:
             self._storage.buffer(batch.table, batch.rows)
         if self._ctx.notes:
             self._keep_failure_notes(name)
-        if len(self._ctx.unobserved) > len(self._unobserved_kept):
+        if self._ctx.unobserved.keys() != self._unobserved_kept.keys():
             self._keep_unobserved()
         return batches
 
@@ -327,16 +341,30 @@ class Recorder:
 
         What a session cannot observe goes with its data, so ``check`` does
         not read the rules that needed it as "no problem".  A sampler that
-        starts to fail for good mid-session adds to it too.
+        starts to fail for good mid-session adds to it too, and one that read
+        after all (``RunContext.observed``) takes it back: what it recorded must
+        not be hidden by what the failed reads said.
         """
         for capability, reason in self._ctx.unobserved.items():
             if capability in self._unobserved_kept:
                 continue
-            self._unobserved_kept.add(capability)
+            self._unobserved_kept[capability] = None
             try:
-                self._storage.record_unobserved(capability, reason)
+                self._unobserved_kept[capability] = self._storage.record_unobserved(
+                    capability, reason
+                )
             except sqlite3.Error as exc:
                 logger.error("観測できない項目を記録 DB に書き込めません: %s", exc)
+        for capability in [
+            c for c in self._unobserved_kept if c not in self._ctx.unobserved
+        ]:
+            event_id = self._unobserved_kept.pop(capability)
+            if event_id is None:
+                continue
+            try:
+                self._storage.forget_unobserved(event_id)
+            except sqlite3.Error as exc:
+                logger.error("観測できた項目を記録 DB に反映できません: %s", exc)
 
     # ------------------------------------------------------------------
     # Spike handling
@@ -375,6 +403,7 @@ class Recorder:
     def _job_system(self) -> None:
         """Tier-1 job: sample system, check trigger, update selfmeter."""
         self._take_dir_walk()
+        self._take_event_reads()
         sampler = self._samplers.get("system")
         if sampler is None:
             return
@@ -414,6 +443,77 @@ class Recorder:
             self._dir_walk = _DirWalk(sampler, self._ctx)
             self._dir_walk.join(_DIR_WALK_WAIT_SEC)
             self._take_dir_walk()
+
+    def _job_event_read(self, name: str) -> None:
+        """Start the read of an event sampler on its own thread.
+
+        A read of ``journalctl`` or ``systemctl`` may use its whole timeout; on
+        the scheduler thread it would stop the 1 s system sampling and the spike
+        trigger for that long, and the hole would be recorded as a gap.  A read
+        is not started while the last one still runs.
+        """
+        self._take_event_read(name)
+        sampler = self._samplers.get(name)
+        if sampler is None or name in self._event_reads:
+            return
+        read = self._event_reads[name] = _EventRead(sampler, self._ctx)
+        read.join(_EVENT_READ_WAIT_SEC)
+        self._take_event_read(name)
+
+    def _take_event_reads(self) -> None:
+        for name in list(self._event_reads):
+            self._take_event_read(name)
+
+    def _take_event_read(self, name: str) -> bool:
+        """Keep what a finished read recorded, on the scheduler thread.
+
+        The read worked on its own copy of the context; what it noted and what
+        it could not observe (or observed after all) of the sampler's own
+        capability are taken over here.  Returns whether the read was done.
+        """
+        read = self._event_reads.get(name)
+        if read is None or read.running():
+            return False
+        del self._event_reads[name]
+        for batch in read.batches:
+            self._storage.buffer(batch.table, batch.rows)
+        capability = getattr(read.sampler, "capability", None)
+        if capability is not None:
+            reason = read.ctx.unobserved.get(capability)
+            if reason is None:
+                self._ctx.unobserved.pop(capability, None)
+            else:
+                self._ctx.unobserved[capability] = reason
+            if capability.value in read.ctx.capabilities:
+                self._ctx.capabilities[capability.value] = read.ctx.capabilities[
+                    capability.value
+                ]
+        if read.ctx.notes:
+            self._ctx.notes.extend(read.ctx.notes)
+            self._keep_failure_notes(name)
+        if self._ctx.unobserved.keys() != self._unobserved_kept.keys():
+            self._keep_unobserved()
+        return True
+
+    def _final_event_read(self, name: str) -> None:
+        """At stop, read an event sampler once more to keep what it has not read yet.
+
+        A read that still runs is waited for a little; one that does not end
+        waits on the same hung command a new read would, so none is started.
+        """
+        if name in self._event_reads:
+            self._event_reads[name].join(_STOP_READ_WAIT_MAX_SEC)
+            if not self._take_event_read(name):
+                self._ctx.notes.append(
+                    Note(
+                        f"{name}_stop",
+                        f"{name}: 停止時に読み取りが終わらなかったため、最後の読み取りは"
+                        "記録していません (journalctl / systemctl が応答していない可能性)",
+                    )
+                )
+                self._keep_failure_notes(name)
+                return
+        self._run_sampler(name)
 
     def _take_dir_walk(self) -> bool:
         """Buffer the rows and notes of a finished walk, on the scheduler thread.
@@ -684,12 +784,12 @@ class Recorder:
             "t3_thermal", sc.thermal_interval, partial(self._run_sampler, "thermal")
         )
         sched.add(
-            "t3_service", sc.service_interval, partial(self._run_sampler, "service")
+            "t3_service", sc.service_interval, partial(self._job_event_read, "service")
         )
         sched.add(
             "t3_kernel_log",
             sc.kernel_log_interval,
-            partial(self._run_sampler, "kernel_log"),
+            partial(self._job_event_read, "kernel_log"),
         )
         sched.add("t3_dir", sc.dir_scan_interval, self._job_dir_scan)
         sched.add("flush", self._flush_interval, self._job_flush)
@@ -726,7 +826,7 @@ class Recorder:
         # cannot be written.
         try:
             for name in _EVENT_SAMPLERS:
-                self._run_sampler(name)
+                self._final_event_read(name)
         except Exception:
             logger.exception("シャットダウン例外")
         saved = self._flush("signal")
@@ -855,6 +955,41 @@ class _DirWalk:
     def age(self) -> float:
         """Seconds since the walk started."""
         return time.monotonic() - self._started
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
+
+
+class _EventRead:
+    """One read of an event sampler (service, kernel log) on a daemon thread.
+
+    Like a walk, it works on its own copy of the context, so what it notes and
+    what it could not observe do not race the scheduler thread; the recorder
+    takes them once the read is done.
+    """
+
+    def __init__(self, sampler: Sampler, ctx: RunContext) -> None:
+        self.sampler = sampler
+        self.ctx = copy.copy(ctx)
+        self.ctx.notes = []
+        self.ctx.unobserved = dict(ctx.unobserved)
+        self.ctx.capabilities = dict(ctx.capabilities)
+        self.batches: list[SampleBatch] = []
+        self._thread = threading.Thread(
+            target=self._read,
+            name=f"procdiag-read-{sampler.name or 'sampler'}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _read(self) -> None:
+        try:
+            self.batches = self.sampler.run(self.ctx)
+        except Exception:
+            logger.exception("サンプラー読み取り例外")
+
+    def running(self) -> bool:
+        return self._thread.is_alive()
 
     def join(self, timeout: float) -> None:
         self._thread.join(timeout)
