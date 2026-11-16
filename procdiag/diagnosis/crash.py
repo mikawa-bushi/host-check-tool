@@ -177,7 +177,7 @@ class OomKillRule(Rule):
         "OOM kill の決定論的証拠となる"
     )
     manual_commands = [
-        "journalctl -k | grep -i oom",
+        "journalctl -k -b all | grep -i oom",
         "dmesg | grep -i oom",
         "dmesg | grep -i 'killed process'",
         "cat /proc/sys/vm/overcommit_memory",

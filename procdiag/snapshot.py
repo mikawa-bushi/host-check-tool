@@ -336,11 +336,13 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
                 status = CRITICAL
                 hint = (
                     "ファイルシステムのエラーで自動的に読み取り専用化した可能性があります。"
-                    "`journalctl -k | grep -iE 'EXT4-fs error|I/O error'` を確認してください"
+                    "`journalctl -k -b all | grep -iE 'EXT4-fs error|I/O error'` を確認してください"
                 )
             else:
                 status = INFO
-                hint = "意図した設定でなければ `journalctl -k` を確認してください"
+                hint = (
+                    "意図した設定でなければ `journalctl -k -b all` を確認してください"
+                )
             items.append(
                 item(
                     status,
