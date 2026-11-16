@@ -10,6 +10,7 @@ filtered subset) against a Storage instance.
 from __future__ import annotations
 
 import difflib
+import re
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -71,6 +72,10 @@ class Rule:
     requires_schema: tuple[str, ...] = ()
     requires_rows: tuple[str, ...] = ()
     requires_observed: tuple[Capability, ...] = ()
+    # Tunables for which 0 or less is meaningless: a cap of 0 hides every
+    # finding, a tolerance of 0 divides by zero.  An override of them must be
+    # above 0 (``resolve_overrides``); ``inf`` still means "unbounded".
+    positive_tunables: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
     def tunables(cls) -> Dict[str, Union[int, float]]:
@@ -242,6 +247,10 @@ def resolve_overrides(
                 f"{cls.rule_id}: '{name}' は調整可能なしきい値ではありません"
                 f" (調整可能: {', '.join(tunables)})"
             )
+        if name in cls.positive_tunables and not value > 0:
+            raise ValueError(
+                f"{cls.rule_id}: '{name}' は 0 より大きい数で指定してください: {value}"
+            )
         if isinstance(tunables[name], int):
             if not float(value).is_integer():
                 raise ValueError(
@@ -301,12 +310,18 @@ def rule_id_problems(setting: str, rule_ids: Iterable[str]) -> List[str]:
     for rule_id in rule_ids:
         if rule_id in _REGISTRY:
             continue
-        close = difflib.get_close_matches(rule_id.upper(), list(_REGISTRY), n=1)
-        hint = (
-            f"{close[0]} のことですか?"
-            if close
-            else "ルール ID の一覧は procdiag explain で表示できます"
+        close = difflib.get_close_matches(
+            rule_id.upper(), list(_REGISTRY), n=1, cutoff=0.8
         )
+        if re.search(r"[;,、\s/|:]", rule_id):
+            hint = (
+                "ルール ID を複数書くときは , (カンマ) で区切ってください "
+                "(config の disabled はリストの要素ごと)"
+            )
+        elif close:
+            hint = f"{close[0]} のことですか?"
+        else:
+            hint = "ルール ID の一覧は procdiag explain で表示できます"
         problems.append(f"{setting}: 不明なルール ID です: {rule_id} ({hint})")
     return problems
 

@@ -52,7 +52,7 @@ from ..core import (
 )
 from ..core.result import blind_throughout, unobserved_hours
 from ..core.util import humanize_bytes, neutralize, shell_quote
-from ..plugins import load_extra_rules
+from ..plugins import load_extra_rules, plugin_failures
 from ..storage import OPTIONAL_SAMPLER_TABLES
 
 if TYPE_CHECKING:
@@ -188,7 +188,7 @@ class Engine:
         names a disabled rule, or when no rule is left to run, so a mistake
         never quietly changes which rules a "no problem" verdict covers.
         """
-        self._load_extra_rules([])
+        load_problems = self._load_extra_rules([])
         disabled = set(self.config.rules.disabled)
         registry = all_rules()  # {rule_id: RuleClass}
         problems = [
@@ -202,7 +202,8 @@ class Engine:
             ),
         ]
         if problems:
-            raise ValueError("\n".join(problems))
+            # An ID that no rule has may be one of the rules that did not load.
+            raise ValueError("\n".join([*problems, *load_problems]))
 
         candidates: list[type[Rule]] = [
             cls for rule_id, cls in registry.items() if rule_id not in disabled
@@ -277,7 +278,7 @@ class Engine:
 
         # --- Step 0: load user-supplied extra rule modules ---
         # Their @register decorators must fire before select()/all_rules().
-        self._load_extra_rules(reasoning)
+        load_problems = self._load_extra_rules(reasoning)
 
         # --- Step 1: determine window ---
         if window is None:
@@ -441,6 +442,7 @@ class Engine:
             unobserved=unobserved,
             unjudged=unjudged,
         )
+        quality.notes[:0] = load_problems
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
         healthy = (
@@ -532,20 +534,30 @@ class Engine:
             )
         return None
 
-    def _load_extra_rules(self, reasoning: list[str]) -> None:
+    def _load_extra_rules(self, reasoning: list[str]) -> list[str]:
         """Import ``config.rules.extra_rules`` so their @register decorators fire.
 
         Load failures are recorded in *reasoning* (surfaced by ``--verbose`` and
         always present in the JSON report) and never abort the diagnosis.
+        Returns one sentence for each module or installed plugin that did not
+        load, for the quality notes: a rule that is not there is not evaluated,
+        and a report that says nothing about it reads as "checked and fine".
         """
+        problems = [
+            f"プラグイン {name} を読み込めなかったため、そのルールは評価していません ({msg})"
+            for name, msg in plugin_failures()
+        ]
         extra = self.config.rules.extra_rules
-        if not extra:
-            return
-        for name, ok, msg in load_extra_rules(extra):
+        for name, ok, msg in load_extra_rules(extra) if extra else ():
             if not ok:
                 reasoning.append(f"追加ルール {name} の読み込みに失敗しました: {msg}")
+                problems.append(
+                    f"追加ルールのモジュール {name} を読み込めなかったため、"
+                    f"そのルールは評価していません ({msg})"
+                )
             elif self.verbose:
                 reasoning.append(f"追加ルール {name} を読み込みました")
+        return problems
 
     def _determine_window(
         self, store: "Storage", reasoning: list[str]
