@@ -410,6 +410,12 @@ def _missing_io_text(q: ObservationQuality) -> str:
     return "未計測" if q.missing_io_pct is None else f"{q.missing_io_pct * 100:.1f}%"
 
 
+def _throttle_text(q: ObservationQuality) -> str:
+    """One slowdown is recorded once per step that widens the interval."""
+    text = f"{q.throttle_events} 回"
+    return f"{text} (間隔を広げた段の数)" if q.throttle_events else text
+
+
 # ---------------------------------------------------------------------------
 # render_terminal
 # ---------------------------------------------------------------------------
@@ -511,7 +517,7 @@ def render_terminal(
     lines.append(f"  欠測 gap 合計 : {q.gap_seconds:.0f} 秒")
     lines.append(f"  自己負荷      : {_self_load_text(q)}")
     lines.append(f"  I/O 欠損率    : {_missing_io_text(q)}")
-    lines.append(f"  減速イベント  : {q.throttle_events} 回")
+    lines.append(f"  減速イベント  : {_throttle_text(q)}")
     for note in q.notes:
         lines.append(f"  備考: {note}")
 
@@ -1149,7 +1155,7 @@ def _quality_section(q: ObservationQuality, window: Window | None) -> str:
     <dt>自己負荷 (平均)</dt><dd>{_pct2(q.self_cpu_avg)}</dd>
     <dt>自己負荷 (最大)</dt><dd>{_pct2(q.self_cpu_max)}</dd>
     <dt>I/O 欠損率</dt><dd>{_missing_io_text(q)}</dd>
-    <dt>減速イベント</dt><dd>{q.throttle_events} 回</dd>
+    <dt>減速イベント</dt><dd>{_throttle_text(q)}</dd>
   </dl>
   {"".join(f"<p>備考: {_esc(n)}</p>" for n in q.notes)}
 </div>

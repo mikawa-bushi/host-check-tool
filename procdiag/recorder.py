@@ -10,7 +10,9 @@ Key design decisions (mirroring netdiag/Watcher):
 - Signal handlers (SIGTERM/SIGINT/SIGHUP) are registered only when running
   in the main thread, and ``run()`` puts the previous handlers back before it
   returns; calling ``run()`` from a worker thread is safe but no signal
-  handling occurs.
+  handling occurs.  A SIGHUP that ``nohup`` set to be ignored stays ignored.
+- ``run()`` can be called once per Recorder, like ``threading.Thread.start``.
+- Watch-dir walks run on their own thread (see ``_job_dir_scan``).
 - The scheduler uses ``time.monotonic`` as its clock so suspend/resume gaps
   are visible in ops_events without distorting wall-clock timestamps.
 - A single ``threading.Event`` (``_stop``) coordinates graceful shutdown
@@ -19,6 +21,7 @@ Key design decisions (mirroring netdiag/Watcher):
 
 from __future__ import annotations
 
+import copy
 import logging
 import platform
 import signal
@@ -48,6 +51,11 @@ logger = logging.getLogger(__name__)
 # Samplers that record what happened since their previous read (up to one
 # 5-minute interval ago): stopping reads them once more to keep that tail.
 _EVENT_SAMPLERS = ("service", "kernel_log")
+
+# How long the dir job waits for the walk it started.  A walk that ends this
+# soon (a small or missing directory) is kept in the same tick, as when walks
+# ran on the scheduler thread; a longer one no longer holds the 1 s sampling.
+_DIR_WALK_WAIT_SEC = 0.1
 
 
 class Recorder:
@@ -146,6 +154,8 @@ class Recorder:
         self._retention_interval = 3600.0
         # Keys of the notes this session has already kept.
         self._noted: set[str] = set()
+        self._ran = False
+        self._dir_walk: Optional[_DirWalk] = None
 
     # ------------------------------------------------------------------
     # Sampler / collaborator factory (T09 wiring)
@@ -204,7 +214,10 @@ class Recorder:
         try:
             from .samplers.selfmeter import SelfMeter  # type: ignore[import]
 
-            return SelfMeter(self._config.budget)
+            return SelfMeter(
+                self._config.budget,
+                process_interval=self._config.sampling.process_interval,
+            )
         except Exception:
             logger.warning(
                 "SelfMeter の初期化に失敗しました — 自己計測なしで継続します"
@@ -309,6 +322,7 @@ class Recorder:
 
     def _job_system(self) -> None:
         """Tier-1 job: sample system, check trigger, update selfmeter."""
+        self._take_dir_walk()
         sampler = self._samplers.get("system")
         if sampler is None:
             return
@@ -334,15 +348,36 @@ class Recorder:
                 self._storage.record_event(throttle_result, "selfmeter自動減速")
 
     def _job_dir_scan(self) -> None:
-        """Tier-3 dir job: watch-dir size scan."""
+        """Tier-3 dir job: start a watch-dir walk unless one is still running.
+
+        A walk may use its whole time budget per directory (10 s by default);
+        on the scheduler thread it would stop the 1 s system sampling and the
+        spike trigger for that long, and the stall would be recorded as a gap.
+        """
         sampler = self._samplers.get("disk")
         if sampler is None or not hasattr(sampler, "collect_dirs"):
             return
-        try:
-            for batch in sampler.collect_dirs(self._ctx):
-                self._storage.buffer(batch.table, batch.rows)
-        except Exception:
-            logger.exception("ディレクトリ走査例外")
+        self._take_dir_walk()
+        if self._dir_walk is None:
+            self._dir_walk = _DirWalk(sampler, self._ctx)
+            self._dir_walk.join(_DIR_WALK_WAIT_SEC)
+            self._take_dir_walk()
+
+    def _take_dir_walk(self) -> bool:
+        """Buffer the rows and notes of a finished walk, on the scheduler thread.
+
+        Returns whether there are rows to flush.
+        """
+        walk = self._dir_walk
+        if walk is None or walk.running():
+            return False
+        self._dir_walk = None
+        for batch in walk.batches:
+            self._storage.buffer(batch.table, batch.rows)
+        if walk.ctx.notes:
+            self._ctx.notes.extend(walk.ctx.notes)
+            self._keep_failure_notes()
+        return bool(walk.batches)
 
     def _flush(self, reason: str) -> bool:
         """Write the buffered rows; on failure say why and keep them buffered."""
@@ -474,8 +509,16 @@ class Recorder:
         """Run the record loop.
 
         Returns 0 on normal exit, 1 when the DB cannot be written at start or
-        the rows buffered at stop could not be written.
+        the rows buffered at stop could not be written.  Raises RuntimeError
+        when called a second time: the first run ended its session and closed
+        the DB it opened.
         """
+        if self._ran:
+            raise RuntimeError(
+                "Recorder.run() は 1 つの Recorder で 1 回だけ呼べます。"
+                "もう一度記録するときは Recorder を作り直してください"
+            )
+        self._ran = True
         self._start_mono = self._clock()
         self._last_retention_mono = self._start_mono
 
@@ -536,13 +579,11 @@ class Recorder:
         job_process = partial(self._run_sampler, "process")
 
         # T2b interval is a callable so the selfmeter factor is evaluated
-        # each scheduling cycle.  The widened interval is capped at the
-        # design ceiling (§4.8: 上限60秒) regardless of the factor.
+        # each scheduling cycle.
         if self._selfmeter is not None:
-            max_interval = self._config.budget.throttle_max_interval
             sched.add(
                 "t2b_process",
-                lambda: min(sc.process_interval * self._selfmeter.factor, max_interval),
+                lambda: sc.process_interval * self._selfmeter.factor,
                 job_process,
             )
         else:
@@ -599,6 +640,17 @@ class Recorder:
         except Exception:
             logger.exception("シャットダウン例外")
         saved = self._flush("signal")
+        # A walk stuck on a mount holds this wait for its whole budget, which
+        # can be as long as the service's TimeoutStopSec: what is recorded is
+        # already written by now.
+        try:
+            walk = self._dir_walk
+            if walk is not None:
+                walk.join(walk.budget)
+                if self._take_dir_walk():
+                    saved = self._flush("interval")
+        except Exception:
+            logger.exception("シャットダウン例外")
         if saved:
             # Roll up the just-flushed final samples so the last (up to one
             # flush-interval + 1 min) of raw data is promoted to *_rollup_1m
@@ -641,7 +693,9 @@ class Recorder:
 
         SIGHUP (the terminal running a foreground ``record`` was closed) is a
         deliberate stop too; without a handler the process would die without
-        closing its session, which would read as an unclean shutdown.
+        closing its session, which would read as an unclean shutdown.  When it
+        is already ignored, ``nohup`` started the recording to outlive the
+        terminal, so it stays ignored.
 
         Returns the handlers that were replaced, keyed by signal number.
         """
@@ -655,6 +709,11 @@ class Recorder:
 
         try:
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                if (
+                    signum == signal.SIGHUP
+                    and signal.getsignal(signum) == signal.SIG_IGN
+                ):
+                    continue
                 # None: the old handler was not installed from Python and
                 # cannot be reinstalled from here.
                 old = signal.signal(signum, _handler)
@@ -664,6 +723,37 @@ class Recorder:
             # Can happen in non-main threads or restricted environments.
             pass
         return previous
+
+
+class _DirWalk:
+    """One watch-dir walk on a daemon thread.
+
+    The walk gets its own copy of the context so its notes do not race the
+    scheduler thread's; the recorder takes its rows and notes once it is done.
+    """
+
+    def __init__(self, sampler: Any, ctx: RunContext) -> None:
+        self.ctx = copy.copy(ctx)
+        self.ctx.notes = []
+        self.batches: list[SampleBatch] = []
+        # The walk ends by itself within this (one time budget per directory).
+        self.budget = sum(wd.time_budget_sec for wd in ctx.config.sampling.watch_dirs)
+        self._thread = threading.Thread(
+            target=self._walk, args=(sampler,), name="procdiag-dir-walk", daemon=True
+        )
+        self._thread.start()
+
+    def _walk(self, sampler: Any) -> None:
+        try:
+            self.batches = sampler.collect_dirs(self.ctx)
+        except Exception:
+            logger.exception("ディレクトリ走査例外")
+
+    def running(self) -> bool:
+        return self._thread.is_alive()
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout)
 
 
 def _records(batches: list[SampleBatch], table: str) -> list[dict]:

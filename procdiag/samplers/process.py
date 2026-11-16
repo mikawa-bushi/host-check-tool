@@ -8,8 +8,11 @@ Key design choices:
 
 * **PID cache** — psutil Process objects are kept alive across ticks so that
   ``cpu_percent()`` can return a meaningful diff (the first call on a fresh
-  object always returns 0.0 or None on some platforms).  New PIDs added to the
-  cache in tick N emit ``cpu_pct=None``; tick N+1 gives the real value.
+  object always returns 0.0 or None on some platforms).  A PID's first sample
+  holds its CPU use since it started instead: a batch job that started since
+  the previous scan is then a culprit of the spike it causes.  That value is
+  None for a process younger than a second and when the boot time cannot be
+  read.
 * **oneshot context** — all attributes are read inside ``Process.oneshot()``
   to minimise /proc round-trips.
 * **AccessDenied handling** — if I/O counters are denied, the ``io_read_delta``
@@ -84,6 +87,36 @@ def _read_pss_bytes(smaps_rollup: Path) -> Optional[int]:
         return None
 
 
+# The start time and the CPU time are both counted in ticks of 10 ms, so the
+# share of a process younger than this is mostly rounding (over 100 % was seen).
+_MIN_AGE_SEC = 1.0
+
+
+def _cpu_since_start(
+    proc: psutil.Process, boot_time: Optional[float]
+) -> Optional[float]:
+    """CPU % of *proc* since it started, as ``cpu_percent()`` would measure it.
+
+    ``cpu_percent()`` measures since its previous call on the same object, so
+    the first read of a PID has nothing to compare with.  The age comes from
+    the boot clock: ``create_time()`` adds the boot time of ``/proc/stat``,
+    which is cut to whole seconds, so on the wall clock a process one second
+    old could look half as busy.  Without a boot time (a ``/proc/stat`` that
+    has no ``btime`` line) there is no start time to measure from.
+    """
+    if boot_time is None:
+        return None
+    try:
+        times = proc.cpu_times()
+        started = proc.create_time() - boot_time
+    except _DENIED_OR_ZOMBIE:
+        return None
+    age = time.clock_gettime(time.CLOCK_BOOTTIME) - started
+    if age < _MIN_AGE_SEC:
+        return None
+    return round((times.user + times.system) / age * 100.0, 1)
+
+
 @register_sampler
 class ProcessSampler(Sampler):
     """Tier-2b: full-process-table scan with persistent PID-object cache.
@@ -152,13 +185,22 @@ class ProcessSampler(Sampler):
         rows: list[tuple] = []
         zombies = 0
         read_fds = self._should_read_fds(ctx)
+        boot_time: Optional[float]
+        try:
+            boot_time = psutil.boot_time()
+        except (RuntimeError, OSError):
+            boot_time = None
         self._refresh_pid_cache()
 
         for pid, proc in list(self._pid_cache.items()):
             identity = self._identity.get(pid)
             try:
                 reading = self._read_process(
-                    pid, proc, read_fds=read_fds, need_identity=identity is None
+                    pid,
+                    proc,
+                    read_fds=read_fds,
+                    first_read=identity is None,
+                    boot_time=boot_time,
                 )
                 if identity is None:
                     proc_id = self._register(pid, proc, reading, ts, ctx)
@@ -176,10 +218,7 @@ class ProcessSampler(Sampler):
             if reading.status == psutil.STATUS_ZOMBIE:
                 zombies += 1
 
-            # psutil's first cpu_percent() on a fresh Process object returns 0.0
-            # without a baseline, so 0% and "no baseline" are indistinguishable.
-            # Per spec (新規PIDの初回 cpu_pct=None で記録) the PID's first tick
-            # records None; the absence of a _prev_io entry marks that tick.
+            # The absence of a _prev_io entry marks the PID's first tick.
             key = (proc_id, pid)
             is_first_tick = key not in self._prev_io
             io_read_delta, io_write_delta = self._io_deltas(
@@ -197,7 +236,7 @@ class ProcessSampler(Sampler):
                     ts=ts,
                     proc_id=proc_id,
                     pid=pid,
-                    cpu_pct=None if is_first_tick else reading.cpu,
+                    cpu_pct=reading.cpu,
                     rss=reading.rss,
                     pss=pss,
                     num_threads=reading.num_threads,
@@ -266,14 +305,15 @@ class ProcessSampler(Sampler):
         proc: psutil.Process,
         *,
         read_fds: bool,
-        need_identity: bool,
+        first_read: bool,
+        boot_time: Optional[float],
     ) -> _Reading:
         """Read one process's metrics inside a single ``oneshot()`` block.
 
-        Name and cmdline are only read for a PID without a cached identity
-        (they never change for a live process).  Per-attribute AccessDenied /
-        zombie errors degrade just that column to None; NoSuchProcess and a
-        process-wide AccessDenied propagate to the caller.
+        Name and cmdline are only read on the first read of a PID (they never
+        change for a live process).  Per-attribute AccessDenied / zombie errors
+        degrade just that column to None; NoSuchProcess and a process-wide
+        AccessDenied propagate to the caller.
         """
         name: Optional[str] = None
         cmdline: list[str] = []
@@ -282,13 +322,15 @@ class ProcessSampler(Sampler):
                 status: Optional[str] = proc.status()  # stat is cached in oneshot
             except _DENIED_OR_ZOMBIE:
                 status = None
-            if need_identity:
+            if first_read:
                 name = proc.name()
                 try:
                     cmdline = proc.cmdline()
                 except _DENIED_OR_ZOMBIE:
                     cmdline = []
-            cpu = proc.cpu_percent()
+            cpu = proc.cpu_percent()  # on a first read: the next read's baseline
+            if first_read:
+                cpu = _cpu_since_start(proc, boot_time)
             try:
                 rss: Optional[int] = proc.memory_info().rss
             except _DENIED_OR_ZOMBIE:

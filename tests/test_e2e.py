@@ -31,6 +31,9 @@ Test cases
    ``test_record_resumes_the_kernel_log_after_a_restart_and_a_reboot`` — with a
    stand-in ``journalctl``, KERNEL-ERROR-01 counts each kernel error once,
    including the ones logged after the last read and while record was stopped.
+
+7. ``test_closing_the_terminal_stops_record_unless_started_with_nohup`` —
+   SIGHUP stops record cleanly, except when nohup set it to be ignored.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -294,6 +298,66 @@ def test_sigterm_shutdown(tmp_path: Path) -> None:
     assert "stopped" in events, (
         f"ops_events does not contain 'stopped' after SIGTERM.\n" f"events: {events}"
     )
+
+
+def _wait_for_session(db_path: Path, timeout: float = 20.0) -> None:
+    """Wait until record has opened its session row."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if _count_rows(db_path, "sessions") > 0:
+                return
+        except sqlite3.Error:
+            pass
+        time.sleep(0.1)
+    pytest.fail("record did not open a session")
+
+
+@pytest.mark.e2e
+@pytest.mark.skipif(shutil.which("nohup") is None, reason="nohup がない")
+@pytest.mark.parametrize("nohup", [True, False])
+def test_closing_the_terminal_stops_record_unless_started_with_nohup(
+    tmp_path: Path, nohup: bool
+) -> None:
+    """A closing terminal sends SIGHUP; nohup set it to be ignored."""
+    config_path = tmp_path / "config.py"
+    db_path = tmp_path / "data" / "procdiag.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_config(config_path, db_path)
+    record = [_PROCDIAG, "record", "--config", str(config_path), "--db", str(db_path)]
+    proc = subprocess.Popen(
+        ["nohup", *record] if nohup else record,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_session(db_path)
+        time.sleep(1.5)
+        hangup_ts = time.time()
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(2.0)
+        still_running = proc.poll() is None
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    assert still_running is nohup
+    assert proc.returncode == 0, proc.stderr.read() if proc.stderr else ""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        (last_ts,) = conn.execute("SELECT MAX(ts) FROM sys_samples").fetchone()
+        (stops,) = conn.execute(
+            "SELECT COUNT(*) FROM ops_events WHERE kind='stopped'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (last_ts > hangup_ts + 1.0) is nohup
+    assert stops == 1
 
 
 # ---------------------------------------------------------------------------

@@ -307,7 +307,7 @@ def _make_meter(
         throttle_factor=throttle_factor,
         throttle_max_interval=throttle_max_interval,
     )
-    return SelfMeter(cfg)
+    return SelfMeter(cfg, process_interval=10.0)
 
 
 class TestSelfMeter:
@@ -408,7 +408,7 @@ class TestSelfMeter:
 
 class TestSelfMeterWarmup:
     def _meter(self, warmup_sec: float) -> SelfMeter:
-        meter = SelfMeter(BudgetConfig(warmup_sec=warmup_sec))
+        meter = SelfMeter(BudgetConfig(warmup_sec=warmup_sec), process_interval=10.0)
         meter.sample = lambda: (50.0, 1024)  # type: ignore[method-assign]
         return meter
 

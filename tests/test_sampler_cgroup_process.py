@@ -9,7 +9,8 @@ Covers:
 - ProcessSampler with live psutil:
   * Column count matches the proc_samples contract.
   * The current process is captured.
-  * Second collect gives a non-None cpu_pct for the current process.
+  * A PID's first collect gives its CPU since it started; the second one
+    gives psutil's cpu_percent since the first.
   * AccessDenied on io_counters increments io_denied / io_total.
   * PSS is read from a fixture smaps_rollup when the proc_id is in pss_targets.
 - Registry stub: same (name, hash) always resolves to the same proc_id.
@@ -23,6 +24,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psutil
+import pytest
 
 from procdiag.config import ProcdiagConfig
 from procdiag.core import Capability
@@ -87,14 +89,26 @@ def _make_ctx(
 
 
 def _mock_proc(
-    pid: int, *, name: str = "worker", status: str = "sleeping"
+    pid: int,
+    *,
+    name: str = "worker",
+    status: str = "sleeping",
+    cpu_seconds: float = 0.0,
+    age: float = 60.0,
 ) -> MagicMock:
+    """A process that started *age* seconds ago and has used *cpu_seconds* since."""
     m = MagicMock(spec=psutil.Process)
     m.pid = pid
     m.name.return_value = name
     m.cmdline.return_value = [name]
     m.status.return_value = status
     m.cpu_percent.return_value = 0.0
+    m.cpu_times.return_value = MagicMock(user=cpu_seconds, system=0.0)
+    # psutil adds the boot time of /proc/stat (whole seconds) to the start
+    # time since boot.
+    m.create_time.return_value = (
+        psutil.boot_time() + time.clock_gettime(time.CLOCK_BOOTTIME) - age
+    )
     m.memory_info.return_value = MagicMock(rss=0)
     m.num_threads.return_value = 1
     m.num_fds.return_value = 3
@@ -414,20 +428,67 @@ class TestProcessSampler:
             my_pid in pids_in_batch
         ), f"Current process PID {my_pid} not found in proc_samples rows"
 
-    def test_first_collect_cpu_pct_none_for_new_pid(self):
-        """On the first collect, cpu_pct for newly seen PIDs must be None."""
+    def test_first_collect_reports_cpu_since_the_process_started(self):
+        """A PID's first sample has no earlier reading; its whole life is the window."""
         sampler, _ = self._sampler()
-        ctx = _make_ctx()
-        sampler.setup(ctx)
-        batches = sampler.collect(ctx)
-        my_pid = os.getpid()
-        my_rows = [r for r in batches[0].rows if r[2] == my_pid]
-        assert len(my_rows) == 1
+        job = _mock_proc(4242, name="batch-job", cpu_seconds=3.0, age=4.0)
+        job.cpu_percent.return_value = 12.5
+        with (
+            patch("psutil.pids", return_value=[4242]),
+            patch("psutil.Process", return_value=job),
+        ):
+            first = sampler.collect(_make_ctx())[0].rows
+            second = sampler.collect(_make_ctx())[0].rows
         # Column index 3 is cpu_pct.
-        assert my_rows[0][3] is None, (
-            f"cpu_pct should be None on first collect for PID {my_pid}, "
-            f"got {my_rows[0][3]}"
-        )
+        assert first[0][3] == pytest.approx(75.0, abs=1.5)
+        assert second[0][3] == 12.5
+
+    def test_first_collect_leaves_cpu_empty_for_a_process_younger_than_a_second(self):
+        """CPU time and start time are ticks of 10 ms: a few ticks over a few ms is noise."""
+        sampler, _ = self._sampler()
+        blink = _mock_proc(4243, name="blink", cpu_seconds=0.05, age=0.02)
+        job = _mock_proc(4244, name="job", cpu_seconds=1.9, age=2.0)
+        with (
+            patch("psutil.pids", return_value=[4243, 4244]),
+            patch(
+                "psutil.Process", side_effect=lambda pid: {4243: blink, 4244: job}[pid]
+            ),
+        ):
+            rows = {r[2]: r for r in sampler.collect(_make_ctx())[0].rows}
+        assert rows[4243][3] is None
+        assert rows[4244][3] == pytest.approx(95.0, abs=5.0)
+
+    def test_first_collect_leaves_cpu_empty_when_the_start_time_is_in_the_future(self):
+        sampler, _ = self._sampler()
+        job = _mock_proc(4245, name="job", cpu_seconds=1.0, age=-3.0)
+        with (
+            patch("psutil.pids", return_value=[4245]),
+            patch("psutil.Process", return_value=job),
+        ):
+            rows = sampler.collect(_make_ctx())[0].rows
+        assert [r[2] for r in rows] == [4245]
+        assert rows[0][3] is None
+
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("line 'btime' not found in /proc/stat"), OSError("EIO")]
+    )
+    def test_collect_goes_on_when_the_boot_time_cannot_be_read(self, error):
+        """Without the boot time a first cpu_pct cannot be measured; the rows still are."""
+        sampler, _ = self._sampler()
+        job = _mock_proc(4246, name="job", cpu_seconds=3.0, age=4.0)
+        job.cpu_percent.return_value = 12.5
+        ctx = _make_ctx()
+        with (
+            patch("psutil.pids", return_value=[4246]),
+            patch("psutil.Process", return_value=job),
+            patch("psutil.boot_time", side_effect=error),
+        ):
+            first = sampler.run(ctx)
+            second = sampler.run(ctx)
+        assert ctx.notes == []
+        assert [r[2] for r in first[0].rows] == [4246]
+        assert first[0].rows[0][3] is None
+        assert second[0].rows[0][3] == 12.5
 
     def test_second_collect_cpu_pct_non_none(self):
         """On the second collect, cpu_pct for the current process is non-None."""
@@ -533,6 +594,8 @@ class TestProcessSampler:
         mock_proc.name.return_value = "testproc"
         mock_proc.cmdline.return_value = ["testproc"]
         mock_proc.cpu_percent.return_value = 5.0
+        mock_proc.cpu_times.return_value = MagicMock(user=1.0, system=0.0)
+        mock_proc.create_time.return_value = psutil.boot_time()
         mock_proc.memory_info.return_value = MagicMock(rss=1024 * 1024)
         mock_proc.num_threads.return_value = 2
         mock_proc.num_fds.return_value = 5
@@ -557,7 +620,7 @@ class TestProcessSampler:
             sampler._pid_cache = {}
             sampler._prev_io = {}
 
-            # First tick for PID 1234 — establishes baseline; cpu_pct=None.
+            # First tick for PID 1234: registers it and sets the cpu_percent baseline.
             b1 = sampler.collect(ctx)
 
         # Get the proc_id assigned to "testproc".
