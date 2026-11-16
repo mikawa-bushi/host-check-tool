@@ -547,8 +547,7 @@ class Engine:
             f"プラグイン {name} を読み込めなかったため、そのルールは評価していません ({msg})"
             for name, msg in plugin_failures()
         ]
-        extra = self.config.rules.extra_rules
-        for name, ok, msg in load_extra_rules(extra) if extra else ():
+        for name, ok, msg in load_extra_rules(self.config.rules.extra_rules):
             if not ok:
                 reasoning.append(f"追加ルール {name} の読み込みに失敗しました: {msg}")
                 problems.append(
