@@ -36,7 +36,7 @@ from typing import List, Optional
 from . import __version__
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig
 from .output import atomic_output
-from .storage import connect_read_only
+from .storage import connect_read_only, drop_idle_wal_files, wal_files_exist
 
 
 @dataclass
@@ -62,6 +62,7 @@ def copy_db(src: Path, dst: Path, *, keep_cmdline: bool) -> None:
     is writing; switching the copy out of WAL mode folds everything into one
     file so no ``-wal`` / ``-shm`` companions are needed.
     """
+    drop_wal_files = not wal_files_exist(src)
     source = connect_read_only(src)
     target = sqlite3.connect(dst)
     try:
@@ -74,6 +75,8 @@ def copy_db(src: Path, dst: Path, *, keep_cmdline: bool) -> None:
     finally:
         source.close()
         target.close()
+        if drop_wal_files:
+            drop_idle_wal_files(src)
 
 
 def create_bundle(
