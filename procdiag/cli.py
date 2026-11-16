@@ -432,6 +432,7 @@ def _render_html(
     diag: Diagnosis,
     charts: Optional[ChartData],
     meta_hostname: Optional[str],
+    snapshot: Optional[list] = None,
 ) -> str:
     """The self-contained HTML report, as ``check`` and ``quick`` write it."""
     from .report import render_html
@@ -441,6 +442,7 @@ def _render_html(
         charts,
         hostname_label=cfg.report.hostname_label,
         meta_hostname=meta_hostname,
+        snapshot=snapshot,
     )
 
 
@@ -885,7 +887,7 @@ def quick(
     report = out / "report.html"
     try:
         report.write_text(
-            _render_html(cfg, diag, charts, meta_hostname), encoding="utf-8"
+            _render_html(cfg, diag, charts, meta_hostname, items), encoding="utf-8"
         )
     except OSError as exc:
         report_error = (

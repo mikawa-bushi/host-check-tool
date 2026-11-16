@@ -29,7 +29,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import procdiag
 from procdiag.compare import (
@@ -64,6 +64,7 @@ from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
 from procdiag.diagnosis.engine import holes_note
 from procdiag.diagnosis.io_disk import usable_bytes
+from procdiag.snapshot import CRITICAL, INFO, OK, WARNING, SnapshotItem
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -964,6 +965,7 @@ def render_html(
     *,
     hostname_label: str | None = None,
     meta_hostname: str | None = None,
+    snapshot: Sequence[SnapshotItem] | None = None,
 ) -> str:
     """Render a self-contained HTML report.
 
@@ -973,6 +975,9 @@ def render_html(
     3. 時系列チャート — inline SVG charts from ChartData
     4. スパイクイベント一覧 — from ChartData.spikes
     5. 観測品質 — ObservationQuality details
+
+    With *snapshot* (``quick``, which checks the host first) an いまの状態
+    section with those items follows the summary.
 
     No external resources are referenced (no <script src>, no <link href>,
     no http:// / https:// URLs) — requirement from design doc §1.2.
@@ -994,6 +999,7 @@ def render_html(
 <h1>{_esc(title)}</h1>
 <p style="color:#888;font-size:.85rem;">生成日時: {_esc(generated_at)} / procdiag {_esc(procdiag.__version__)} ／ 時刻はすべてホストのローカルタイム</p>
 {_summary_section(diag)}
+{_snapshot_section(snapshot)}
 {_proposal_section(diag)}
 {_charts_section(charts)}
 {_spike_section(charts)}
@@ -1046,6 +1052,36 @@ def _summary_section(diag: Diagnosis) -> str:
 {_coverage_html(diag)}<table>
   <thead><tr><th></th><th>ルールID</th><th>対象</th><th>サマリ</th><th>確信度</th></tr></thead>
   <tbody>{finding_rows}</tbody>
+</table>
+"""
+
+
+_SNAPSHOT_BADGE = {
+    CRITICAL: ("badge-crit", "重大"),
+    WARNING: ("badge-warn", "警告"),
+    INFO: ("badge-info", "参考"),
+    OK: ("badge-ok", "正常"),
+}
+
+
+def _snapshot_section(items: Sequence[SnapshotItem] | None) -> str:
+    """いまの状態: the snapshot ``quick`` took before it recorded, one row per item."""
+    if items is None:
+        return ""
+    rows = "".join(
+        f'<tr><td><span class="{_SNAPSHOT_BADGE[i.status][0]}">'
+        f"{_SNAPSHOT_BADGE[i.status][1]}</span></td>"
+        f"<td>{_esc(i.category)}</td><td>{_esc(i.label)}</td>"
+        f"<td>{_esc(i.detail)}</td><td>{_esc(i.hint)}</td></tr>"
+        for i in items
+    )
+    count = {s: sum(1 for i in items if i.status == s) for s in (CRITICAL, WARNING)}
+    return f"""
+<h2>いまの状態 (snapshot)</h2>
+<p>記録を始める前に確認した、いまのホストの状態です。重大 {count[CRITICAL]} 件 / 警告 {count[WARNING]} 件。</p>
+<table>
+  <thead><tr><th></th><th>分類</th><th>項目</th><th>状態</th><th>対処</th></tr></thead>
+  <tbody>{rows}</tbody>
 </table>
 """
 
