@@ -516,7 +516,18 @@ _REMOVED_COMMANDS = {
 }
 
 
-class _ProcdiagGroup(click.Group):
+class _HelpGroup(click.Group):
+    # A bare group (``procdiag``, ``procdiag service``) shows the help and
+    # succeeds.  click 8.1 does that; click 8.2 and later treat it as a usage
+    # error, which would be 4 here.
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not args and not ctx.resilient_parsing:
+            click.echo(ctx.get_help(), color=ctx.color)
+            ctx.exit(0)
+        return super().parse_args(ctx, args)
+
+
+class _ProcdiagGroup(_HelpGroup):
     # A mistake on the command line is a precondition error (4), not click's 2:
     # check and compare document 2 as "info only", so a wrapper would read a
     # mistyped option as a pass.
@@ -526,14 +537,6 @@ class _ProcdiagGroup(click.Group):
         except click.UsageError as exc:
             exc.exit_code = _EXIT_USAGE
             raise
-
-    # Bare ``procdiag`` shows the help and succeeds.  click 8.1 does that; click
-    # 8.2 and later treat it as a usage error, which would be 4 here.
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        if not args and not ctx.resilient_parsing:
-            click.echo(ctx.get_help(), color=ctx.color)
-            ctx.exit(0)
-        return super().parse_args(ctx, args)
 
     def invoke(self, ctx: click.Context) -> Any:
         try:
@@ -1427,7 +1430,7 @@ _unit_duration_option = click.option(
 )
 
 
-@cli.group()
+@cli.group(cls=_HelpGroup)
 def service() -> None:
     """systemd ユニットファイルの生成と配置を行います。"""
 
