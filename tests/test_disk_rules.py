@@ -1226,3 +1226,132 @@ class TestSnapshotThresholds:
         (item,) = snap._check_disks(config)
 
         assert item.status == "warning"
+
+
+class TestPercentNeverShownAcrossAThreshold:
+    @staticmethod
+    def _filled(tmp_path, *, used_pct: float, inode_pct: float | None = None):
+        inode_pct = used_pct if inode_pct is None else inode_pct
+        store, start = _recording(tmp_path, 2)
+        total = 100 * _GiB
+        used = int(total * used_pct / 100)
+        _disk(
+            store,
+            _flat(
+                start,
+                120,
+                mountpoint="/",
+                total=total,
+                used=used,
+                avail=total - used,
+                inodes_total=1_000_000,
+                inodes_used=int(1_000_000 * inode_pct / 100),
+                read_only=0,
+            ),
+        )
+        return store
+
+    def test_a_disk_at_94_96_percent_is_a_warning_that_does_not_read_95_0(
+        self, tmp_path
+    ):
+        store = self._filled(tmp_path, used_pct=94.96)
+        diag = _run(store, "DISK-FULL-01")
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.severity is Severity.WARNING
+        assert "95.0%" not in f.summary and "94.9%" in f.summary
+        assert f.evidence["used_pct"] == 94.9
+        assert "使用率 94.9%" in f.proposal
+
+    def test_a_disk_at_exactly_95_percent_is_critical_and_reads_95_0(self, tmp_path):
+        store = self._filled(tmp_path, used_pct=95.0)
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+        assert f.severity is Severity.CRITICAL
+        assert "95.0%" in f.summary and f.evidence["used_pct"] == 95.0
+
+    def test_inodes_at_94_96_percent_do_not_read_95_0(self, tmp_path):
+        store = self._filled(tmp_path, used_pct=94.96)
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+        assert f.severity is Severity.WARNING
+        assert "95.0%" not in f.summary and "94.9%" in f.summary
+        assert f.evidence["used_pct"] == 94.9
+
+    @pytest.mark.parametrize(
+        "bytes_pct, shown", [(94.96, "94.9"), (89.96, "89.9"), (95.0, "95.0")]
+    )
+    def test_the_byte_usage_beside_an_inode_finding_is_cut_the_same_way(
+        self, tmp_path, bytes_pct, shown
+    ):
+        store = self._filled(tmp_path, used_pct=bytes_pct, inode_pct=97.0)
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+        assert f.evidence["bytes_used_pct"] == float(shown)
+        assert f"(容量の使用率は {shown}%)" in f.proposal
+
+    def test_the_byte_usage_that_does_not_reach_a_level_is_still_rounded(
+        self, tmp_path
+    ):
+        store = self._filled(tmp_path, used_pct=61.26, inode_pct=97.0)
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+        assert "(容量の使用率は 61.3%)" in f.proposal
+
+
+class TestUnjudgedPartsAreInTheVerdict:
+    @staticmethod
+    def _cut_short_scans(tmp_path):
+        store, start = _recording(tmp_path, 24)
+        _dirs(
+            store,
+            [(start + h * _HOUR, "/srv/steady", 5 * _GiB, 0) for h in range(25)]
+            + [
+                (start + h * _HOUR, "/srv/archive", (20 + 2 * h) * _GiB, 1)
+                for h in range(25)
+            ],
+        )
+        return store
+
+    @staticmethod
+    def _screen(db, *args):
+        result = CliRunner().invoke(
+            cli, ["check", "--db", str(db), "--only", "DISK-GROWTH-01", *args]
+        )
+        assert result.exit_code in (0, 1, 2), result.output
+        return result.output
+
+    def test_the_engine_names_the_rule_that_left_a_part_unjudged(self, tmp_path):
+        diag = _run(self._cut_short_scans(tmp_path), "DISK-GROWTH-01")
+        assert diag.evaluated_rules == ["DISK-GROWTH-01"]
+        assert diag.fully_evaluated is False
+        assert list(diag.unjudged_parts) == ["DISK-GROWTH-01"]
+        assert "/srv/archive" in " ".join(diag.unjudged_parts["DISK-GROWTH-01"])
+
+    def test_check_text_does_not_call_it_a_plain_no_problem(self, tmp_path):
+        store = self._cut_short_scans(tmp_path)
+        store.close()
+        lines = [line for line in self._screen(store.path).splitlines() if line.strip()]
+        verdict = next(line for line in lines if line.startswith("診断:"))
+        assert verdict.startswith("診断: 評価できた範囲では")
+        coverage = next(line for line in lines if line.startswith("⚠ 評価範囲"))
+        assert "一部を判定できていない 1 件" in coverage
+        assert "DISK-GROWTH-01" in coverage
+
+    def test_check_json_and_html_say_so_too(self, tmp_path):
+        store = self._cut_short_scans(tmp_path)
+        store.close()
+        data = json.loads(self._screen(store.path, "--format", "json"))
+        assert data["unjudged_rules"] == ["DISK-GROWTH-01"]
+        html = self._screen(store.path, "--format", "html")
+        assert "問題なし (一部未評価)" in html
+
+    def test_a_directory_with_two_complete_scans_leaves_nothing_unjudged(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 24)
+        _dirs(
+            store,
+            [
+                (start + h * _HOUR, "/srv/grow", (1 + h // 4) * _GiB, 0)
+                for h in range(25)
+            ],
+        )
+        diag = _run(store, "DISK-GROWTH-01")
+        assert diag.unjudged_parts == {}
+        assert diag.fully_evaluated is True

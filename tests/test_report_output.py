@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
+from shellrun import SHELLS
 from synth import (
     add_disk_series,
     add_proc_series,
@@ -32,7 +34,7 @@ from synth import (
 from procdiag import snapshot as snap
 from procdiag.cli import cli
 from procdiag.config import ProcdiagConfig
-from procdiag.core import Diagnosis, Finding, Severity
+from procdiag.core import Diagnosis, Finding, Severity, Window
 from procdiag.core.result import Confidence
 from procdiag.diagnosis import Engine
 from procdiag.report import (
@@ -227,6 +229,27 @@ def _commands(diag: Diagnosis) -> list[str]:
     return cmds
 
 
+PASTED_NAMES = [
+    "x'; touch $MARK; #`",
+    "my`app",
+    "a'b",
+    "`touch x`",
+    "$(touch x)",
+    "'$(reboot)'`",
+]
+
+
+@pytest.fixture(scope="module")
+def pasted_pgreps(tmp_path_factory):
+    """Name -> the pgrep command the proposal tells the operator to paste."""
+    commands = {}
+    for i, name in enumerate(PASTED_NAMES):
+        db = _leak_db(tmp_path_factory.mktemp(f"pasted{i}"), name)
+        diag = _diagnose(db, only=["MEM-LEAK-01"])
+        (commands[name],) = [c for c in _commands(diag) if c.startswith("pgrep")]
+    return commands
+
+
 @pytest.fixture(scope="module")
 def evil(tmp_path_factory):
     db = _leak_db(tmp_path_factory.mktemp("evil"), EVIL_NAME, mount=SPACED_MOUNT)
@@ -266,6 +289,42 @@ class TestQuotedCommands:
         for cmd in pgreps:
             argv = shlex.split(cmd)
             assert argv[-2:] == ["--", "-rf"]
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    def test_a_backtick_in_a_name_does_not_cut_the_command_span(self, tmp_path):
+        name = "my`app"
+        diag = _diagnose(_leak_db(tmp_path, name), only=["MEM-LEAK-01"])
+        (pgrep,) = [c for c in _commands(diag) if c.startswith("pgrep")]
+        quoted = pgrep.split(" -- ", 1)[1]
+        shown = subprocess.run(
+            ["bash", "-c", f"printf %s {quoted}"], capture_output=True, text=True
+        )
+        assert shown.stdout == name
+
+    def test_a_name_cannot_forge_a_command_span(self, tmp_path):
+        name = "x` `sudo reboot` `y"
+        diag = _diagnose(_leak_db(tmp_path, name), only=["MEM-LEAK-01"])
+        assert not [c for c in _commands(diag) if c.startswith("sudo reboot")]
+        (finding,) = diag.findings
+        assert finding.proposal.count("`") % 2 == 0
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("name", PASTED_NAMES, ids=repr)
+    def test_the_pasted_pgrep_runs_once_on_the_name(
+        self, pasted_pgreps, stubs, shell, name
+    ):
+        pasted = stubs.paste(shell, pasted_pgreps[name])
+        assert pasted.stderr == ""
+        assert pasted.calls == [("pgrep", ["-a", "--", name])]
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_a_name_with_a_line_break_still_runs_once(self, tmp_path, stubs, shell):
+        name = "x\n'; touch $MARK; reboot #`"
+        diag = _diagnose(_leak_db(tmp_path, name), only=["MEM-LEAK-01"])
+        (pgrep,) = [c for c in _commands(diag) if c.startswith("pgrep")]
+        pasted = stubs.paste(shell, pgrep)
+        assert [c for c, _ in pasted.calls] == ["pgrep"]
+        assert len(pasted.calls[0][1]) == 3
 
     def test_html_report_carries_the_quoted_command_too(self, tmp_path):
         db = _leak_db(tmp_path, EVIL_NAME)
@@ -641,3 +700,162 @@ class TestSnapshotNonUtf8:
         assert b"UnicodeEncodeError" not in run.stderr, run.stderr.decode()
         assert (out / "report.html").exists()
         assert "[3/3]".encode() in run.stdout
+
+
+# ---------------------------------------------------------------------------
+# --verbose reasoning, own colour codes, inert proposals
+# ---------------------------------------------------------------------------
+
+LINE_BREAKS = ["\n", "\r", "\x0b", "\x0c", "\x1c", "\x85", " ", " "]
+
+
+def _forged_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.lstrip().startswith(FORGED)]
+
+
+class TestVerboseReasoning:
+    @pytest.mark.parametrize("sep", LINE_BREAKS, ids=lambda s: f"U+{ord(s):04X}")
+    def test_check_reasoning_keeps_a_host_name_on_one_line(self, tmp_path, sep):
+        db = _leak_db(tmp_path, f"myapp{sep}{FORGED}")
+        out = _invoke(
+            "check", "--db", db, "--only", "MEM-LEAK-01", "--verbose", "--no-color"
+        ).output
+        assert "推論過程:" in out
+        assert _forged_lines(out) == []
+
+    def test_a_rule_that_crashed_shows_the_traceback_from_its_first_line(
+        self, tmp_path, monkeypatch
+    ):
+        from procdiag.diagnosis.memory import MemLeakRule
+
+        def boom(self, store, window):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(MemLeakRule, "assess", boom, raising=False)
+        monkeypatch.setattr(MemLeakRule, "evaluate", boom, raising=False)
+        db = _leak_db(tmp_path, "myapp")
+        out = _invoke(
+            "check", "--db", db, "--only", "MEM-LEAK-01", "--verbose", "--no-color"
+        ).output
+        lines = [line.strip() for line in out.splitlines()]
+        start = lines.index("Traceback (most recent call last):")
+        assert 'File "' in out and "boom" in out
+        assert any(line.startswith("RuntimeError: boom") for line in lines[start:])
+
+    def test_compare_reasoning_keeps_a_host_name_on_one_line(self, tmp_path):
+        store = make_db(tmp_path, hours=48)
+        now = time.time()
+        at = now - 24 * _HOUR
+        add_sys_baseline(store, hours=48, start_ts=now - 48 * _HOUR)
+        for rss, slope, t0 in ((200, 38, now - 48 * _HOUR), (300, 0.2, at)):
+            add_proc_series(
+                store,
+                f"myapp\n{FORGED}",
+                rss_start=rss * _MB,
+                rss_slope_per_h=slope * _MB,
+                hours=24,
+                start_ts=t0,
+            )
+        store.close()
+        iso = datetime.fromtimestamp(at).strftime("%Y-%m-%dT%H:%M:%S")
+        out = _invoke(
+            "compare", "--db", store.path, "--at", iso, "--no-color", "--verbose"
+        ).output
+        assert "推論過程 (修正前):" in out
+        assert _forged_lines(out) == []
+
+
+class TestOwnColourCodes:
+    GREEN = "\x1b[32m"
+
+    def _finding(self, subject: str) -> Finding:
+        return Finding(
+            rule_id="MEM-LEAK-01",
+            severity=Severity.WARNING,
+            subject=subject,
+            summary="s",
+            evidence={},
+            detected_at=(1.0, 2.0),
+            confidence=Confidence.HIGH,
+        )
+
+    def test_a_colour_code_inside_host_text_is_shown_not_obeyed(self):
+        diag = Diagnosis(
+            findings=[self._finding(f"app{self.GREEN}green")], healthy=False
+        )
+        out = render_terminal(diag, color=True)
+        assert self.GREEN not in out
+        assert "\\x1b[32mgreen" in out
+        assert "\x1b[33m" in out
+
+    def test_a_name_that_imitates_the_marking_is_shown_not_obeyed(self):
+        imitation = f"\x00{self.GREEN}\x00"
+        diag = Diagnosis(findings=[self._finding(f"app{imitation}x")], healthy=False)
+        out = render_terminal(diag, color=True)
+        assert self.GREEN not in out
+        assert "\x00" not in out
+        assert "app\\x00\\x1b[32m\\x00x" in out
+
+    def test_a_comparison_does_not_obey_a_colour_code_inside_host_text(self):
+        from procdiag.compare import (
+            Comparison,
+            ComparisonRow,
+            Detected,
+            Evaluated,
+            Period,
+            Side,
+            SideName,
+            Unknown,
+            Why,
+        )
+        from procdiag.report import render_comparison_terminal
+
+        finding = self._finding(f"app{self.GREEN}green")
+
+        def side(name):
+            return Side(
+                name,
+                Path("x.db"),
+                "h",
+                "6",
+                "{}",
+                Period(None, None),
+                Evaluated(
+                    Window(0.0, 3600.0), 1.0, Diagnosis(findings=[], healthy=True)
+                ),
+            )
+
+        row = ComparisonRow(
+            rule_id="MEM-LEAK-01",
+            title="t",
+            subject=f"app{self.GREEN}green",
+            identity=None,
+            headline=None,
+            threshold=None,
+            before=Unknown(Why.TOO_SHORT, "d"),
+            after=Detected(Severity.WARNING, 1, None, finding),
+        )
+        cmp = Comparison(side(SideName.BEFORE), side(SideName.AFTER), (row,), ())
+        out = render_comparison_terminal(cmp, color=True)
+        assert self.GREEN not in out
+        assert "\\x1b[32mgreen" in out
+
+
+class TestNoDataJson:
+    def test_a_db_without_samples_lists_no_rule_as_evaluated(self, tmp_path):
+        db = tmp_path / "empty.db"
+        Storage(db).close()
+        data = json.loads(_invoke("check", "--db", db, "--format", "json").output)
+        assert data["no_data"] is True
+        assert data["evaluated_rules"] == []
+
+
+class TestProposalsAreInert:
+    def test_a_library_caller_gets_proposals_without_control_characters(self, tmp_path):
+        diag = _diagnose(_leak_db(tmp_path, PAYLOAD), only=["MEM-LEAK-01"])
+        (finding,) = diag.findings
+        assert "\x1b" not in finding.proposal and "\x07" not in finding.proposal
+        assert "\\x1b[2J" in finding.proposal
+        assert not any(
+            line.startswith(FORGED) for line in finding.proposal.splitlines()
+        )

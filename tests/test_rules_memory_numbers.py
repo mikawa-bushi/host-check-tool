@@ -1118,6 +1118,24 @@ class TestMemPressureNeedsObservedDays:
         )
         store.close()
 
+    def test_a_wait_of_two_minutes_is_never_shown_as_zero_hours(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 24 * 60 + 6 * 60 - 2
+        _pressure_recording(store, _local_midnight_jst(), minutes, pressure={})
+
+        diag = Engine(ProcdiagConfig()).run(store, only=["MEM-PRESSURE-01"])
+
+        (skipped,) = diag.skipped_rules
+        assert skipped.rule_id == "MEM-PRESSURE-01"
+        assert skipped.remaining_hours == 0.1
+        assert any(
+            "MEM-PRESSURE-01" in step and "あと 0.1h" in step for step in diag.reasoning
+        )
+        store.close()
+
     def test_pressure_in_the_edge_sliver_is_enough_to_evaluate(
         self, tmp_path, local_tz
     ):

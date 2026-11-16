@@ -424,3 +424,212 @@ class TestUsageErrors:
         result = _run("--db", tmp_path / "nope.db", "--at", "2026-10-28")
         assert result.exit_code == 4
         assert "DB ファイルが見つかりません" in result.stderr
+
+
+def _clean_db(directory, *, hours: float):
+    directory.mkdir(parents=True, exist_ok=True)
+    store = make_db(directory, hours=hours)
+    add_sys_baseline(store, hours=hours, start_ts=time.time() - hours * _HOUR)
+    store.close()
+    return store.path
+
+
+class TestNothingJudged:
+    def test_two_recordings_too_short_for_the_rules_are_not_called_clean(
+        self, tmp_path
+    ):
+        before = _clean_db(tmp_path / "a", hours=2)
+        after = _clean_db(tmp_path / "b", hours=2)
+        result = _run(before, after)
+        assert result.exit_code == 3, result.output
+        conclusion = result.stdout.split("結果:")[1]
+        assert "問題は検出されませんでした" not in conclusion
+        assert "判定できません" in conclusion
+        assert "記録を続けてから比べ直してください" in conclusion
+
+    def test_the_conclusion_says_how_many_more_hours_to_record(self, tmp_path):
+        before = _clean_db(tmp_path / "a", hours=2)
+        after = _clean_db(tmp_path / "b", hours=2)
+        result = _run(before, after)
+        conclusion = result.stdout.split("結果:")[1]
+        assert "あと最長 22.0 時間" in conclusion
+        assert "記録を続けてから比べ直してください" in conclusion
+
+    def test_with_only_a_6_hour_rule_the_conclusion_names_its_wait(self, tmp_path):
+        before = _clean_db(tmp_path / "a", hours=2)
+        after = _clean_db(tmp_path / "b", hours=2)
+        result = _run(before, after, "--only", "MEM-LEAK-01")
+        conclusion = result.stdout.split("結果:")[1]
+        assert "あと最長 4.0 時間" in conclusion
+
+    def test_json_names_the_rules_neither_period_could_run(self, tmp_path):
+        before = _clean_db(tmp_path / "a", hours=2)
+        after = _clean_db(tmp_path / "b", hours=2)
+        data = json.loads(_run(before, after, "--format", "json").stdout)
+        (note,) = [n for n in data["notes"] if n["kind"] == "not_comparable"]
+        assert {"MEM-LEAK-01", "MEM-PRESSURE-01"} <= set(note["detail"]["rules"])
+        assert data["rows"] == []
+
+    def test_a_rule_that_could_run_on_one_side_keeps_the_scoped_wording(self, tmp_path):
+        before = _clean_db(tmp_path / "a", hours=30)
+        after = _clean_db(tmp_path / "b", hours=2)
+        result = _run(before, after, "--skip", "MEM-PRESSURE-01")
+        assert result.exit_code == 0, result.output
+        assert "評価できた範囲では、どちらの期間にも問題は検出されませんでした" in (
+            result.stdout
+        )
+
+    def test_a_resolved_problem_is_still_reported_when_other_rules_wait(self, tmp_path):
+        db, at = _recording(tmp_path, before_h=12, after_h=12)
+        result = _run("--db", db, "--at", _iso(at))
+        assert result.exit_code == 0, result.output
+        assert "✔ 解消" in result.stdout
+        assert "修正前に検出された問題はすべて解消しました" in result.stdout
+
+
+class TestOutputOption:
+    def test_compare_takes_the_same_short_option_as_check(self, story, tmp_path):
+        db, at = story
+        out = tmp_path / "cmp.txt"
+        result = _run("--db", db, "--at", _iso(at), "-o", out)
+        assert result.exit_code == 0, result.output
+        assert "[MEM-LEAK-01]" in out.read_text(encoding="utf-8")
+        assert "比較結果を書き出しました" in result.stdout
+
+    def test_a_json_file_name_gets_json(self, story, tmp_path):
+        db, at = story
+        out = tmp_path / "cmp.json"
+        result = _run("--db", db, "--at", _iso(at), "-o", out)
+        assert result.exit_code == 0, result.output
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["format"] == "procdiag-compare/1"
+
+    def test_the_extension_is_read_in_any_case(self, story, tmp_path):
+        db, at = story
+        out = tmp_path / "CMP.JSON"
+        _run("--db", db, "--at", _iso(at), "-o", out)
+        assert json.loads(out.read_text(encoding="utf-8"))["rows"]
+
+    def test_an_explicit_format_wins_over_the_extension(self, story, tmp_path):
+        db, at = story
+        out = tmp_path / "cmp.json"
+        _run("--db", db, "--at", _iso(at), "--format", "text", "-o", out)
+        assert "結果:" in out.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("name", ["cmp.txt", "cmp.html", "cmp"])
+    def test_any_other_file_name_gets_text(self, story, tmp_path, name):
+        db, at = story
+        out = tmp_path / name
+        _run("--db", db, "--at", _iso(at), "-o", out)
+        assert "結果:" in out.read_text(encoding="utf-8")
+
+    def test_help_lists_the_short_option_and_every_exit_code_meaning(self):
+        text = CliRunner().invoke(cli, ["compare", "--help"]).output
+        assert "-o, --output" in text
+        flat = "".join(text.split())
+        for phrase in ("変化なし", "悪化", "改善(しきい値以上)"):
+            assert phrase in flat
+
+
+class TestWhatToDoAboutAnUnjudgedRow:
+    def test_a_name_paired_row_is_not_told_to_keep_recording(self, tmp_path):
+        db, at = _python3_procs(
+            tmp_path,
+            {
+                "python3 /opt/collector.py": (20.0, None),
+                "python3 /opt/report_tool.py": (None, 0.0),
+            },
+        )
+        args = ["--db", db, "--at", _iso(at), "--only", "MEM-LEAK-01"]
+        result = _run(*args)
+        assert result.exit_code == 3, result.output
+        conclusion = result.stdout.split("結果:")[1]
+        assert "記録を続けても判定できません" in conclusion
+        assert "記録を続けてから比べ直してください" not in conclusion
+        (row,) = json.loads(_run(*args, "--format", "json").stdout)["rows"]
+        assert row["identity"] == "python3 /opt/collector.py"
+        assert row["after_identity"] == "python3 /opt/report_tool.py"
+
+    def test_a_row_cut_short_by_the_recording_is_still_told_to_keep_recording(
+        self, tmp_path
+    ):
+        db, at = _recording(tmp_path, before_h=24, after_h=3)
+        result = _run("--db", db, "--at", _iso(at))
+        assert result.exit_code == 3, result.output
+        conclusion = result.stdout.split("結果:")[1]
+        assert "記録を続けてから比べ直してください" in conclusion
+        assert "記録を続けても判定できません" not in conclusion
+
+    def test_a_reason_that_recording_cannot_cure_has_no_dangling_other_clause(
+        self, tmp_path
+    ):
+        db, at = _recording(tmp_path, before_h=30, after_h=30)
+        con = sqlite3.connect(db)
+        con.execute("DELETE FROM proc_rollup_1m WHERE ts_min >= ?", (at,))
+        con.commit()
+        con.close()
+        args = ["--db", db, "--at", _iso(at), "--only", "MEM-LEAK-01"]
+        result = _run(*args)
+        assert result.exit_code == 3, result.output
+        conclusion = result.stdout.split("結果:")[1]
+        assert "判定できない検出があります。" in conclusion
+        assert "それ以外は" not in conclusion
+        assert "理由を行ごとに示しています" in conclusion
+        (row,) = json.loads(_run(*args, "--format", "json").stdout)["rows"]
+        assert row["why"] == "not_recorded"
+
+    def test_a_short_after_db_can_also_be_matched_by_trimming_before(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 1 * _HOUR
+        before = _intermittent_faults(
+            tmp_path / "a", hours=24, start=at - 24 * _HOUR, at=at
+        )
+        after = _clean_db(tmp_path / "b", hours=1)
+        result = _run(before, after)
+        rows = _rows_section(result.stdout)
+        assert "--before" in rows
+        assert "あと" in rows
+
+    def test_explicit_periods_can_also_be_matched_by_trimming_before(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 1 * _HOUR
+        db = _intermittent_faults(tmp_path, hours=25, start=at - 24 * _HOUR, at=at)
+        before = f"{_iso(at - 24 * _HOUR)}..{_iso(at)}"
+        result = _run("--db", db, "--before", before, "--after", f"{_iso(at)}..")
+        rows = _rows_section(result.stdout)
+        assert "修正後の期間 1.0 時間は修正前の 24.0 時間より短い" in rows
+        assert "--before" in rows
+
+    def test_with_at_the_before_period_is_not_offered_as_a_way_out(self, tmp_path):
+        now = time.time() // 60 * 60
+        at = now - 1 * _HOUR
+        db = _intermittent_faults(tmp_path, hours=25, start=at - 24 * _HOUR, at=at)
+        result = _run("--db", db, "--at", _iso(at))
+        assert result.exit_code == 3, result.output
+        rows = _rows_section(result.stdout)
+        assert "修正後の期間 1.0 時間は修正前の 24.0 時間より短い" in rows
+        assert "あと 23.0 時間記録" in rows
+        assert "--before" not in result.stdout
+        data = json.loads(_run("--db", db, "--at", _iso(at), "--format", "json").stdout)
+        details = [
+            side["detail"]
+            for row in data["rows"]
+            for side in (row["before"], row["after"])
+            if side["state"] == "unknown"
+        ]
+        assert details and not [d for d in details if "--before" in d]
+
+
+class TestBeforePeriodLength:
+    def test_the_before_period_is_as_long_as_the_hours_recorded_after(self, tmp_path):
+        now = time.time() // 60 * 60
+        start = now - 160 * _HOUR
+        at = start + 100 * _HOUR
+        store = make_db(tmp_path, hours=160)
+        add_sys_baseline(store, hours=110, start_ts=start)
+        add_sys_baseline(store, hours=30, start_ts=start + 130 * _HOUR)
+        db = store.path
+        store.close()
+        data = json.loads(_run("--db", db, "--at", _iso(at), "--format", "json").stdout)
+        assert data["after"]["span_hours"] == pytest.approx(40.0, abs=0.1)
+        assert data["before"]["span_hours"] == pytest.approx(40.0, abs=0.1)

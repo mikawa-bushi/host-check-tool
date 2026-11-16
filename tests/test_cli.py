@@ -902,6 +902,82 @@ class TestQuickRun:
         report = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
         assert report.startswith("<!doctype html>")
 
+    @staticmethod
+    def _stub_snapshot(monkeypatch, items):
+        from procdiag import snapshot
+
+        monkeypatch.setattr(snapshot, "run_snapshot", lambda cfg: items)
+        return snapshot
+
+    def test_html_report_holds_the_snapshot_section(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag import snapshot
+
+        monkeypatch.chdir(tmp_path)
+        self._stub_snapshot(
+            monkeypatch,
+            [
+                snapshot.SnapshotItem(
+                    "プロセス",
+                    "zombies",
+                    "ゾンビプロセス",
+                    snapshot.WARNING,
+                    "55 個 <b>x</b>",
+                    "親プロセスを確認してください",
+                ),
+                snapshot.SnapshotItem(
+                    "メモリ", "memory", "メモリ空き", snapshot.OK, "42% 空き"
+                ),
+            ],
+        )
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        assert result.exit_code == 1, result.output
+        html = (tmp_path / "q" / "report.html").read_text(encoding="utf-8")
+        assert "いまの状態" in html
+        for text in ("ゾンビプロセス", "親プロセスを確認してください", "メモリ空き"):
+            assert text in html
+        assert "55 個 &lt;b&gt;x&lt;/b&gt;" in html
+        assert "<b>x</b>" not in html
+
+    def test_check_report_has_no_snapshot_section(self, runner, tmp_path):
+        db = tmp_path / "c.db"
+        from synth import add_sys_baseline
+
+        with Storage(db) as store:
+            add_sys_baseline(store, hours=1.0)
+        out = tmp_path / "r.html"
+        runner.invoke(cli, ["check", "--db", str(db), "-o", str(out)])
+        assert "いまの状態" not in out.read_text(encoding="utf-8")
+
+    def test_the_repeated_problem_list_cannot_inject_control_characters(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from procdiag import snapshot
+
+        monkeypatch.chdir(tmp_path)
+        self._stub_snapshot(
+            monkeypatch,
+            [
+                snapshot.SnapshotItem(
+                    "プロセス",
+                    "zombies",
+                    "名前\x1b[2J",
+                    snapshot.WARNING,
+                    "細部\x1b]0;x\x07",
+                    "対処\x1b[H",
+                )
+            ],
+        )
+        result = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", "q", "--no-color"]
+        )
+        after_diagnosis = result.output.split("[3/3]", 1)[1]
+        assert "\x1b" not in after_diagnosis and "\x07" not in after_diagnosis
+        assert "\\x1b[2J" in after_diagnosis
+
     def test_diagnosis_is_still_shown_when_the_report_cannot_be_written(
         self, runner, tmp_path, monkeypatch
     ):

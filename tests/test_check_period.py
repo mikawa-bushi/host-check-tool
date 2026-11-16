@@ -96,6 +96,58 @@ class TestChosenPeriod:
         assert result.exit_code == 3, result.output
         assert "記録がありません" in result.output
 
+    @pytest.mark.parametrize("suffix", [".json", ".html", ".txt"])
+    def test_a_period_without_records_still_writes_the_report(
+        self, recording, tmp_path, suffix
+    ):
+        db, _ = recording
+        out = tmp_path / f"report{suffix}"
+        out.write_text("yesterday's report")
+        result = CliRunner().invoke(
+            cli,
+            [
+                "check",
+                "--db",
+                str(db),
+                "--since",
+                _iso(time.time() + _HOUR),
+                "-o",
+                str(out),
+            ],
+        )
+        assert result.exit_code == 3, result.output
+        text = out.read_text(encoding="utf-8")
+        assert "yesterday" not in text
+        if suffix == ".json":
+            report = json.loads(text)
+            assert report["no_data"] is True
+            assert report["healthy"] is False
+            assert report["window"] is None
+            assert any(
+                "指定した期間に記録がありません" in n
+                for n in report["quality"]["notes"]
+            )
+        else:
+            assert "観測データがありません" in text
+            assert "指定した期間に記録がありません" in text
+
+    def test_a_period_without_records_prints_json_on_stdout(self, recording):
+        db, _ = recording
+        result = CliRunner().invoke(
+            cli,
+            [
+                "check",
+                "--db",
+                str(db),
+                "--since",
+                _iso(time.time() + _HOUR),
+                "--format",
+                "json",
+            ],
+        )
+        assert result.exit_code == 3, result.output
+        assert json.loads(result.stdout)["no_data"] is True
+
     def test_an_unreadable_time_exits_4(self, recording):
         db, _ = recording
         result = CliRunner().invoke(cli, ["check", "--db", str(db), "--since", "昨日"])
@@ -156,6 +208,20 @@ class TestPeriodLength:
         report = _check_json(db, "--since", _iso(start), "--until", _iso(until))
         assert "MEM-LEAK-01" in _skipped(report)
 
+    @pytest.mark.parametrize("minutes_short", [2.4, 2.9])
+    def test_a_wait_of_a_few_minutes_is_never_shown_as_zero_hours(
+        self, leaking_recording, minutes_short
+    ):
+        db, start = leaking_recording
+        until = start + 6 * _HOUR - minutes_short * 60
+        args = ["--since", _iso(start), "--until", _iso(until)]
+        report = _check_json(db, *args)
+        waits = [r["remaining_hours"] for r in report["skipped_rules"]]
+        assert waits and all(w >= 0.1 for w in waits)
+        screen = _check(db, *args, "--no-color").output
+        assert "あと 0.0h" not in screen and "あと 0.0 時間" not in screen
+        assert "MEM-LEAK-01 (あと 0.1h)" in screen
+
 
 def test_an_empty_db_has_no_window(tmp_path):
     store = make_db(tmp_path, hours=1)
@@ -165,3 +231,27 @@ def test_an_empty_db_has_no_window(tmp_path):
     )
     assert result.exit_code == 3
     assert json.loads(result.stdout)["window"] is None
+
+
+@pytest.fixture()
+def holey_recording(tmp_path):
+    """57 h from first to last row: 12 h and 15 h recorded, raw only for 21 h of it."""
+    now = time.time()
+    start = now - 57 * _HOUR
+    store = make_db(tmp_path, hours=57)
+    add_sys_baseline(store, hours=12, start_ts=start)
+    add_sys_baseline(store, hours=15, start_ts=start + 42 * _HOUR)
+    store.conn.execute("DELETE FROM sys_samples WHERE ts < ?", (start + 6 * _HOUR,))
+    store.conn.commit()
+    store.close()
+    return store.path
+
+
+class TestPeriodNotesCountRecordedHours:
+    def test_the_raw_data_note_does_not_count_the_gap_as_raw_data(
+        self, holey_recording
+    ):
+        report = _check_json(holey_recording, "--since", "2020-01-01")
+        assert report["quality"]["span_hours"] == pytest.approx(27.0, abs=0.1)
+        (note,) = [n for n in report["quality"]["notes"] if "生データがあるのは" in n]
+        assert "期間 27.0 時間のうち生データがあるのは 21.0 時間です" in note

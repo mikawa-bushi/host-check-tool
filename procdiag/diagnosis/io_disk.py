@@ -121,6 +121,7 @@ class DiskFullRule(Rule):
             if capacity <= 0:
                 continue
             used_pct = used / capacity * 100.0
+            shown_pct = _shown_pct(used_pct, self.warning_pct, self.critical_pct)
             writable = not _column(last, "read_only")
             forecast, hours = _forecast(
                 mrows, window, "used", capacity, self.min_trend_hours
@@ -140,7 +141,7 @@ class DiskFullRule(Rule):
                 "mountpoint": mountpoint,
                 "days_left": forecast.days_left if forecast else None,
                 "daily_growth_bytes": forecast.per_day if forecast else None,
-                "used_pct": round(used_pct, 1),
+                "used_pct": shown_pct,
                 "used_bytes": used,
                 "avail_bytes": free,
                 "total_bytes": total,
@@ -155,7 +156,7 @@ class DiskFullRule(Rule):
 
             parts = []
             if by_level:
-                parts.append(f"使用率 {used_pct:.1f}% (空き {free / GiB:.1f} GB)")
+                parts.append(f"使用率 {shown_pct:.1f}% (空き {free / GiB:.1f} GB)")
             if forecast is not None:
                 parts.append(
                     f"残り {forecast.days_left:.1f}日で満杯"
@@ -185,6 +186,17 @@ class DiskFullRule(Rule):
         """The mounts whose days-to-full forecast waits for more recording."""
         mounts = _current_filesystems(store, window, _has_bytes)
         return _forecast_pending(self, mounts, window)
+
+
+def _shown_pct(value: float, *levels: float) -> float:
+    """*value* to one decimal, cut instead of rounded where rounding reaches a level.
+
+    94.96% is below the 95% critical level, so it must not read "95.0%".
+    """
+    shown = round(value, 1)
+    if any(value < level <= shown for level in levels):
+        return math.floor(value * 10 + 1e-9) / 10
+    return shown
 
 
 # A filesystem whose size changes by more than this from one sample to the
@@ -852,14 +864,19 @@ class DiskInodeRule(Rule):
                 "mountpoint": mountpoint,
                 "inodes_used": used,
                 "inodes_total": total,
-                "used_pct": round(used_pct, 1),
+                "used_pct": _shown_pct(used_pct, self.warning_pct, self.critical_pct),
                 "bytes_used_pct": (
-                    round(bytes_pct, 1) if bytes_pct is not None else None
+                    _shown_pct(
+                        bytes_pct, DiskFullRule.warning_pct, DiskFullRule.critical_pct
+                    )
+                    if bytes_pct is not None
+                    else None
                 ),
                 "days_left": days_left,
                 "warning_pct": self.warning_pct,
             }
-            summary = f"{mountpoint}: inode 使用率 {used_pct:.1f}%" + (
+            shown_pct = _shown_pct(used_pct, self.warning_pct, self.critical_pct)
+            summary = f"{mountpoint}: inode 使用率 {shown_pct:.1f}%" + (
                 f" (約 {days_left:.1f}日で枯渇)" if days_left is not None else ""
             )
             findings.append(
