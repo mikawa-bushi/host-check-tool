@@ -374,12 +374,13 @@ def _diagnose(
     """Run the rules on *db*; return ``(diagnosis, charts, meta_hostname)``.
 
     Without *since* / *until* the engine picks the period (the raw samples).
-    With either, the rules run over the records in ``[since, until)`` and the
-    command exits with code 3 when there are none.  Charts and the recorded
+    With either, the rules run over the records in ``[since, until)``; with
+    none in it the diagnosis has no data (exit code 3) and is still returned,
+    so ``-o`` writes a report instead of leaving an old one.  Charts and the recorded
     hostname are only needed for HTML output, so they are read (inside the
     open connection) only when *with_charts* is set and are ``None`` otherwise.
     """
-    from .core import Window
+    from .core import Diagnosis, Window
     from .diagnosis import Engine
     from .report import build_charts
     from .storage import Storage
@@ -400,7 +401,9 @@ def _diagnose(
                     else "DB に記録がありません。"
                 )
                 click.echo(f"エラー: 指定した期間に記録がありません。{where}", err=True)
-                sys.exit(_EXIT_NO_DATA)
+                empty = Diagnosis(findings=[], healthy=False, no_data=True)
+                empty.quality.notes.append(f"指定した期間に記録がありません。{where}")
+                return empty, None, store.meta().get("hostname")
             window = Window(*bounds)
         diag = Engine(cfg, verbose=verbose).run(
             store, only=only, skip=skip, window=window
@@ -757,7 +760,7 @@ def check(
     elif fmt == "html":
         text = _render_html(cfg, diag, charts, meta_hostname)
     else:
-        color = should_use_color(no_color)
+        color = should_use_color(no_color) and not output
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
 
     if output:
@@ -949,7 +952,11 @@ def quick(
     help="出力フォーマット。",
 )
 @click.option(
-    "--output", type=click.Path(), default=None, help="結果をファイルに書き出す。"
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="結果をファイルに書き出す (例: -o compare.txt)。",
 )
 @click.option("--verbose", is_flag=True, help="推論過程と修正後の提案を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
@@ -1022,7 +1029,7 @@ def compare(
         text = report_mod.render_comparison_json(result)
     else:
         text = report_mod.render_comparison_terminal(
-            result, color=should_use_color(no_color), verbose=verbose
+            result, color=should_use_color(no_color) and not output, verbose=verbose
         )
 
     if output:
