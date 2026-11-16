@@ -141,6 +141,10 @@ class TriggerConfig(_Model):
         return v
 
 
+# 1.0001 would widen an interval by 0.01 % a minute: 12 days to double it.
+_MIN_THROTTLE_FACTOR = 1.1
+
+
 class BudgetConfig(_Model):
     """Self-throttling overhead budget."""
 
@@ -160,10 +164,11 @@ class BudgetConfig(_Model):
     @field_validator("throttle_factor")
     @classmethod
     def _widening_factor(cls, v: float) -> float:
-        if v <= 1:
+        if v < _MIN_THROTTLE_FACTOR:
             raise ValueError(
-                "throttle_factor は 1 より大きい数でなければなりません "
-                f"(自動減速で Tier-2b の間隔を何倍にするか): {v}"
+                f"throttle_factor は {_MIN_THROTTLE_FACTOR} 以上でなければなりません "
+                "(自動減速で Tier-2b の間隔を何倍にするか。1 に近いと間隔がほとんど"
+                f"広がらず、減速になりません): {v}"
             )
         return v
 
@@ -365,7 +370,7 @@ config = ProcdiagConfig(
 
     budget=BudgetConfig(
         overhead_budget_pct=1.0,   # 自己CPUオーバーヘッド上限 (%)
-        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1 より大きい数)
+        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1.1 以上)
         throttle_max_interval=60.0, # 自動減速で広げる Tier2b 間隔の上限 (秒)
         warmup_sec=60.0,           # 起動直後この秒数は自己負荷の判定から除外
     ),

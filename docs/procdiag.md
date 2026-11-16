@@ -79,7 +79,7 @@ procdiag check -o report.html
 | `procdiag check` | 記録済み DB に診断ルールを実行し改善提案を出力する。`-o report.html` / `-o report.json` でファイルに書き出す |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
 | `procdiag status` | 記録期間・サンプル数・自己負荷の概況を表示する |
-| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/カーネルログの読取/センサ/DB の置き場の書き込み権限と空き容量) を診断する。空き容量は `retention.min_free_disk_mb` と比べる。降格ありで exit 2 |
+| `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup v2/権限/I-O読取率/カーネルログの読取/CPU の温度センサ/DB の置き場の書き込み権限と空き容量) を診断する。空き容量は `retention.min_free_disk_mb` と比べる。DB のパスがディレクトリ、またはフォルダ・ファイルが切れたシンボリックリンクのときも降格にする。降格ありで exit 2 |
 | `procdiag explain [名前]` | ルールまたはサンプラーの詳細を表示する。引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示する |
 | `procdiag export` | 記録データを CSV または JSON でエクスポートする |
 | `procdiag prune` | 保持ポリシーを手動実行する。記録中にも実行できる |
@@ -100,7 +100,11 @@ procdiag check -o report.html
 以前の版は、設定ファイルの相対パスもカレントフォルダから読んでいた。設定ファイルのフォルダからの位置に DB が無く、
 同じ相対パスをカレントフォルダから見た位置に DB があるときは、既存の DB を使い続ける (以前の手順で作ったユニットの
 作業フォルダ、user ユニットならホームフォルダ、system ユニットなら `/` の DB)。そのときは両方のパスと直し方
-(`db_path` を絶対パスにする、または DB を移す) を stderr に 1 行出し、`doctor` の「記録 DB の置き場」も `degraded` にする。
+(`db_path` を絶対パスにする、または DB を移す) を stderr に 1 行出し、`doctor` の「記録 DB の置き場」も `degraded` にする
+(通知に続けて、そのフォルダに書き込めるか・空きがあるかも調べる)。`check` は使った DB を観測品質の備考にも書く。
+設定の DB を開かない `snapshot` / `quick` と、DB を 2 つ指定した `compare`、`--db` を指定したときは出さない。
+`status` / `check` / `export` / `bundle` など読むだけのコマンドは、DB のそばに `-wal` / `-shm` を残さない
+(記録が動いている間は、記録がそれらを使うので DB のそばにある。データの入った `-wal` には触れない)。
 `--config ""` / `--db ""` のように空の値を渡すと、既定に戻さず終了コード 4 で終わる。
 `--since ""` / `--until ""`、`record --duration ""` (無期限の記録にしない) も同じである。
 
@@ -112,7 +116,7 @@ systemd は `$HOME` (user ユニット) や `/` (system ユニット) から起�
 `--config` も `--db` も無い system ユニットは、`StateDirectory=procdiag` を付けて `/var/lib/procdiag/procdiag.db` に記録する。
 
 ユニットは `Restart=on-failure` だが、`record` が終了コード 4 (設定・オプションの誤り、DB として使えないファイル:
-ディレクトリ・壊れた DB・新しい版の DB) で終わったときは `RestartPreventExitStatus=4` で再起動しない。
+ディレクトリ・壊れた DB・新しい版の DB・他のソフトの SQLite ファイル) で終わったときは `RestartPreventExitStatus=4` で再起動しない。
 再起動しても直らず、10 秒ごとに失敗を繰り返すだけだからである。
 記録を始めるときに DB を開けない・作れない (DB のフォルダが無い・書けない) ときと、DB に書けないときは終了コード 1 で、
 再起動する。後からつながるディスクのフォルダが使えるようになる、空きができる、など時間がたてば直ることがあるからである。
@@ -134,7 +138,9 @@ DB に書き込めない間 (ディスク満杯・I/O エラー・読み取り�
 --verbose                 # 推論過程を表示
 ```
 
-`--only` / `--skip` (`compare` も同じ) と `config.rules.disabled` のルール ID は、`procdiag explain` の一覧どおり大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に書いたとき、実行するルールが 1 つも残らないときは、診断せずに終了コード `4` で終わる。
+`--only` / `--skip` (`compare` も同じ) と `config.rules.disabled` のルール ID は、`procdiag explain` の一覧どおり大文字で書く。存在しない ID を書いたとき、`rules.disabled` で無効にしたルールを `--only` に書いたとき、実行するルールが 1 つも残らないときは、診断せずに終了コード `4` で終わる。複数の ID は `,` で区切る (`;` や空白は区切りにならず、エラーの文がそう案内する)。ID に似たものがあるときだけ「のことですか?」と候補を出す。
+
+`config.rules.extra_rules` のモジュールと、entry point (`procdiag.rules`) のプラグインが読み込めないとき (ID が組み込みのルールと重なって登録できないときを含む) は、そのルールを評価していないことを観測品質の備考に出す (画面・HTML・JSON)。`--verbose` と JSON の `reasoning` には、これまでどおり読み込みの失敗が出る。`rules.disabled` などの ID が不明なときは、その読み込みの失敗も同じエラーに並べる。
 
 ### 終了コード (check)
 
@@ -145,6 +151,10 @@ DB に書き込めない間 (ディスク満杯・I/O エラー・読み取り�
 | `2` | info レベルの Finding のみ |
 | `3` | 観測データなし (DB にサンプルが1件もない＝記録が回っていない、または `--since` / `--until` の期間に記録がない) |
 | `4` | 前提条件エラー (DB ファイルが無い・開けない、設定ファイルが無い・読み込めない、出力先に書けない、コマンドラインの誤り等)。`1` の異常検出と区別される |
+
+どのコマンドも、Ctrl-C で中断したときは終了コード 130 で終わり、`中断しました。` と出す (click の `Aborted!` と 1 ではない。
+1 は check の「critical・warning あり」と同じで、異常検出と読まれてしまう)。`record` と `quick` の記録中の Ctrl-C は、
+これまでどおり記録を安全に止めて終わる。引数なしの `procdiag` はヘルプを標準出力に出して終了コード 0 で終わる。
 
 CI で info を失敗扱いにしたくない場合は `procdiag check --exit-zero-on-info` を使うと、info のみのときに `0` を返す（`1` / `0` の判定は変わらない）。
 
@@ -232,6 +242,7 @@ procdiag compare before.db after.db                              # 2 つの DB (
   world-writable、誰でも書き込めるフォルダにあって sticky ビットが無い、または sticky でも所有者が自分と root 以外）に限り、
   実行せず終了コード 4 で終わる。他人が置いた `/tmp/config.py` を `/tmp` での実行で動かさないためである。
   自分の責任で使うファイルは `--config` で明示する（明示したファイルは実行する）。
+- 設定ファイルが `sys.exit()` を呼んで終わろうとしたときも、そのまま終了せず、設定ファイルの誤りとして終了コード 4 で終わる。
 - 配置後に `procdiag doctor` を実行すると、`設定ファイルの安全性` チェックが、上と同じ基準（所有者・world-writable・
   置き場のフォルダ）で他のユーザーが書き換えられる `config.py` を `degraded` として警告する。
 
@@ -427,7 +438,7 @@ Tier-1 の各ティックで `SystemSnapshot` を評価:
   超えたままなら 1 分ごとにさらに広げる。`throttle_max_interval` (既定 60 秒) で止める。`process_interval` が
   それより長いときは広げない (短くもしない)
 - 10 分間連続して予算内に収まるごとに、間隔を 1 段ずつ戻す
-- `throttle_factor` は 1 より大きい数にする (1 以下だと広がらない、または縮むので、設定の読み込みでエラー (終了コード 4) になる)
+- `throttle_factor` は 1.1 以上にする (1 以下だと広がらない、または縮み、1.0001 のように 1 に近いと 12 日かけても倍にならないので、設定の読み込みでエラー (終了コード 4) になる)
 - 観測品質の「減速イベント N 回」は、間隔を広げた段の数 (1 回の減速で 5 段広げると 5 回)
 
 ---
@@ -479,6 +490,8 @@ procdiag が「観測できなかった事実」を隠さないよう、以下�
 
 各ルールのしきい値 (クラス属性の数値) は `config.rules.overrides[<RULE-ID>]` で上書きでき、
 一覧と既定値は `procdiag explain <RULE-ID>` で確認できる。
+0 以下では意味がない項目 (CPU-PERIODIC-01 の `tol_sec`、OOM-KILL-01 の `max_findings`、IO-BOTTLENECK-01 の `top_n`、
+KERNEL-ERROR-01 の `max_samples`) に 0 以下を書くと、起動時に終了コード 4 で終わる (`tol_sec` は `inf` なら上限なし)。
 
 DB の版 5 から、プロセスの 1 分集計をプロセス (PID) ごとに新しい表 `proc_pid_rollup_1m` に持つ。
 それより古い DB は、次に `record` などで書き込みとして開いたときに版 5 になる。版 5 にするときは
