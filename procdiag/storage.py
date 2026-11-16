@@ -512,7 +512,7 @@ def _expiry_cutoffs(raw: str, rollup: Optional[str]) -> Tuple[float, Optional[fl
 
 
 # Headroom on the guard's post-VACUUM size estimate (see _size_after_vacuum).
-_VACUUM_ESTIMATE_MARGIN = 1.02
+_VACUUM_ESTIMATE_MARGIN = 1.05
 
 # Share of the file the guard keeps reusable when it cannot VACUUM, so that
 # recording fills freed pages instead of extending the file.
@@ -961,31 +961,50 @@ class Storage:
         DELETE only moves pages to the freelist and leaves the rest half
         empty, so the file keeps its size until a VACUUM and the pages in use
         overstate the result (measured: 5% to 33% too high).  The bytes the
-        b-trees actually use (``dbstat``) land within 0.6% of the real result
-        and cost a read of the file, with no extra disk space and no rewrite.
-        The estimate carries a margin so a VACUUM never ends above it, and
-        falls back to the pages in use when SQLite lacks ``dbstat``.
+        b-trees actually use (``dbstat``), each b-tree rounded up to whole
+        pages as the VACUUM writes it, land within 3% below the real result
+        (measured on DBs of 1 to 14 MB) and cost a read of the file, with no
+        extra disk space and no rewrite.  The estimate carries a margin of 5%
+        for the rest and falls back to the pages in use when SQLite lacks
+        ``dbstat``.
         """
         page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
         free_pages = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
         page_size = self.conn.execute("PRAGMA page_size").fetchone()[0]
         in_use = (page_count - free_pages) * page_size
         try:
-            used = self.conn.execute(
-                "SELECT SUM(pgsize - unused) FROM dbstat"
-            ).fetchone()[0]
+            per_tree = self.conn.execute(
+                "SELECT SUM(pgsize - unused) FROM dbstat GROUP BY name"
+            ).fetchall()
         except sqlite3.Error:
             return in_use
-        return min(in_use, int((used or 0) * _VACUUM_ESTIMATE_MARGIN))
+        used = sum(-(-(used or 0) // page_size) * page_size for (used,) in per_tree)
+        return min(in_use, int(used * _VACUUM_ESTIMATE_MARGIN))
 
-    def _truncate_wal(self) -> bool:
-        """Checkpoint and truncate the ``-wal``; False when a reader blocks it."""
+    def _truncate_wal(self, *, wait: bool = True) -> Optional[str]:
+        """Checkpoint and truncate the ``-wal``; None when done, else why not.
+
+        ``"reader"`` when a reader blocks it, otherwise the error's text.  A
+        reader makes the checkpoint wait for SQLite's busy timeout (5 s);
+        ``wait=False`` gives up at once, for the hourly check that runs on the
+        sampling thread and must not stall it.
+        """
+        timeout = None
         try:
+            if not wait:
+                timeout = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                self.conn.execute("PRAGMA busy_timeout=0")
             busy = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
         except sqlite3.Error as exc:
             logger.warning("DBサイズガード: WAL の切り詰め失敗: %s", exc)
-            return False
-        return not busy
+            return str(exc)
+        finally:
+            if timeout is not None:
+                try:
+                    self.conn.execute(f"PRAGMA busy_timeout={int(timeout)}")
+                except sqlite3.Error:
+                    pass
+        return "reader" if busy else None
 
     def _guard_event(self, kind: str, detail: str) -> None:
         """Record a guard event; a full disk must not abort the guard."""
@@ -1099,7 +1118,7 @@ class Storage:
         # give it back before measuring (the guard runs right after the hourly
         # delete).
         self.conn.commit()
-        self._truncate_wal()
+        self._truncate_wal(wait=False)
         if fits(self._disk_bytes()):
             return {"triggered": False}
 
@@ -1112,7 +1131,14 @@ class Storage:
         def goal(size: int) -> bool:
             return fits(size) and (can_vacuum(size) or not low_disk)
 
+        def floor_out_of_reach(size: int) -> bool:
+            """Would the free space still fall short of the floor at *size*?"""
+            if min_free_bytes is None:
+                return False
+            return free_bytes() + self._disk_bytes() - size < min_free_bytes
+
         file_bytes = self.path.stat().st_size
+        unreachable = False
         applied: List[str] = []
         sizes: List[int] = []
         try:
@@ -1126,9 +1152,25 @@ class Storage:
                 applied.append(step_name)
                 sizes.append(self._size_after_vacuum())
             keep = len(applied)
-            if not goal(sizes[-1]) and not can_vacuum(sizes[-1]):
-                target = (1 - _GUARD_HOLD_SLACK) * file_bytes
-                keep = next((i for i, size in enumerate(sizes) if size <= target), keep)
+            if not goal(sizes[-1]):
+                if not can_vacuum(sizes[-1]):
+                    target = (1 - _GUARD_HOLD_SLACK) * file_bytes
+                    keep = next(
+                        (i for i, size in enumerate(sizes) if size <= target), keep
+                    )
+                elif floor_out_of_reach(sizes[-1]):
+                    # The bottom rung does not return enough: cutting would
+                    # lose the history without ever reaching the floor, so only
+                    # the size cap decides how far to cut.
+                    unreachable = True
+                    keep = next(
+                        (
+                            i
+                            for i, size in enumerate(sizes)
+                            if max_bytes is None or size <= max_bytes
+                        ),
+                        keep,
+                    )
             if keep < len(applied):
                 self.conn.execute(f"ROLLBACK TO guard_{keep}")
             self.conn.commit()
@@ -1148,15 +1190,23 @@ class Storage:
                 f"{step_name}: DB={size // MiB}MB (VACUUM 後の見込み)",
             )
 
+        if unreachable and min_free_bytes is not None:
+            self._guard_event(
+                "db_guard_error",
+                f"空きの下限 {min_free_bytes // MiB}MB は、DB を最も短い保持にしても"
+                "満たせないため、これ以上保持期間を縮めません",
+            )
         self._truncate_wal()
         vacuumed = self._vacuum(sizes[keep])
-        wal_returned = self._truncate_wal()
+        wal_failure = self._truncate_wal()
         size_after = self._disk_bytes()
-        wal_note = (
-            "WAL 切り詰め済み"
-            if wal_returned
-            else f"WAL {self._wal_bytes() // MiB}MB は読み取り中のため次回に切り詰め"
-        )
+        wal_mb = self._wal_bytes() // MiB
+        if wal_failure is None:
+            wal_note = "WAL 切り詰め済み"
+        elif wal_failure == "reader":
+            wal_note = f"WAL {wal_mb}MB は読み取り中のため次回に切り詰め"
+        else:
+            wal_note = f"WAL {wal_mb}MB の切り詰めに失敗: {wal_failure}"
         self._guard_event(
             "db_guard_reclaim",
             f"DB={size_before // MiB}MB -> {size_after // MiB}MB"
