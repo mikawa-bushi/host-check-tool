@@ -1,6 +1,7 @@
 """Regression tests for the disk rules (DISK-FULL-01, DISK-INODE-01,
-FS-READONLY-01, DISK-GROWTH-01, DISK-JOURNAL-01) and the column that keeps
-the space other users can write (schema 6)."""
+FS-READONLY-01, DISK-GROWTH-01, DISK-JOURNAL-01), the column that keeps
+the space other users can write (schema 6) and the one that keeps the
+filesystem UUID (schema 7)."""
 
 from __future__ import annotations
 
@@ -1119,8 +1120,9 @@ def _schema5_db(path, start, *, used):
         add_sys_baseline(store, hours=3 + 1 / 60, start_ts=start)
     conn = sqlite3.connect(path)
     columns = {r[1] for r in conn.execute("PRAGMA table_info(disk_samples)")}
-    if "avail" in columns:
-        conn.execute("ALTER TABLE disk_samples DROP COLUMN avail")
+    for newer in ("avail", "fs_uuid"):
+        if newer in columns:
+            conn.execute(f"ALTER TABLE disk_samples DROP COLUMN {newer}")
     conn.execute("UPDATE meta SET value = '5' WHERE key = 'schema_version'")
     conn.executemany(
         "INSERT INTO disk_samples (ts, mountpoint, total, used, read_only)"
@@ -1150,7 +1152,7 @@ class TestSchema6:
             rows = store.rows("disk_samples")
 
         version, columns = _version_and_columns(path)
-        assert version == "6"
+        assert version == str(storage.SCHEMA_VERSION)
         assert "avail" in columns
         assert len(rows) == 181
         assert {r["used"] for r in rows} == {40 * _GiB}
@@ -1204,7 +1206,96 @@ class TestSchema6:
             pass
 
         monkeypatch.setattr(sqlite3, "connect", connect)
-        assert _version_and_columns(path) == ("6", {*TABLE_COLUMNS["disk_samples"]})
+        assert _version_and_columns(path) == (
+            str(storage.SCHEMA_VERSION),
+            {*TABLE_COLUMNS["disk_samples"]},
+        )
+
+
+def _schema6_db(path, start, *, used):
+    """A DB as procdiag wrote it at schema 6: disk_samples without fs_uuid."""
+    with Storage(path) as store:
+        add_sys_baseline(store, hours=3 + 1 / 60, start_ts=start)
+    conn = sqlite3.connect(path)
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(disk_samples)")}
+    if "fs_uuid" in columns:
+        conn.execute("ALTER TABLE disk_samples DROP COLUMN fs_uuid")
+    conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
+    conn.executemany(
+        "INSERT INTO disk_samples (ts, mountpoint, total, used, avail, read_only)"
+        " VALUES (?, '/', ?, ?, ?, 0)",
+        [(start + m * 60, 100 * _GiB, used, 100 * _GiB - used) for m in range(181)],
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestSchema7:
+    def test_a_write_open_adds_the_uuid_column_and_keeps_the_rows(self, tmp_path):
+        path = tmp_path / "v6.db"
+        _schema6_db(path, time.time() - 4 * _HOUR, used=40 * _GiB)
+
+        with Storage(path) as store:
+            rows = store.rows("disk_samples")
+
+        version, columns = _version_and_columns(path)
+        assert version == "7"
+        assert "fs_uuid" in columns
+        assert len(rows) == 181
+        assert {r["used"] for r in rows} == {40 * _GiB}
+        assert {r["fs_uuid"] for r in rows} == {None}
+
+    def test_a_read_only_open_of_schema_6_reports_a_full_disk(self, tmp_path):
+        path = tmp_path / "v6.db"
+        _schema6_db(path, time.time() - 4 * _HOUR, used=97 * _GiB)
+
+        with Storage(path, read_only=True) as store:
+            diag = _run(store, "DISK-FULL-01", "FS-READONLY-01")
+
+        assert [f.severity for f in diag.findings] == [Severity.CRITICAL]
+        assert diag.errored_rules == []
+        assert _version_and_columns(path)[0] == "6"
+
+    def test_a_migration_cut_short_leaves_the_database_at_schema_6(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "v6.db"
+        _schema6_db(path, time.time() - 4 * _HOUR, used=40 * _GiB)
+
+        def killed(conn):
+            raise sqlite3.OperationalError("killed")
+
+        monkeypatch.setitem(
+            storage._MIGRATIONS, 7, [*storage._MIGRATIONS.get(7, []), killed]
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            Storage(path)
+
+        version, columns = _version_and_columns(path)
+        assert version == "6"
+        assert "fs_uuid" not in columns
+
+    def test_it_migrates_on_a_disk_without_room_for_a_copy(self, tmp_path, monkeypatch):
+        path = tmp_path / "v6.db"
+        _schema6_db(path, time.time() - 4 * _HOUR, used=40 * _GiB)
+        conn = sqlite3.connect(path)
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+        conn.close()
+        connect = sqlite3.connect
+
+        def nearly_full(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            conn.execute(f"PRAGMA max_page_count = {pages + 8}")
+            return conn
+
+        monkeypatch.setattr(sqlite3, "connect", nearly_full)
+        with Storage(path):
+            pass
+
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        version, columns = _version_and_columns(path)
+        assert version == "7"
+        assert "fs_uuid" in columns
 
 
 class TestSnapshotThresholds:
@@ -1638,6 +1729,208 @@ class TestFilesystemWhoseSizeDrifts:
 
         assert _found(diag, "DISK-FULL-01") == []
         assert _pending(diag) != {}
+
+
+_STICK_A = "1A2B-3C4D"
+_STICK_B = "5E6F-7081"
+
+
+def _media(start, *media, mountpoint="/media/usb"):
+    """Rows each minute of the media mounted one after another at *mountpoint*.
+
+    Each medium is ``(from_h, to_h, total_gb, used_gb_at, fs_uuid)``, where
+    *used_gb_at* gives the GiB used at an hour of the recording.
+    """
+    rows = []
+    for from_h, to_h, total_gb, used_gb_at, fs_uuid in media:
+        total = int(total_gb * _GiB)
+        for m in range(round(from_h * 60), round(to_h * 60) + 1):
+            used = int(used_gb_at(m / 60) * _GiB)
+            rows.append(
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": mountpoint,
+                    "total": total,
+                    "used": used,
+                    "avail": total - used,
+                    "read_only": 0,
+                    "fs_uuid": fs_uuid,
+                }
+            )
+    return rows
+
+
+class TestAnotherMediumIsToldByItsFilesystemUuid:
+    @pytest.mark.parametrize("minutes_unlinked", [0, 3])
+    def test_a_stick_of_the_same_size_that_grows_slowly_is_not_a_full_disk(
+        self, tmp_path, minutes_unlinked
+    ):
+        store, start = _recording(tmp_path, 24)
+        rows = _media(
+            start,
+            (0, 12, 128, lambda h: 5, _STICK_A),
+            (12 + 1 / 60, 24, 128, lambda h: 10 + 0.1 * (h - 12), _STICK_B),
+        )
+        for row in rows:
+            if 0 < row["ts"] - start - 12 * _HOUR <= minutes_unlinked * 60:
+                row["fs_uuid"] = None
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert diag.skipped_rules == []
+
+    @pytest.mark.parametrize("hours_after, days_left", [(8, 8.8), (22, 8.3)])
+    def test_a_stick_five_percent_smaller_is_forecast_from_its_own_rows(
+        self, tmp_path, hours_after, days_left
+    ):
+        hours = 18 + hours_after
+        store, start = _recording(tmp_path, hours)
+        _disk(
+            store,
+            _media(
+                start,
+                (0, 18, 64, lambda h: 2, _STICK_A),
+                (18 + 1 / 60, hours, 61, lambda h: 50 + 0.05 * (h - 18), _STICK_B),
+            ),
+        )
+
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+
+        assert f.severity is Severity.WARNING
+        assert f.evidence["days_left"] == pytest.approx(days_left, abs=0.3)
+
+    def test_a_stick_of_the_same_size_is_forecast_from_its_own_inodes(self, tmp_path):
+        store, start = _recording(tmp_path, 24)
+        rows = _media(
+            start,
+            (0, 12, 128, lambda h: 5, _STICK_A),
+            (12 + 1 / 60, 24, 128, lambda h: 5, _STICK_B),
+        )
+        for row in rows:
+            hour = (row["ts"] - start) / _HOUR
+            row["inodes_total"] = 1_000_000
+            row["inodes_used"] = (
+                50_000 if row["fs_uuid"] == _STICK_A else 300_000 + 2_000 * (hour - 12)
+            )
+        _disk(store, rows)
+
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+
+        assert f.severity is Severity.WARNING
+        assert f.evidence["days_left"] == pytest.approx(676_000 / 48_000, abs=0.3)
+
+    def test_a_jump_on_one_filesystem_is_still_growth(self, tmp_path):
+        store, start = _recording(tmp_path, 24)
+        _disk(
+            store,
+            _media(
+                start,
+                (0, 12, 128, lambda h: 5, _STICK_A),
+                (12 + 1 / 60, 24, 128, lambda h: 10 + 0.1 * (h - 12), _STICK_A),
+            ),
+        )
+
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+
+        assert f.severity is Severity.WARNING
+        assert f.evidence["days_left"] < 30
+
+    def test_rows_from_before_the_uuid_was_recorded_continue_its_filesystem(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        rows = _steady(start, 12, total=200)
+        for row in rows:
+            row["fs_uuid"] = _STICK_A if row["ts"] >= start + 9 * _HOUR else None
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] == pytest.approx(3.4, abs=0.4)
+        assert diag.skipped_rules == []
+
+    def test_a_size_beyond_the_drift_still_ends_a_filesystem_of_one_uuid(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 24)
+        _disk(
+            store,
+            _media(
+                start,
+                (0, 20, 64, lambda h: 10 + 0.5 * h, _STICK_A),
+                (20 + 1 / 60, 24, 128, lambda h: 10 + 0.5 * h, _STICK_A),
+            ),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert _pending(diag) == {
+            ("DISK-FULL-01", "/media/usb"): pytest.approx(2.0, abs=0.1)
+        }
+
+    @pytest.mark.parametrize("gap", [90, 240])
+    def test_a_gap_that_swallows_a_nightly_job_keeps_the_forecast_of_one_uuid(
+        self, tmp_path, gap
+    ):
+        store, start = _recording(tmp_path, 48)
+        rows = _grown(start, 200, _nightly, hours=48, cut=[(2250, 2250 + gap)])
+        for row in rows:
+            row["fs_uuid"] = _STICK_A
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        findings = _found(diag, "DISK-FULL-01")
+        assert [f.severity for f in findings] == [Severity.WARNING]
+        assert findings[0].evidence["days_left"] == pytest.approx(8.5, abs=0.5)
+        assert diag.skipped_rules == []
+
+    def test_a_gap_beside_a_log_rotation_on_one_uuid_is_not_critical(self, tmp_path):
+        store, start = _recording(tmp_path, 66)
+        rows = _grown(start, 64, _rotated_log, hours=66, cut=[(2820, 2880)])
+        for row in rows:
+            row["fs_uuid"] = _STICK_A
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert diag.skipped_rules == []
+
+    def test_a_stick_swapped_for_a_write_protected_card_of_its_size_is_no_remount(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        rows = _media(
+            start,
+            (0, 6, 16, lambda h: 2, _STICK_A),
+            (8, 12, 16, lambda h: 3, _STICK_B),
+        )
+        for row in rows:
+            row["read_only"] = int(row["fs_uuid"] == _STICK_B)
+        _disk(store, rows)
+
+        assert _found(_run(store, "FS-READONLY-01"), "FS-READONLY-01") == []
+
+    def test_a_filesystem_of_one_uuid_that_turns_read_only_is_a_remount(self, tmp_path):
+        store, start = _recording(tmp_path, 12)
+        rows = _media(
+            start,
+            (0, 6, 16, lambda h: 2, _STICK_A),
+            (8, 12, 16, lambda h: 3, _STICK_A),
+        )
+        for row in rows:
+            row["read_only"] = int(row["ts"] >= start + 8 * _HOUR)
+        _disk(store, rows)
+
+        (f,) = _found(_run(store, "FS-READONLY-01"), "FS-READONLY-01")
+
+        assert f.severity is Severity.CRITICAL
+        assert f.evidence["switched_at"] == start + 8 * _HOUR
 
 
 class TestOneFilesystemUnderSeveralMountPoints:

@@ -65,6 +65,7 @@ def _make_v3_db(path, *, wal: bool = True) -> None:
         ("disk_samples", "inodes_used"),
         ("disk_samples", "read_only"),
         ("disk_samples", "avail"),
+        ("disk_samples", "fs_uuid"),
         ("proc_registry", "fd_soft_limit"),
         ("proc_registry", "fd_hard_limit"),
     ):

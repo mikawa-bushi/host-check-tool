@@ -10,7 +10,10 @@ drive them at different intervals (``disk_interval`` for partition snapshots,
   which leaves out the blocks ext4 reserves for root) next to ``total`` and
   ``used``, plus ``os.statvfs`` for inode usage and the mount options for a
   read-only flag — "space left but cannot write" (inode exhaustion, or a filesystem
-  error that remounted it read-only) is invisible in byte counts alone.
+  error that remounted it read-only) is invisible in byte counts alone.  Each row
+  also keeps the UUID udev gives the filesystem of the mount's source device
+  (``/dev/disk/by-uuid``), so that another USB stick or card of the same size
+  at the same mount point is not read as growth.
   A mount whose mount point is a file (a bind-mounted ``/etc/hosts`` in a
   container) is not a filesystem to watch and is skipped (``is_watched_mount``,
   which ``snapshot`` uses too).  Produces ``disk_samples`` rows.
@@ -106,6 +109,7 @@ class DiskSampler(Sampler):
         except Exception:
             partitions = []
 
+        uuids = _filesystem_uuids()
         for part in partitions:
             if not is_watched_mount(part):
                 continue
@@ -125,6 +129,7 @@ class DiskSampler(Sampler):
                     inodes_total=inodes_total,
                     inodes_used=inodes_used,
                     read_only=int(is_read_only(part.opts)),
+                    fs_uuid=_device_uuid(part.device, uuids),
                 )
             )
 
@@ -193,6 +198,46 @@ def is_watched_mount(part: Any) -> bool:
 def is_read_only(mount_opts: str) -> bool:
     """Whether a mount-options string (``"rw,relatime"``) says read-only."""
     return "ro" in (mount_opts or "").split(",")
+
+
+# udev links each block device that holds a filesystem here by the filesystem's
+# UUID (60-persistent-storage.rules); the links are readable without root.
+_BY_UUID = "/dev/disk/by-uuid"
+
+
+def _filesystem_uuids() -> dict[tuple[int, int], str]:
+    """The UUID of each filesystem udev links, keyed by its device node.
+
+    Read at every sample, so a stick swapped at a mount point shows its own.
+    Empty without udev (a container, a minimal image).
+    """
+    try:
+        names = os.listdir(_BY_UUID)
+    except OSError:
+        return {}
+    uuids = {}
+    for name in names:
+        try:
+            st = os.stat(os.path.join(_BY_UUID, name))
+        except OSError:
+            continue
+        uuids[(st.st_dev, st.st_ino)] = name
+    return uuids
+
+
+def _device_uuid(device: str, uuids: dict[tuple[int, int], str]) -> Optional[str]:
+    """The filesystem UUID of the mount source *device*; None if unknown.
+
+    The source is a device node by any of its names (``/dev/sdb1``,
+    ``/dev/mapper/vg-data``).  A ZFS dataset or a network share is not one.
+    """
+    if not device.startswith("/"):
+        return None
+    try:
+        st = os.stat(device)
+    except OSError:
+        return None
+    return uuids.get((st.st_dev, st.st_ino))
 
 
 def _inode_usage(mountpoint: str) -> Tuple[Optional[int], Optional[int]]:

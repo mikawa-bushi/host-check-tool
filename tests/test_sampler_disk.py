@@ -17,6 +17,7 @@ Two test areas:
 from __future__ import annotations
 
 import os
+from collections import namedtuple
 
 import pytest
 
@@ -79,13 +80,14 @@ class TestDiskCollect:
         ctx = _make_ctx()
         batch = sampler.collect(ctx)[0]
         for row in batch.rows:
-            ts, mp, total, used, inodes_total, inodes_used, read_only, avail = row
+            r = dict(zip(TABLE_COLUMNS["disk_samples"], row))
+            mp, total, used, avail = r["mountpoint"], r["total"], r["used"], r["avail"]
             assert total > 0, f"{mp}: total={total}"
             assert used >= 0, f"{mp}: used={used}"
             assert used + avail <= total, f"{mp}: used={used} + avail={avail} > {total}"
-            assert read_only in (0, 1)
-            if inodes_total is not None:
-                assert 0 <= inodes_used <= inodes_total
+            assert r["read_only"] in (0, 1)
+            if r["inodes_total"] is not None:
+                assert 0 <= r["inodes_used"] <= r["inodes_total"]
 
 
 class TestMountState:
@@ -105,6 +107,98 @@ class TestMountState:
 
         monkeypatch.setattr(disk_mod.os, "statvfs", lambda p: _St())
         assert disk_mod._inode_usage("/") == (None, None)
+
+
+_Part = namedtuple("_Part", "device mountpoint fstype opts")
+_Usage = namedtuple("_Usage", "total used free percent")
+
+
+class TestFilesystemUuid:
+    """The UUID udev links in /dev/disk/by-uuid, recorded with each mount."""
+
+    @staticmethod
+    def _host(tmp_path):
+        """Device nodes, by-uuid links and mount points under *tmp_path*."""
+        dev = tmp_path / "dev"
+        (dev / "mapper").mkdir(parents=True)
+        for node in ("sdb1", "sdc1", "dm-0"):
+            (dev / node).write_text("")
+        (dev / "mapper" / "vg-data").symlink_to("../dm-0")
+        by_uuid = dev / "disk" / "by-uuid"
+        by_uuid.mkdir(parents=True)
+        (by_uuid / "1A2B-3C4D").symlink_to("../../sdb1")
+        (by_uuid / "ae0d3630-b70f-41a7-9b7c-674cac16fd0a").symlink_to("../../dm-0")
+        for mount in ("usb", "data", "other", "tank"):
+            (tmp_path / "mnt" / mount).mkdir(parents=True)
+        return dev, by_uuid
+
+    @staticmethod
+    def _collect(monkeypatch, tmp_path, by_uuid, parts):
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_BY_UUID", str(by_uuid), raising=False)
+        monkeypatch.setattr(
+            disk_mod.psutil,
+            "disk_partitions",
+            lambda all=False: [
+                _Part(device, str(tmp_path / "mnt" / mount), fstype, "rw")
+                for device, mount, fstype in parts
+            ],
+        )
+        monkeypatch.setattr(
+            disk_mod.psutil, "disk_usage", lambda mp: _Usage(100, 40, 60, 40.0)
+        )
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (None, None))
+        (batch,) = DiskSampler().collect(_make_ctx())
+        rows = [dict(zip(TABLE_COLUMNS["disk_samples"], row)) for row in batch.rows]
+        return {r["mountpoint"].rsplit("/", 1)[-1]: r.get("fs_uuid") for r in rows}
+
+    def test_each_mount_records_the_uuid_of_its_device(self, tmp_path, monkeypatch):
+        dev, by_uuid = self._host(tmp_path)
+
+        uuids = self._collect(
+            monkeypatch,
+            tmp_path,
+            by_uuid,
+            [
+                (str(dev / "sdb1"), "usb", "vfat"),
+                (str(dev / "mapper" / "vg-data"), "data", "ext4"),
+                (str(dev / "sdc1"), "other", "ext4"),
+                ("tank/data", "tank", "zfs"),
+            ],
+        )
+
+        assert uuids == {
+            "usb": "1A2B-3C4D",
+            "data": "ae0d3630-b70f-41a7-9b7c-674cac16fd0a",
+            "other": None,
+            "tank": None,
+        }
+
+    def test_a_stick_swapped_between_two_samples_records_the_new_uuid(
+        self, tmp_path, monkeypatch
+    ):
+        dev, by_uuid = self._host(tmp_path)
+        parts = [(str(dev / "sdb1"), "usb", "vfat")]
+        before = self._collect(monkeypatch, tmp_path, by_uuid, parts)
+
+        (by_uuid / "1A2B-3C4D").unlink()
+        (by_uuid / "5E6F-7081").symlink_to("../../sdb1")
+        after = self._collect(monkeypatch, tmp_path, by_uuid, parts)
+
+        assert (before, after) == ({"usb": "1A2B-3C4D"}, {"usb": "5E6F-7081"})
+
+    def test_no_uuid_is_recorded_without_the_by_uuid_links(self, tmp_path, monkeypatch):
+        dev, _ = self._host(tmp_path)
+
+        uuids = self._collect(
+            monkeypatch,
+            tmp_path,
+            tmp_path / "no-udev",
+            [(str(dev / "sdb1"), "usb", "vfat")],
+        )
+
+        assert uuids == {"usb": None}
 
 
 # ---------------------------------------------------------------------------

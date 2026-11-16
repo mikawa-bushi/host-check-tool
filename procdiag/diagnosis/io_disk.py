@@ -211,15 +211,16 @@ def _shown_pct(value: float, *levels: float) -> float:
     return shown
 
 
-# A filesystem whose size changes by more than ``_FILESYSTEM_DRIFT`` from one
-# sample to the next is another one: a different USB stick or card at the same
-# mount point, or a resized partition.  A ZFS dataset's size drifts as its pool
-# fills, a little at a time, and is still the same filesystem.  Another medium
-# of the same size leaves no mark in the rows, since the DB keeps no device
-# identity and a gap in them or a jump in the usage is as often a job or a log
-# rotation, so a swap to one is not seen.
-# FS-READONLY-01 asks for the same size to within ``_SAME_SIZE_TOLERANCE`` before
-# it calls a switch to read-only one filesystem.
+# A row with another filesystem UUID than the rows after it is another
+# filesystem: a different USB stick or card at the same mount point.  So is one
+# whose size changes by more than ``_FILESYSTEM_DRIFT`` from one sample to the
+# next: a resized partition, or a medium of another size where no UUID was
+# recorded.  A ZFS dataset's size drifts as its pool fills, a little at a time,
+# and is still the same filesystem.  A row without a UUID (recorded before
+# schema 7, a ZFS dataset, a host without udev) is told by its size alone, since
+# a gap in the rows or a jump in the usage is as often a job or a log rotation.
+# FS-READONLY-01 asks for the same size to within ``_SAME_SIZE_TOLERANCE``, and
+# no other UUID, before it calls a switch to read-only one filesystem.
 _SAME_SIZE_TOLERANCE = 0.01
 _FILESYSTEM_DRIFT = 0.10
 
@@ -230,12 +231,25 @@ def _same_size(
     return a is not None and b is not None and abs(a - b) <= tolerance * max(a, b)
 
 
+def _other_uuid(a: Optional[str], b: Optional[str]) -> bool:
+    return a is not None and b is not None and a != b
+
+
 def _one_filesystem(rows: list) -> list:
-    """The last of a mount's *rows*: those of the filesystem it has now."""
+    """The last of a mount's *rows*: those of the filesystem it has now.
+
+    A row without a UUID is compared with the UUID of the rows after it.
+    """
     first = len(rows) - 1
-    while first > 0 and _same_size(
-        rows[first - 1]["total"], rows[first]["total"], _FILESYSTEM_DRIFT
-    ):
+    uuid = _column(rows[first], "fs_uuid")
+    while first > 0:
+        prev = rows[first - 1]
+        prev_uuid = _column(prev, "fs_uuid")
+        if _other_uuid(prev_uuid, uuid) or not _same_size(
+            prev["total"], rows[first]["total"], _FILESYSTEM_DRIFT
+        ):
+            break
+        uuid = uuid or prev_uuid
         first -= 1
     return rows[first:]
 
@@ -1099,6 +1113,9 @@ class FsReadOnlyRule(Rule):
                     if not prev["read_only"]
                     and cur["read_only"]
                     and _same_size(prev["total"], cur["total"])
+                    and not _other_uuid(
+                        _column(prev, "fs_uuid"), _column(cur, "fs_uuid")
+                    )
                 ),
                 None,
             )
