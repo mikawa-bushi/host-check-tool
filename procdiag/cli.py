@@ -215,6 +215,7 @@ def _load_config(
     db_path: Optional[str] = None,
     *,
     uses_db: bool = True,
+    records: bool = False,
 ) -> ProcdiagConfig:
     """Load the config (``./config.py`` by default) with an optional DB override.
 
@@ -223,7 +224,9 @@ def _load_config(
     of being silently taken for "not given".  Warns on stderr when the DB is
     the one an older procdiag kept in the current folder
     (:meth:`~procdiag.config.ProcdiagConfig.db_path_notice`), unless the command
-    never opens the config's DB (*uses_db* False).
+    never opens the config's DB (*uses_db* False), and, for a command that
+    *records*, when ``budget.throttle_factor`` is used as a larger value
+    (:meth:`~procdiag.config.BudgetConfig.throttle_notice`).
     """
     from .config import load_config
 
@@ -238,6 +241,9 @@ def _load_config(
     if db_path is not None:
         cfg = cfg.with_db_path(db_path)
     notice = cfg.db_path_notice() if uses_db else None
+    if notice:
+        click.echo(f"警告: {notice}", err=True)
+    notice = cfg.budget.throttle_notice() if records else None
     if notice:
         click.echo(f"警告: {notice}", err=True)
     if cfg.rules.overrides or cfg.rules.disabled:
@@ -695,7 +701,7 @@ def record(
     from .core.util import parse_duration
     from .recorder import Recorder
 
-    cfg = _load_config(config_path, db_path)
+    cfg = _load_config(config_path, db_path, records=True)
 
     duration_sec: Optional[float] = None
     if duration is not None:
@@ -878,7 +884,7 @@ def quick(
             err=True,
         )
         sys.exit(_EXIT_USAGE)
-    cfg = _load_config(config_path, uses_db=False)
+    cfg = _load_config(config_path, uses_db=False, records=True)
     out = Path(out_dir or time.strftime("procdiag-quick-%Y%m%d-%H%M%S"))
     try:
         occupied = out.exists() and (not out.is_dir() or any(out.iterdir()))

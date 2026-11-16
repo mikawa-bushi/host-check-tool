@@ -47,7 +47,7 @@ class DoctorCheck:
     """Result of a single observability check."""
 
     name: str  # "psi", "cgroup_v2", "root", "io_counters", "smaps",
-    #            "journal", "sensors", "db_disk", "config_security"
+    #            "journal", "sensors", "db_disk", "config_security", "budget"
     label: str  # 日本語表示名
     status: str  # "ok" | "degraded" | "info"
     detail: str  # 日本語。降格時は §2.1 の「降格時の挙動」に相当する影響説明
@@ -306,6 +306,24 @@ def _check_config_security(config_path: Optional[str]) -> _Outcome:
     )
 
 
+@_doctor_check("budget", "自動減速の設定", what="自動減速の設定")
+def _check_budget(config: ProcdiagConfig) -> _Outcome:
+    """Check that ``budget.throttle_factor`` is used as the config file says.
+
+    A factor below the minimum is raised to it, not refused (an unattended
+    recording must still start), so this is where the user is told.
+    """
+    notice = config.budget.throttle_notice()
+    if notice:
+        return "degraded", notice
+    factor = config.budget.throttle_factor
+    return (
+        "ok",
+        f"throttle_factor = {factor:g} — 自己負荷が予算を超えている間、"
+        f"Tier-2b の間隔を 1 分ごとに {factor:g} 倍ずつ広げます",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -320,7 +338,7 @@ def run_doctor(
 ) -> list[DoctorCheck]:
     """Run all observability checks and return a list of :class:`DoctorCheck`.
 
-    Always returns exactly 9 items in a fixed order regardless of errors.
+    Always returns exactly 10 items in a fixed order regardless of errors.
     Each check is wrapped so a single failure cannot propagate.
 
     Parameters
@@ -345,4 +363,5 @@ def run_doctor(
         _check_sensors(),
         _check_db_disk(config),
         _check_config_security(config_path),
+        _check_budget(config),
     ]

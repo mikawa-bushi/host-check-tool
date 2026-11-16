@@ -141,7 +141,9 @@ class TriggerConfig(_Model):
         return v
 
 
-# 1.0001 would widen an interval by 0.01 % a minute: 12 days to double it.
+# 1.0001 would widen an interval by 0.01 % a minute: 12 days to double it.  procdiag
+# 0.6 took any factor above 0, so a smaller one is used as this, not refused: a
+# refusal ends ``record`` with exit code 4, which the unit does not restart on.
 _MIN_THROTTLE_FACTOR = 1.1
 
 
@@ -154,6 +156,9 @@ class BudgetConfig(_Model):
     # Seconds after start excluded from the overhead average (start-up cost).
     warmup_sec: float = 60.0
 
+    # The factor the config file gave, when it was below the minimum.
+    _throttle_written: Optional[float] = PrivateAttr(default=None)
+
     @field_validator("overhead_budget_pct", "throttle_max_interval")
     @classmethod
     def _positive_float(cls, v: float) -> float:
@@ -163,14 +168,32 @@ class BudgetConfig(_Model):
 
     @field_validator("throttle_factor")
     @classmethod
-    def _widening_factor(cls, v: float) -> float:
-        if v < _MIN_THROTTLE_FACTOR:
+    def _positive_factor(cls, v: float) -> float:
+        if v <= 0:
             raise ValueError(
-                f"throttle_factor は {_MIN_THROTTLE_FACTOR} 以上でなければなりません "
-                "(自動減速で Tier-2b の間隔を何倍にするか。1 に近いと間隔がほとんど"
-                f"広がらず、減速になりません): {v}"
+                "throttle_factor は 0 より大きい数でなければなりません "
+                f"(自動減速で Tier-2b の間隔を何倍にするか): {v}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _raise_to_the_minimum_factor(self) -> "BudgetConfig":
+        if self.throttle_factor < _MIN_THROTTLE_FACTOR:
+            self._throttle_written = self.throttle_factor
+            self.throttle_factor = _MIN_THROTTLE_FACTOR
+        return self
+
+    def throttle_notice(self) -> Optional[str]:
+        """Why ``throttle_factor`` is not what the config file says, or ``None``."""
+        if self._throttle_written is None:
+            return None
+        minimum = f"{_MIN_THROTTLE_FACTOR:g}"
+        return (
+            f"budget.throttle_factor に {self._throttle_written:g} が書かれていますが、"
+            f"{minimum} 未満では自動減速になりません (1 に近いと間隔がほとんど広がらず、"
+            f"1 以下では広がりません)。{minimum} として使います。"
+            f"{minimum} 以上の値に書き直してください"
+        )
 
     @field_validator("warmup_sec")
     @classmethod
@@ -370,7 +393,7 @@ config = ProcdiagConfig(
 
     budget=BudgetConfig(
         overhead_budget_pct=1.0,   # 自己CPUオーバーヘッド上限 (%)
-        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1.1 以上)
+        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1.1 未満は 1.1 として使う)
         throttle_max_interval=60.0, # 自動減速で広げる Tier2b 間隔の上限 (秒)
         warmup_sec=60.0,           # 起動直後この秒数は自己負荷の判定から除外
     ),

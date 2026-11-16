@@ -446,6 +446,8 @@ class Engine:
         )
         quality.notes[:0] = load_problems
         quality.notes.extend(config_notes)
+        if has_data:
+            quality.notes.extend(_adjusted_config_notes(store, window))
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
         healthy = (
@@ -703,6 +705,17 @@ def _hole_seconds(store: "Storage") -> float:
     except (KeyError, TypeError, ValueError):
         return _MIN_HOLE_SECONDS
     return max(_MIN_HOLE_SECONDS, _HOLE_STEPS * interval)
+
+
+def _adjusted_config_notes(store: "Storage", window: Window) -> list[str]:
+    """Where a recording in *window* ran with other settings than its config file's."""
+    return list(
+        dict.fromkeys(
+            f"記録の設定を調整して記録しました ({_local_minute(ts)} 以降): {detail}"
+            for ts, _, until, detail in store.session_events("config_adjusted")
+            if ts <= window.end_ts and until > window.start_ts
+        )
+    )
 
 
 def _local_minute(ts: float) -> str:
