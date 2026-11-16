@@ -25,8 +25,9 @@ Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from ..core import (
     Capability,
@@ -309,10 +310,13 @@ _MEM_PRESSURE_PSI_THRESHOLD: float = (
 # A local day counts as observed only when it has this many hours of PSI rows,
 # so the slivers at the edges of a recording are not days.
 _MEM_PRESSURE_MIN_DAY_HOURS: float = 6.0
-# Consecutive pressure minutes for a pressure day: chronic pressure lasts, a
+# Consecutive pressure minutes for a sustained run: chronic pressure lasts, a
 # blip or scattered minutes do not.
 _MEM_PRESSURE_MIN_MINUTES: int = 10
-# Swap-out within a minute of such a run (a stray page is not).
+# Runs closer than this are one occurrence of pressure: a run broken by a dip or
+# a missing row, or one bad night made of several runs.
+_MEM_PRESSURE_OCCURRENCE_GAP_HOURS: float = 6.0
+# Swap-out within a minute of an occurrence's runs (a stray page is not).
 _MEM_PRESSURE_MIN_SWAP_OUT: int = MiB
 # Pressure days needed, and the share of the observed days they must be.
 _MEM_PRESSURE_MIN_DAYS: int = 2
@@ -346,19 +350,92 @@ def _consecutive_runs(buckets: list[int]) -> list[list[int]]:
     return runs
 
 
+def _minutes_by_day(buckets: Iterable[int]) -> dict[str, int]:
+    """Minute buckets per local calendar day, in time order."""
+    counts: dict[str, int] = {}
+    for bucket in buckets:
+        day = _local_day(bucket * 60)
+        counts[day] = counts.get(day, 0) + 1
+    return counts
+
+
+@dataclass(frozen=True)
+class _Occurrence:
+    """Sustained runs, each a range of minute buckets, close enough to be one."""
+
+    runs: tuple[range, ...]
+
+    @property
+    def minutes(self) -> int:
+        return sum(len(run) for run in self.runs)
+
+    @property
+    def surroundings(self) -> set[int]:
+        """The runs and the minute on each side of each, where swap-out counts."""
+        return {b for run in self.runs for b in range(run.start - 1, run.stop + 1)}
+
+    @property
+    def span(self) -> range:
+        """From the start of the first run to the end of the last, gaps included."""
+        return range(self.runs[0].start, self.runs[-1].stop)
+
+
+def _occurrences(runs: Iterable[range]) -> list[_Occurrence]:
+    """Group runs, in time order, into occurrences.
+
+    A run that starts less than ``_MEM_PRESSURE_OCCURRENCE_GAP_HOURS`` after the
+    previous one ends joins the previous one's occurrence.
+    """
+    gap = _MEM_PRESSURE_OCCURRENCE_GAP_HOURS * 60
+    groups: list[list[range]] = []
+    for run in runs:
+        if groups and run.start - groups[-1][-1].stop < gap:
+            groups[-1].append(run)
+        else:
+            groups.append([run])
+    return [_Occurrence(tuple(group)) for group in groups]
+
+
+@dataclass(frozen=True)
+class _Pressure:
+    """The pressure days, and the minutes and swap-out of the occurrences counted.
+
+    ``minutes`` and ``swap_out`` count each occurrence, and each minute's
+    swap-out, once, however many days the occurrence makes pressure days.
+    """
+
+    days: frozenset[str]
+    minutes: int
+    swap_out: int
+
+
 @register
 class MemPressureRule(Rule):
     """Detect chronically recurring memory pressure with swap activity.
 
-    Queries ``sys_rollup_1m`` and groups the rows by the host's local calendar
-    day.  A day is *observed* with at least ``min_day_observed_hours`` of PSI
-    rows, and a *pressure day* when ``psi_mem_max`` exceeds the threshold for at
-    least ``min_pressure_minutes`` minutes in a row and ``min_swap_out_bytes``
-    were swapped out within a minute of that run.  Fires WARNING when at least
-    ``min_pressure_days`` days are pressure days and they are at least
-    ``min_recurrence_fraction`` of the observed days.  A recording with fewer
-    than ``min_pressure_days`` observed days is reported as not evaluable
-    (``recording_shortfall_hours``), never as healthy.
+    Queries ``sys_rollup_1m``.  A *run* is at least ``min_pressure_minutes``
+    minutes in a row with ``psi_mem_max`` above the threshold, found on the
+    whole timeline so that midnight never cuts one in two.  Runs less than six
+    hours apart (gaps in the data included) are one *occurrence*: a run broken
+    by a dip or a missing row, or one bad night made of several runs.  An
+    occurrence counts when ``min_swap_out_bytes`` were swapped out within a
+    minute of its runs.  Taken in time order, it makes a *pressure day* of the
+    earliest local day it touches that is not one yet, so a run across
+    midnight is one day and two nights are two days, however their minutes
+    fall on either side.  It also makes a pressure day of each day it covers for
+    ``min_day_observed_hours`` (first run's start to last run's end) with
+    ``min_swap_out_bytes`` of that day's own, and the earliest day needs that
+    much swap-out besides theirs: unbroken pressure with swap-out throughout is
+    a pressure day every day, with one swap-out minute it is one day.  An
+    occurrence's minutes and swap-out are counted once.  A day is *observed*
+    with at least ``min_day_observed_hours`` of PSI rows, or when it is a
+    pressure day: a day with fewer rows (the sliver at an edge of a recording,
+    or a day cut short by a gap or a power loss) is a day only when it already
+    holds the pressure.  Fires WARNING when at least ``min_pressure_days`` days
+    are pressure days and they are at least ``min_recurrence_fraction`` of the
+    observed days.  A recording with fewer than ``min_pressure_days`` observed
+    days is reported as not evaluable (``recording_shortfall_hours``), never as
+    healthy.
 
     PSI columns absent from the DB (all None) → silent (no finding).
     """
@@ -371,9 +448,11 @@ class MemPressureRule(Rule):
     requires_rows = ("sys_rollup_1m", "sys_rollup_1m.psi_mem_max")
     requires_observed = (Capability.PSI,)
     what = (
-        "sys_rollup_1m の psi_mem_max が閾値超の状態が 1 日に一定時間以上途切れず続き、"
-        "その前後の swap_out_sum も一定量以上ある日が、観測が十分なローカル日の"
-        "過半数で反復するかを判定する"
+        "sys_rollup_1m の psi_mem_max が閾値超の状態が一定時間以上途切れず続いた圧迫を、"
+        "間が 6 時間未満なら 1 回とまとめ、前後の swap_out_sum も一定量以上ある回を"
+        "そのローカル日のうちまだ数えていない最も早い日 (長く続いてその日の分だけで"
+        "スワップのある日も) の圧迫日とし、圧迫日が観測が十分なローカル日"
+        " (観測が短くても圧迫日を含む) の過半数で反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
@@ -394,23 +473,92 @@ class MemPressureRule(Rule):
     min_swap_out_bytes: int = _MEM_PRESSURE_MIN_SWAP_OUT
     min_pressure_days: int = _MEM_PRESSURE_MIN_DAYS
 
+    def _pressure(self, rollup_rows: Iterable[Mapping[str, Any]]) -> _Pressure:
+        """Find the occurrences on the whole timeline, then the days they make."""
+        swap_out_by_bucket: dict[int, int] = {}
+        pressure_buckets: set[int] = set()
+        for row in rollup_rows:
+            bucket = int(row["ts_min"] // 60)
+            swap_out_by_bucket[bucket] = swap_out_by_bucket.get(bucket, 0) + (
+                row["swap_out_sum"] or 0
+            )
+            psi = row["psi_mem_max"]
+            if psi is not None and psi > self.psi_threshold:
+                pressure_buckets.add(bucket)
+        runs = [
+            range(run[0], run[-1] + 1)
+            for run in _consecutive_runs(sorted(pressure_buckets))
+            if len(run) >= self.min_pressure_minutes
+        ]
+
+        need = self.min_day_observed_hours * 60
+        days: set[str] = set()
+        counted: list[_Occurrence] = []
+        for occurrence in _occurrences(runs):
+            swap_out_by_day: dict[str, int] = {}
+            for bucket in occurrence.surroundings:
+                if swap_out_by_bucket.get(bucket):
+                    day = _local_day(bucket * 60)
+                    swap_out_by_day[day] = (
+                        swap_out_by_day.get(day, 0) + swap_out_by_bucket[bucket]
+                    )
+            swap_out = sum(swap_out_by_day.values())
+            if swap_out < self.min_swap_out_bytes:
+                continue
+            counted.append(occurrence)
+            covered = _minutes_by_day(occurrence.span)
+            long_days = {
+                day
+                for day, minutes in covered.items()
+                if minutes >= need
+                and swap_out_by_day.get(day, 0) >= self.min_swap_out_bytes
+            }
+            earliest = next((day for day in covered if day not in days), None)
+            # Swap-out that made a long day a pressure day cannot make another.
+            spare = swap_out - sum(
+                swap_out_by_day.get(day, 0) for day in long_days - {earliest}
+            )
+            if earliest is not None and spare >= self.min_swap_out_bytes:
+                days.add(earliest)
+            days |= long_days
+
+        around = {b for occurrence in counted for b in occurrence.surroundings}
+        return _Pressure(
+            frozenset(days),
+            sum(occurrence.minutes for occurrence in counted),
+            sum(swap_out_by_bucket.get(b, 0) for b in around),
+        )
+
+    def _judged_days(
+        self, observed_minutes: Mapping[str, int], pressure_days: Collection[str]
+    ) -> dict[str, bool]:
+        """Day -> is it a pressure day, for the days the rule can judge."""
+        need = self.min_day_observed_hours * 60
+        return {
+            day: day in pressure_days
+            for day, minutes in observed_minutes.items()
+            if minutes >= need or day in pressure_days
+        }
+
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours still to record before ``min_pressure_days`` days are observed.
 
-        A day needs ``min_day_observed_hours`` of PSI rows to count, so a
-        recording of 24 hours can hold a single observed day, and "recurs on
-        most days" cannot be judged from it.  The answer assumes the recording
-        goes on without gaps.
+        A day needs ``min_day_observed_hours`` of PSI rows to count unless it is
+        already a pressure day, so a recording of 24 hours can hold a single
+        observed day, and "recurs on most days" cannot be judged from it.  The
+        answer assumes the recording goes on without gaps and without more
+        pressure than the recording already holds.
         """
         rows = store.rows("sys_rollup_1m", since=window.start_ts, until=window.end_ts)
         observed = _observed_minutes_by_day(rows)
         if not observed:
             return 0.0
-        need = self.min_day_observed_hours * 60
+        pressure_days = self._pressure(rows).days
 
         def enough() -> bool:
-            return sum(1 for m in observed.values() if m >= need) >= (
-                self.min_pressure_days
+            return (
+                len(self._judged_days(observed, pressure_days))
+                >= self.min_pressure_days
             )
 
         if enough():
@@ -438,41 +586,10 @@ class MemPressureRule(Rule):
         if all_psi_none:
             return []
 
-        observed_minutes = _observed_minutes_by_day(rollup_rows)
-        swap_out_by_bucket: dict[int, int] = {}
-        pressure_buckets: set[int] = set()
-        for row in rollup_rows:
-            bucket = int(row["ts_min"] // 60)
-            swap_out_by_bucket[bucket] = swap_out_by_bucket.get(bucket, 0) + (
-                row["swap_out_sum"] or 0
-            )
-            psi = row["psi_mem_max"]
-            if psi is not None and psi > self.psi_threshold:
-                pressure_buckets.add(bucket)
-
-        sustained_by_day: dict[str, set[int]] = {}
-        for run in _consecutive_runs(sorted(pressure_buckets)):
-            if len(run) >= self.min_pressure_minutes:
-                for bucket in run:
-                    sustained_by_day.setdefault(_local_day(bucket * 60), set()).add(
-                        bucket
-                    )
-
-        pressure_minutes: dict[str, int] = {}
-        pressure_swap_out: dict[str, int] = {}
-        events_by_day: dict[str, bool] = {}
-        for day, minutes in observed_minutes.items():
-            if minutes < self.min_day_observed_hours * 60:
-                continue
-            sustained = sustained_by_day.get(day, set())
-            near = {b + d for b in sustained for d in (-1, 0, 1)}
-            swap_out = sum(swap_out_by_bucket.get(b, 0) for b in near)
-            events_by_day[day] = (
-                len(sustained) >= self.min_pressure_minutes
-                and swap_out >= self.min_swap_out_bytes
-            )
-            pressure_minutes[day] = len(sustained)
-            pressure_swap_out[day] = swap_out
+        pressure = self._pressure(rollup_rows)
+        events_by_day = self._judged_days(
+            _observed_minutes_by_day(rollup_rows), pressure.days
+        )
 
         n_days = len(events_by_day)
         pressure_days = sorted(d for d, hit in events_by_day.items() if hit)
@@ -482,9 +599,6 @@ class MemPressureRule(Rule):
         recurrence = detect_recurrence(events_by_day)
         if recurrence < self.min_recurrence_fraction:
             return []
-
-        total_swap_out = sum(pressure_swap_out[d] for d in pressure_days)
-        total_pressure_minutes = sum(pressure_minutes[d] for d in pressure_days)
 
         # Compute representative peak PSI for the summary.
         peak_psi = max(
@@ -499,11 +613,12 @@ class MemPressureRule(Rule):
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
             "pressure_days": pressure_days,
-            "swap_out_total_bytes": total_swap_out,
-            "pressure_event_count": total_pressure_minutes,
+            "swap_out_total_bytes": pressure.swap_out,
+            "pressure_event_count": pressure.minutes,
             "min_pressure_minutes": self.min_pressure_minutes,
             "min_swap_out_bytes": self.min_swap_out_bytes,
             "min_day_observed_hours": self.min_day_observed_hours,
+            "occurrence_gap_hours": _MEM_PRESSURE_OCCURRENCE_GAP_HOURS,
         }
 
         # Annotate the peak against this host's own usual level for the same
@@ -524,8 +639,9 @@ class MemPressureRule(Rule):
 
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"
-            f" {self.min_pressure_minutes}分以上途切れず続く日が {n_pressure_days}/{n_days} 日で反復"
-            f" (圧迫中のスワップアウト {humanize_bytes(total_swap_out)})"
+            f" {self.min_pressure_minutes}分以上途切れず続きスワップアウトを伴った圧迫のあった日が"
+            f" {n_pressure_days}/{n_days} 日"
+            f" (圧迫中のスワップアウト {humanize_bytes(pressure.swap_out)})"
         )
 
         confidence = (
