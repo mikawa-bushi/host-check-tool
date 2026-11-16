@@ -968,10 +968,10 @@ class Storage:
         pages as the VACUUM writes it, land 0.4% to 3% below the result on
         DBs of 1 to 14 MB and cost a read of the file, with no extra disk
         space and no rewrite.  The estimate adds a margin of 5% to that, which
-        puts it 2% to 5% above the result there, and falls back to the pages in
+        puts it 3.6% to 4.3% above the result there, and falls back to the pages in
         use when SQLite lacks ``dbstat``.  It is not a bound: on tables whose
         rows nearly fill a page, or whose deletions are scattered, a VACUUM
-        leaves up to 1.5 times what it says (measured: 64% to 104% of the
+        leaves more than 1.5 times what it says (measured: 64% to 104% of the
         result across such tables).
         """
         return self._vacuum_size_bounds()[1]
