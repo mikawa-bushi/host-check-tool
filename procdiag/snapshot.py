@@ -23,7 +23,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import psutil
 
@@ -288,6 +288,7 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
     inode_warn = _threshold(config, DiskInodeRule, "warning_pct")
     inode_crit = _threshold(config, DiskInodeRule, "critical_pct")
     items: List[SnapshotItem] = []
+    shown: Set[tuple] = set()
     for part in psutil.disk_partitions(all=False):
         if not is_watched_mount(part):
             continue
@@ -297,23 +298,27 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
             usage = psutil.disk_usage(path)
         except OSError:
             continue
+        # A bind mount shows a filesystem already listed under another path.
+        first_mount = (part.device, usage.total) not in shown
+        shown.add((part.device, usage.total))
         status = _level(usage.percent, disk_warn, disk_crit)
         hint = (
             f"`du -sh {shell_quote(mp)}/* | sort -rh | head`"
             " で大きいディレクトリを確認してください"
         )
-        items.append(
-            item(
-                status,
-                f"{usage.percent:.0f}% 使用 (空き {usage.free / GiB:.1f} GB)",
-                _advice(status, hint),
-                name=f"disk:{mp}",
-                label=f"{mp} 容量",
+        if first_mount:
+            items.append(
+                item(
+                    status,
+                    f"{usage.percent:.0f}% 使用 (空き {usage.free / GiB:.1f} GB)",
+                    _advice(status, hint),
+                    name=f"disk:{mp}",
+                    label=f"{mp} 容量",
+                )
             )
-        )
 
         total, used = _inode_usage(path)
-        if total:
+        if total and first_mount:
             pct = used / total * 100.0
             status = _level(pct, inode_warn, inode_crit)
             hint = (

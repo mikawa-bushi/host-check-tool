@@ -623,11 +623,36 @@ class Forecast:
     """When a growing value reaches its capacity.
 
     ``per_day`` is the growth per day of the fit behind ``days_left``, so the
-    two always agree: ``days_left * per_day`` is what was left.
+    two always agree: ``days_left * per_day`` is what was left.  ``one_step``
+    says most of the growth happened at once (a copy, an unpacked archive), so
+    the line through it says how fast the one step was, not how fast the value
+    grows.
     """
 
     days_left: float
     per_day: float
+    one_step: bool = False
+
+
+# A growth is one step when this share of it falls in a window of this share of
+# the series' time.
+_ONE_STEP_SHARE = 0.7
+_ONE_STEP_WINDOW = 1 / 6
+
+
+def _is_one_step(points: Sequence[tuple[float, float]]) -> bool:
+    """Whether most of the rise of *points* happens within a sixth of their time."""
+    width = (points[-1][0] - points[0][0]) * _ONE_STEP_WINDOW
+    total = points[-1][1] - points[0][1]
+    if total <= 0 or width <= 0:
+        return False
+    best = 0.0
+    end = 0
+    for i, (t, v) in enumerate(points):
+        while end + 1 < len(points) and points[end + 1][0] - t <= width:
+            end += 1
+        best = max(best, points[end][1] - v)
+    return best >= _ONE_STEP_SHARE * total
 
 
 def forecast_full(
@@ -663,7 +688,11 @@ def forecast_full(
 
     per_day = fit.slope_per_hour * 24.0
     remaining = max(0.0, capacity - work_pts[-1][1])
-    return Forecast(days_left=remaining / per_day, per_day=per_day)
+    return Forecast(
+        days_left=remaining / per_day,
+        per_day=per_day,
+        one_step=_is_one_step(work_pts),
+    )
 
 
 def extrapolate_full(
