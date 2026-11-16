@@ -36,10 +36,22 @@ _Part = namedtuple("_Part", "device mountpoint fstype opts")
 _Usage = namedtuple("_Usage", "total used free percent")
 
 
+_recordings: list[Storage] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_recordings():
+    """Close the DBs ``_recording`` made, which most tests leave open."""
+    yield
+    while _recordings:
+        _recordings.pop().close()
+
+
 def _recording(tmp_path, hours: float):
     """A DB with *hours* of system samples ending now; returns it and its start."""
     start = time.time() - hours * _HOUR - 120
     store = make_db(tmp_path, hours=hours)
+    _recordings.append(store)
     add_sys_baseline(store, hours=hours + 1 / 60, start_ts=start)
     return store, start
 
@@ -1729,6 +1741,43 @@ class TestFilesystemWhoseSizeDrifts:
 
         assert _found(diag, "DISK-FULL-01") == []
         assert _pending(diag) != {}
+
+    @staticmethod
+    def _resized(tmp_path, ratio):
+        """12 h of a mount filling 2 GiB an hour, its total times *ratio* from hour 9."""
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            [
+                {
+                    "ts": start + m * 60,
+                    "mountpoint": "/tank",
+                    "total": int(500 * _GiB * (ratio if m >= 9 * 60 else 1)),
+                    "used": int(100 * _GiB + 2 * _GiB * m / 60),
+                    "read_only": 0,
+                }
+                for m in range(12 * 60 + 1)
+            ],
+        )
+        return _run(store, "DISK-FULL-01")
+
+    @pytest.mark.parametrize("ratio", [0.905, 1.105], ids=["9.5% less", "10.5% more"])
+    def test_a_change_up_to_ten_percent_of_the_larger_size_is_one_filesystem(
+        self, tmp_path, ratio
+    ):
+        diag = self._resized(tmp_path, ratio)
+
+        assert len(_found(diag, "DISK-FULL-01")) == 1
+        assert _pending(diag) == {}
+
+    @pytest.mark.parametrize("ratio", [0.895, 1.115], ids=["10.5% less", "11.5% more"])
+    def test_a_change_beyond_ten_percent_of_the_larger_size_is_another(
+        self, tmp_path, ratio
+    ):
+        diag = self._resized(tmp_path, ratio)
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert set(_pending(diag)) == {("DISK-FULL-01", "/tank")}
 
 
 _STICK_A = "1A2B-3C4D"

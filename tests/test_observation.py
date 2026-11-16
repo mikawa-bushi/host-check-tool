@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 
 import psutil
@@ -247,7 +248,7 @@ class TestSpikeTriggerWithoutPsi:
         db = tmp_path / "busy.db"
         _record(db, proc_root=proc, samplers={"system": SystemSampler()})
 
-        with sqlite3.connect(db) as conn:
+        with closing(sqlite3.connect(db)) as conn:
             kinds = [
                 r[0] for r in conn.execute("SELECT trigger_type FROM spike_events")
             ]

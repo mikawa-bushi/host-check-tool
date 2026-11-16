@@ -29,14 +29,19 @@ _CAP = 0.6
 
 
 class _Reader(Sampler):
-    """The service or kernel-log sampler, whose reads hang from call *hang_from* on."""
+    """The service or kernel-log sampler, whose reads hang from call *hang_from* on.
+
+    The calls before it take *before* seconds.
+    """
 
     tier = "T3"
 
-    def __init__(self, name: str, *, hang: float, hang_from: int = 1) -> None:
+    def __init__(
+        self, name: str, *, hang: float, hang_from: int = 1, before: float = 0.0
+    ) -> None:
         self.name = name
         self.interval_key = f"{name}_interval"
-        self.hang, self.hang_from = hang, hang_from
+        self.hang, self.hang_from, self.before = hang, hang_from, before
         self.calls = 0
         self._lock = threading.Lock()
 
@@ -44,8 +49,9 @@ class _Reader(Sampler):
         with self._lock:
             self.calls += 1
             call = self.calls
-        if call >= self.hang_from:
-            time.sleep(self.hang)
+        delay = self.hang if call >= self.hang_from else self.before
+        if delay:
+            time.sleep(delay)
         row = make_row(
             "kernel_events",
             ts=time.time(),
@@ -193,6 +199,21 @@ def test_a_read_that_ends_inside_the_stop_wait_is_kept_and_read_once_more(
     assert kept == ["kernel_log 1", "kernel_log 2"]
     noted = _rows(db, "SELECT detail FROM ops_events WHERE kind = 'sampler_failed'")
     assert not any("停止時" in d for (d,) in noted), noted
+
+
+def test_the_read_after_one_that_ended_in_time_cannot_hold_the_stop(tmp_path):
+    reader = _Reader("kernel_log", hang=2.0, hang_from=2, before=0.45)
+
+    took = _stop_took(_recorder(tmp_path, [reader], 0.3), 0.3)
+
+    assert took < 1.1, "the read that follows is waited for as long as the others"
+    db = tmp_path / "stop.db"
+    assert [m for (m,) in _rows(db, "SELECT message FROM kernel_events")] == [
+        "kernel_log 1"
+    ]
+    assert _rows(db, "SELECT 1 FROM ops_events WHERE kind = 'stopped'")
+    noted = _rows(db, "SELECT detail FROM ops_events WHERE kind = 'sampler_failed'")
+    assert any("kernel_log: 停止時" in d for (d,) in noted), noted
 
 
 def test_the_last_reads_are_written_by_the_stop_itself(tmp_path):

@@ -64,9 +64,9 @@ class _Recording:
         self.kinds: list[str] = []
         self.cursor = cursor
 
-    def tick(self) -> bool:
-        """Run one collect; whether it succeeded."""
-        self.clock.now += _INTERVAL
+    def tick(self, after: float = _INTERVAL) -> bool:
+        """Run one collect *after* seconds later; whether it succeeded."""
+        self.clock.now += after
         batches = self.sampler.run(self.ctx)
         for batch in batches:
             for row in batch.rows:
@@ -357,6 +357,21 @@ class TestAJournalThatCameBackAfterTwoFailedReads:
         assert recording.kinds == ["io_error", "io_error"]
         assert Capability.KERNEL_LOG not in recording.ctx.unobserved
 
+    def test_a_check_of_the_position_that_fails_keeps_it_unobserved(
+        self, journal, clock
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        journal.fail_cursor_reads(2)
+        journal.log(recording.after_tick(100), _IO_ERROR)
+        assert recording.ticks(2) == [False, False]
+        journal.fail_cursor_lookups()
+
+        assert recording.tick() is True
+
+        assert recording.kinds == ["io_error"]
+        assert Capability.KERNEL_LOG in recording.ctx.unobserved
+
     def test_a_journal_that_never_reads_stays_unobserved(self, journal, clock):
         journal.log(_T0 - 100, _BOOT)
         recording = _Recording(clock)
@@ -531,6 +546,23 @@ class TestTwoLinesOfTheSameTimeAndText:
         assert recording.ticks(3) == [False, False, True]
 
         assert recording.kinds == ["io_error"]
+
+    def test_two_identical_lines_read_one_after_the_other_are_not_recorded_again(
+        self, journal, clock
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        assert recording.tick() is True
+        logged = clock.now + 0.1
+        journal.log(logged, _IO_ERROR)
+        assert recording.tick(0.2) is True
+        journal.log(logged, _IO_ERROR)
+        assert recording.tick(0.2) is True
+        journal.reject_cursors()
+
+        assert recording.tick(0.2) is True
+
+        assert recording.kinds == ["io_error", "io_error"]
 
 
 class _ScriptedKernelLog(KernelLogSampler):

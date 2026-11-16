@@ -12,7 +12,8 @@ here is ``s=fake;i=<n>`` for the entry numbered *n*; entries a vacuum dropped
 keep their numbers, which no later entry takes.
 
 Faults a test can arm: the next reads from a cursor fail without saying why
-(a timeout, a busy journal), every cursor is refused, the whole journal is down.
+(a timeout, a busy journal), every cursor is refused, a look-up of one entry by
+``--cursor`` fails (a journalctl that does not know it), the whole journal is down.
 """
 
 from __future__ import annotations
@@ -56,6 +57,9 @@ with open(root + "/journal", encoding="utf-8") as f:
 newest = shown[-1][0] if shown else faults.get("dropped", 0)
 alive = False
 if opt("--cursor"):
+    if faults.get("fail_cursor_lookups"):
+        sys.stderr.write("journalctl: injected failure\n")
+        sys.exit(1)
     given = re.fullmatch(r"s=fake;i=(\d+)", opt("--cursor"))
     if not given:
         sys.stderr.write("Failed to seek to cursor: Invalid argument\n")
@@ -135,6 +139,10 @@ class FakeJournal:
     def fail_cursor_reads(self, count: int = -1) -> None:
         """Make the next *count* reads from a cursor fail (-1: all of them)."""
         self._arm(fail_cursor_reads=count)
+
+    def fail_cursor_lookups(self, on: bool = True) -> None:
+        """Make ``--cursor`` (asking whether an entry is still there) fail."""
+        self._arm(fail_cursor_lookups=on)
 
     def reject_cursors(self, on: bool = True) -> None:
         self._arm(reject_cursors=on)

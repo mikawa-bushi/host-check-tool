@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,18 @@ def good_db(tmp_path) -> Path:
     return path
 
 
+def _write(path: Path, *statements: str) -> None:
+    """Run *statements* on the DB at *path*, committed, and close the connection."""
+    with closing(sqlite3.connect(path)) as conn, conn:
+        for statement in statements:
+            conn.execute(statement)
+
+
+def _count(path: Path, table: str) -> int:
+    with closing(sqlite3.connect(path)) as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
 def _lines(result) -> list[str]:
     return [ln for ln in result.output.splitlines() if ln.strip()]
 
@@ -57,8 +70,7 @@ def _assert_refused(result) -> None:
 def _make_bad_dbs(tmp_path: Path, good_db: Path) -> dict[str, Path]:
     newer = tmp_path / "newer.db"
     shutil.copy(good_db, newer)
-    with sqlite3.connect(newer) as conn:
-        conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+    _write(newer, "UPDATE meta SET value='99' WHERE key='schema_version'")
     truncated = tmp_path / "truncated.db"
     data = good_db.read_bytes()
     truncated.write_bytes(data[: len(data) // 2])
@@ -309,10 +321,11 @@ class TestOldDb:
     def old_db(self, request, tmp_path, good_db):
         old = tmp_path / "old.db"
         shutil.copy(good_db, old)
-        with sqlite3.connect(old) as conn:
-            for table in request.param:
-                conn.execute(f"DROP TABLE {table}")
-            conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        _write(
+            old,
+            *(f"DROP TABLE {table}" for table in request.param),
+            "UPDATE meta SET value='1' WHERE key='schema_version'",
+        )
         return old
 
     def test_status_reads_it(self, runner, old_db):
@@ -368,20 +381,11 @@ class TestPrune:
     def test_a_bad_retention_is_refused_before_deleting(
         self, runner, good_db, option, value
     ):
-        before = (
-            sqlite3.connect(good_db)
-            .execute("SELECT COUNT(*) FROM sys_samples")
-            .fetchone()
-        )
+        before = _count(good_db, "sys_samples")
         result = runner.invoke(cli, ["prune", "--db", str(good_db), option, value])
         _assert_refused(result)
         assert option in result.output and value in result.output
-        after = (
-            sqlite3.connect(good_db)
-            .execute("SELECT COUNT(*) FROM sys_samples")
-            .fetchone()
-        )
-        assert after == before
+        assert _count(good_db, "sys_samples") == before
 
 
 class TestInit:
@@ -454,10 +458,7 @@ def _foreign_db(tmp_path: Path, good_db: Path, kind: str) -> Path:
         statements = ["UPDATE meta SET value='abc' WHERE key='schema_version'"]
     else:
         statements = FOREIGN_DBS[kind]
-    with sqlite3.connect(path) as conn:
-        for statement in statements:
-            conn.execute(statement)
-    conn.close()
+    _write(path, *statements)
     return path
 
 
@@ -496,8 +497,6 @@ class TestForeignDb:
         db = tmp_path / "old.db"
         with Storage(db) as store:
             store.set_meta("hostname", "x")
-        with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
-        conn.close()
+        _write(db, "UPDATE meta SET value='1' WHERE key='schema_version'")
         result = runner.invoke(cli, ["record", "--db", str(db), "--duration", "2s"])
         assert result.exit_code == 0, result.output

@@ -487,8 +487,10 @@ class TestRecorder:
         result = rec.run()
 
         assert result == 0
-        storage = Storage(tmp_path / "test.db")
-        rows = storage.conn.execute("SELECT COUNT(*) AS c FROM sys_samples").fetchone()
+        with Storage(tmp_path / "test.db") as storage:
+            rows = storage.conn.execute(
+                "SELECT COUNT(*) AS c FROM sys_samples"
+            ).fetchone()
         assert rows["c"] >= 1, "sys_samples must have at least one row"
 
     def test_spike_event_recorded(self, tmp_path: Path):
@@ -510,8 +512,8 @@ class TestRecorder:
         )
         rec.run()
 
-        storage = Storage(tmp_path / "test.db")
-        rows = storage.conn.execute("SELECT * FROM spike_events").fetchall()
+        with Storage(tmp_path / "test.db") as storage:
+            rows = storage.conn.execute("SELECT * FROM spike_events").fetchall()
         assert len(rows) >= 1, "spike_events must have at least one row"
 
         for row in rows:
@@ -540,6 +542,7 @@ class TestRecorder:
         n = rec._storage.conn.execute(
             "SELECT COUNT(*) AS c FROM ops_events WHERE kind='gap'"
         ).fetchone()["c"]
+        rec._storage.close()
         assert n == 1
 
     def test_ops_events_has_stopped(self, tmp_path: Path):
@@ -559,10 +562,10 @@ class TestRecorder:
         )
         rec.run()
 
-        storage = Storage(tmp_path / "test.db")
-        rows = storage.conn.execute(
-            "SELECT * FROM ops_events WHERE kind='stopped'"
-        ).fetchall()
+        with Storage(tmp_path / "test.db") as storage:
+            rows = storage.conn.execute(
+                "SELECT * FROM ops_events WHERE kind='stopped'"
+            ).fetchall()
         assert len(rows) >= 1, "ops_events must contain a 'stopped' row"
 
     def test_meta_populated(self, tmp_path: Path):
@@ -582,8 +585,8 @@ class TestRecorder:
         )
         rec.run()
 
-        storage = Storage(tmp_path / "test.db")
-        meta = storage.meta()
+        with Storage(tmp_path / "test.db") as storage:
+            meta = storage.meta()
         assert "hostname" in meta, "meta must have hostname"
         assert "kernel" in meta, "meta must have kernel"
         assert meta["cpu_count"] == str(psutil.cpu_count())
@@ -611,10 +614,10 @@ class TestRecorder:
         )
         rec.run()
 
-        storage = Storage(tmp_path / "test.db")
-        rows = storage.conn.execute(
-            "SELECT * FROM ops_events WHERE kind='throttle_down'"
-        ).fetchall()
+        with Storage(tmp_path / "test.db") as storage:
+            rows = storage.conn.execute(
+                "SELECT * FROM ops_events WHERE kind='throttle_down'"
+            ).fetchall()
         assert len(rows) >= 1, "throttle_down must appear in ops_events"
 
     def test_t2b_callable_interval_respects_factor(self, tmp_path: Path):
