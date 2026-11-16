@@ -31,8 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, NoReturn, Optional
 import click
 
 from . import __version__
-from .core.util import read_only_filesystem
-from .output import atomic_output
+from .output import atomic_output, read_only_filesystem
 from .plugins import load_plugins
 
 if TYPE_CHECKING:
@@ -79,7 +78,7 @@ def _reason(exc: OSError) -> str:
 
 
 def _db_error(exc: sqlite3.Error, shown: object) -> str:
-    """The error line for a DB that raised *exc*, naming a busy or failing one for what it is."""
+    """The error line for a DB that raised *exc*: busy, failing or unusable."""
     reason = str(exc)
     if "locked" in reason or "busy" in reason:
         return (

@@ -153,18 +153,6 @@ def normalize_cmdline(
     return hash12, display
 
 
-def read_only_filesystem(path: object) -> bool:
-    """Whether *path* is on a file system mounted read-only.
-
-    ``os.access`` is False both for a missing permission and for such a mount,
-    and only the first can be cured with ``chmod``.
-    """
-    try:
-        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
-    except OSError:
-        return False
-
-
 def should_use_color(no_color: bool = False) -> bool:
     """Whether ANSI colour should be emitted to stdout.
 

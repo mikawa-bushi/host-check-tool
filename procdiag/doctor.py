@@ -33,7 +33,8 @@ import psutil
 
 from . import kernlog
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig, config_trust_problem
-from .core.util import GiB, MiB, read_only_filesystem
+from .core.util import GiB, MiB
+from .output import read_only_filesystem
 from .samplers.thermal import ThermalSampler
 
 # ---------------------------------------------------------------------------
