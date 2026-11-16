@@ -41,6 +41,7 @@ from .trend import (
     confidence_from_fit,
     days_until,
     fit_linear,
+    fit_shortfall_hours,
     observed_fit,
     proc_details,
     proc_label,
@@ -118,6 +119,9 @@ class FdLeakRule(MeasuredRule):
     # Allow tests to override thresholds on the class.
     slope_warning_fd_h: float = _FD_LEAK_SLOPE_WARNING_FD_H
     min_r2: float = _FD_LEAK_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
@@ -231,6 +235,9 @@ class ThreadLeakRule(MeasuredRule):
     slope_warning_h: float = _THREAD_LEAK_SLOPE_WARNING_H
     min_r2: float = _THREAD_LEAK_MIN_R2
 
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
+
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
@@ -336,6 +343,11 @@ class ZombieRule(MeasuredRule):
     # Minimum slope (zombies/h) and R² to emit INFO.
     slope_warning_h: float = _ZOMBIE_SLOPE_WARNING_H
     min_r2: float = _ZOMBIE_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(
+            store, window, ("proc_counts", "ts"), ("proc_samples", "ts")
+        )
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         series = self._counted_series(store, window)

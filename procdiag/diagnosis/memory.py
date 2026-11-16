@@ -49,6 +49,7 @@ from .trend import (
     baseline_deviation,
     confidence_from_fit,
     detect_recurrence,
+    fit_shortfall_hours,
     learn_baseline,
     observed_fit,
     proc_details,
@@ -160,6 +161,9 @@ class MemLeakRule(MeasuredRule):
     slope_warning_mb_h: float = _MEM_LEAK_SLOPE_WARNING_MB_H
     slope_critical_mb_h: float = _MEM_LEAK_SLOPE_CRITICAL_MB_H
     min_r2: float = _MEM_LEAK_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
