@@ -1482,9 +1482,15 @@ class Storage:
         return (row["missing"] or 0) / row["total"]
 
     def recent_events(self, limit: int) -> List[sqlite3.Row]:
-        """Return the newest *limit* ``ops_events`` rows, oldest first."""
+        """Return the newest *limit* ``ops_events`` rows, oldest first.
+
+        What a session could not observe (``unobserved``, up to five rows at
+        its start) is a fact about the session, not a recent event: it would
+        push the stops and gaps out of a short list.  ``check`` reports it.
+        """
         rows = self.conn.execute(
-            "SELECT * FROM ops_events ORDER BY ts DESC, rowid DESC LIMIT ?",
+            "SELECT * FROM ops_events WHERE kind != 'unobserved'"
+            " ORDER BY ts DESC, rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return rows[::-1]
