@@ -35,10 +35,22 @@ _Part = namedtuple("_Part", "device mountpoint fstype opts")
 _Usage = namedtuple("_Usage", "total used free percent")
 
 
+_recordings: list[Storage] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_recordings():
+    """Close the DBs ``_recording`` made, which most tests leave open."""
+    yield
+    while _recordings:
+        _recordings.pop().close()
+
+
 def _recording(tmp_path, hours: float):
     """A DB with *hours* of system samples ending now; returns it and its start."""
     start = time.time() - hours * _HOUR - 120
     store = make_db(tmp_path, hours=hours)
+    _recordings.append(store)
     add_sys_baseline(store, hours=hours + 1 / 60, start_ts=start)
     return store, start
 

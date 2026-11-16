@@ -14,6 +14,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -353,7 +354,7 @@ class TestPruneValidation:
         db = _copy(mixed_template, tmp_path)
 
         def raw_rows() -> int:
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 return conn.execute("SELECT COUNT(*) FROM proc_samples").fetchone()[0]
 
         before = raw_rows()
