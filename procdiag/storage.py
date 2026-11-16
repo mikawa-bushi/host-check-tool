@@ -1869,10 +1869,14 @@ class Storage:
     # ------------------------------------------------------------------
 
     def _insert_event(self, kind: str, detail: str) -> None:
-        """Insert an ops_event inside the caller's transaction (no commit)."""
+        """Insert an ops_event inside the caller's transaction (no commit).
+
+        The detail may name a host path or process (stored as
+        :func:`storable_text`).
+        """
         self.conn.execute(
             "INSERT INTO ops_events (ts, kind, detail) VALUES (?, ?, ?)",
-            (time.time(), kind, detail),
+            (time.time(), kind, storable_text(detail)),
         )
 
 
