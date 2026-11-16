@@ -22,6 +22,7 @@ Key design decisions (mirroring netdiag/Watcher):
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import platform
 import signal
@@ -33,7 +34,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from . import spikes
+from . import service, spikes
 from .config import ProcdiagConfig
 from .core.result import Capability
 from .core.sampler import Note, RunContext, SampleBatch, Sampler
@@ -56,6 +57,12 @@ _EVENT_SAMPLERS = ("service", "kernel_log")
 # soon (a small or missing directory) is kept in the same tick, as when walks
 # ran on the scheduler thread; a longer one no longer holds the 1 s sampling.
 _DIR_WALK_WAIT_SEC = 0.1
+# What the stop waits for a walk that is still running at most.  A walk stuck
+# on a mount holds its whole time budget, which can add up to the service's
+# TimeoutStopSec; after that systemd kills the recorder with its session open.
+_STOP_WALK_WAIT_MAX_SEC = service.TIMEOUT_STOP_SEC / 3
+# How long a walk may run past its whole time budget before it counts as stuck.
+_WALK_STUCK_SLACK_SEC = 30.0
 
 
 class Recorder:
@@ -92,6 +99,10 @@ class Recorder:
         Monotonic clock callable (injectable for tests).
     sleep:
         Sleep callable (injectable for tests).
+    on_start:
+        Called once the DB took the session's meta and the samplers are set
+        up, just before the first tick; not called when the recording cannot
+        start.
     """
 
     def __init__(
@@ -107,8 +118,10 @@ class Recorder:
         storage: Optional[Storage] = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        on_start: Optional[Callable[[], None]] = None,
     ) -> None:
         self._config = config
+        self._on_start = on_start
         self._duration = duration
         self._clock = clock
         self._sleep = sleep
@@ -246,10 +259,24 @@ class Recorder:
                 "cpu_count": str(psutil.cpu_count() or ""),
                 "boot_time": str(boot_time),
                 "procdiag_version": _VERSION,
-                "config": self._config.model_dump_json(),
+                "config": self._config_json(),
                 "started_ts": str(time.time()),
             }
         )
+
+    def _config_json(self) -> str:
+        """The config as JSON text for ``meta``.
+
+        A path from the host that is not UTF-8 (a watch dir named in Shift_JIS)
+        carries lone surrogates that pydantic cannot encode; ``json`` writes
+        them as ``\\udcNN`` escapes, which read back as the same text.
+        """
+        try:
+            return self._config.model_dump_json()
+        except ValueError:
+            return json.dumps(
+                self._config.model_dump(mode="json"), separators=(",", ":")
+            )
 
     # ------------------------------------------------------------------
     # Sampling helpers
@@ -393,7 +420,10 @@ class Recorder:
         Returns whether there are rows to flush.
         """
         walk = self._dir_walk
-        if walk is None or walk.running():
+        if walk is None:
+            return False
+        if walk.running():
+            self._note_stuck_walk(walk)
             return False
         self._dir_walk = None
         for batch in walk.batches:
@@ -402,6 +432,26 @@ class Recorder:
             self._ctx.notes.extend(walk.ctx.notes)
             self._keep_failure_notes()
         return bool(walk.batches)
+
+    def _note_stuck_walk(self, walk: "_DirWalk") -> None:
+        """Say once that a walk outlived its whole time budget by far.
+
+        Nothing else tells why ``dir_samples`` stops: a walk that never ends
+        keeps the next one from starting.
+        """
+        if "dir_walk" in self._noted:
+            return
+        if walk.age() <= walk.budget + _WALK_STUCK_SLACK_SEC:
+            return
+        self._ctx.notes.append(
+            Note(
+                "dir_walk",
+                f"disk_dirs: 監視ディレクトリの走査が時間予算 ({walk.budget:g} 秒) を"
+                "過ぎても終わりません (マウント先が応答していない可能性)。"
+                "終わるまで dir_samples を記録できません",
+            )
+        )
+        self._keep_failure_notes()
 
     def _flush(self, reason: str) -> bool:
         """Write the buffered rows; on failure say why and keep them buffered."""
@@ -590,6 +640,8 @@ class Recorder:
         self._keep_unobserved()
         if self._trigger is None:
             self._trigger = self._build_trigger()
+        if self._on_start is not None:
+            self._on_start()
 
         # Attach selfmeter to context.
         if self._selfmeter is not None:
@@ -653,9 +705,9 @@ class Recorder:
                 if self._clock() >= deadline:
                     self._stop.set()
 
-            # Poll often enough to be responsive but not so often that it adds
-            # overhead: every system_interval is fine.
-            sched.add("_duration_check", sc.system_interval, _check_duration)
+            # Every second at most, so a long system_interval does not stretch
+            # the duration.
+            sched.add("_duration_check", min(sc.system_interval, 1.0), _check_duration)
 
         # Run the scheduler loop (blocks until _stop is set).
         try:
@@ -671,15 +723,24 @@ class Recorder:
         except Exception:
             logger.exception("シャットダウン例外")
         saved = self._flush("signal")
-        # A walk stuck on a mount holds this wait for its whole budget, which
-        # can be as long as the service's TimeoutStopSec: what is recorded is
-        # already written by now.
+        # A walk stuck on a mount gets the capped wait only: what is recorded
+        # is already written by now.
         try:
             walk = self._dir_walk
             if walk is not None:
-                walk.join(walk.budget)
+                walk.join(min(walk.budget, _STOP_WALK_WAIT_MAX_SEC))
                 if self._take_dir_walk():
                     saved = self._flush("interval")
+                elif self._dir_walk is not None:
+                    self._ctx.notes.append(
+                        Note(
+                            "dir_walk_stop",
+                            "disk_dirs: 停止時に監視ディレクトリの走査が終わらなかったため、"
+                            "その結果は記録していません "
+                            "(マウント先が応答していない可能性)",
+                        )
+                    )
+                    self._keep_failure_notes()
         except Exception:
             logger.exception("シャットダウン例外")
         if saved:
@@ -769,6 +830,7 @@ class _DirWalk:
         self.batches: list[SampleBatch] = []
         # The walk ends by itself within this (one time budget per directory).
         self.budget = sum(wd.time_budget_sec for wd in ctx.config.sampling.watch_dirs)
+        self._started = time.monotonic()
         self._thread = threading.Thread(
             target=self._walk, args=(sampler,), name="procdiag-dir-walk", daemon=True
         )
@@ -782,6 +844,10 @@ class _DirWalk:
 
     def running(self) -> bool:
         return self._thread.is_alive()
+
+    def age(self) -> float:
+        """Seconds since the walk started."""
+        return time.monotonic() - self._started
 
     def join(self, timeout: float) -> None:
         self._thread.join(timeout)
