@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import types
+from pathlib import Path
 
 import pytest
 from click.shell_completion import BashComplete
@@ -84,32 +85,42 @@ class TestShellCompletion:
 
 
 class TestUnwritablePlace:
-    @pytest.fixture()
-    def read_only_fs(self, monkeypatch):
-        """Make every folder look like one on a file system mounted read-only."""
-        real = os.statvfs
+    @staticmethod
+    def _cannot_write(monkeypatch, folder, *, read_only: bool) -> None:
+        """Make *folder* refuse writes, as on a file system mounted read-only or not."""
+        real_access, real_statvfs = os.access, os.statvfs
+
+        def access(path, mode, **kwargs):
+            if Path(path).is_relative_to(folder):
+                return False
+            return real_access(path, mode, **kwargs)
 
         def statvfs(path):
-            return types.SimpleNamespace(f_flag=real(path).f_flag | os.ST_RDONLY)
+            flag = real_statvfs(path).f_flag
+            if read_only and Path(path).is_relative_to(folder):
+                flag |= os.ST_RDONLY
+            return types.SimpleNamespace(f_flag=flag)
 
+        monkeypatch.setattr(os, "access", access)
         monkeypatch.setattr(os, "statvfs", statvfs)
-        monkeypatch.setattr(os, "access", lambda *a, **k: False)
 
     def test_quick_out_on_a_read_only_file_system_says_so(
-        self, runner, tmp_path, read_only_fs
+        self, runner, tmp_path, monkeypatch
     ):
         out = tmp_path / "usb"
         out.mkdir()
+        self._cannot_write(monkeypatch, out, read_only=True)
         result = runner.invoke(cli, ["quick", "--duration", "1s", "--out", str(out)])
         assert result.exit_code == 4, result.output
         assert "読み取り専用" in result.output
         assert "Permission denied" not in result.output
 
     def test_check_output_on_a_read_only_file_system_says_so(
-        self, runner, tmp_path, good_db, read_only_fs
+        self, runner, tmp_path, good_db, monkeypatch
     ):
         out = tmp_path / "usb" / "r.html"
         out.parent.mkdir()
+        self._cannot_write(monkeypatch, out.parent, read_only=True)
         result = runner.invoke(
             cli, ["check", "--db", str(good_db), "--output", str(out)]
         )
@@ -117,15 +128,24 @@ class TestUnwritablePlace:
         assert "読み取り専用" in result.output
 
     def test_a_plain_permission_problem_is_still_a_permission_problem(
-        self, runner, tmp_path, monkeypatch
+        self, runner, tmp_path, good_db, monkeypatch
     ):
-        out = tmp_path / "locked"
-        out.mkdir()
-        monkeypatch.setattr(os, "access", lambda *a, **k: False)
-        result = runner.invoke(cli, ["quick", "--duration", "1s", "--out", str(out)])
-        assert result.exit_code == 4, result.output
-        assert "読み取り専用" not in result.output
-        assert "書き込めません" in result.output
+        quick_out = tmp_path / "locked"
+        quick_out.mkdir()
+        report = tmp_path / "usb" / "r.html"
+        report.parent.mkdir()
+        self._cannot_write(monkeypatch, tmp_path / "locked", read_only=False)
+        quick = runner.invoke(
+            cli, ["quick", "--duration", "1s", "--out", str(quick_out)]
+        )
+        self._cannot_write(monkeypatch, report.parent, read_only=False)
+        check = runner.invoke(
+            cli, ["check", "--db", str(good_db), "--output", str(report)]
+        )
+        for result in (quick, check):
+            assert result.exit_code == 4, result.output
+            assert "読み取り専用" not in result.output
+            assert "書き込めません" in result.output
 
 
 class TestBusyDb:
@@ -143,6 +163,12 @@ class TestBusyDb:
         self, runner, tmp_path, locked_db, monkeypatch, command
     ):
         monkeypatch.chdir(tmp_path)
+        connect = sqlite3.connect
+        monkeypatch.setattr(
+            sqlite3,
+            "connect",
+            lambda *a, **kw: connect(*a, **{"timeout": 0.05, **kw}),
+        )
         result = runner.invoke(cli, [command, "--db", str(locked_db)])
         assert result.exit_code == 4, result.output
         assert "使用中" in result.output

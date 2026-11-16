@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, NoReturn, Optional
 import click
 
 from . import __version__
+from .core.util import read_only_filesystem
 from .output import atomic_output
 from .plugins import load_plugins
 
@@ -54,6 +55,10 @@ _EXIT_USAGE = 4
 # What the shell reports for a process killed by SIGPIPE (128 + 13): the reader
 # of stdout went away, e.g. ``procdiag export | head``.
 _EXIT_CLOSED_PIPE = 141
+# What the shell reports for a process ended by Ctrl-C (128 + SIGINT).
+_EXIT_INTERRUPTED = 130
+
+_READ_ONLY_MOUNT = "読み取り専用のファイルシステムにあります"
 
 _DB_MISSING_MSG = (
     "エラー: DB ファイルが見つかりません: {db}\n"
@@ -71,6 +76,22 @@ def _reason(exc: OSError) -> str:
     """The cause of an ``OSError`` without the errno prefix, with its path."""
     reason = exc.strerror or str(exc)
     return f"{reason}: {exc.filename}" if exc.filename else reason
+
+
+def _db_error(exc: sqlite3.Error, shown: object) -> str:
+    """The error line for a DB that raised *exc*, naming a busy or failing one for what it is."""
+    reason = str(exc)
+    if "locked" in reason or "busy" in reason:
+        return (
+            f"DB は他のプロセスが使用中です: {shown} ({reason})。"
+            "記録を止めるか、しばらくしてからもう一度実行してください"
+        )
+    if "disk I/O error" in reason:
+        return (
+            f"DB の読み書き中にディスクの I/O エラーが起きました: {shown} ({reason})。"
+            "ディスクの状態を確認してください"
+        )
+    return f"DB を使えません: {shown} ({reason})"
 
 
 @contextmanager
@@ -100,7 +121,7 @@ def _db_guard(*dbs: object) -> Iterator[None]:
             if "readonly" in str(exc)
             else ""
         )
-        _fail(f"DB を使えません: {shown} ({exc}){hint}")
+        _fail(f"{_db_error(exc, shown)}{hint}")
 
 
 def _output_problem(path: Path, *, make_parents: bool = False) -> Optional[str]:
@@ -112,13 +133,17 @@ def _output_problem(path: Path, *, make_parents: bool = False) -> Optional[str]:
     if path.is_dir():
         return "ディレクトリです。ファイル名まで指定してください"
     if path.exists():
-        return None if os.access(path, os.W_OK) else "書き込めません"
+        if os.access(path, os.W_OK):
+            return None
+        return _READ_ONLY_MOUNT if read_only_filesystem(path) else "書き込めません"
     folder = path.parent
     while make_parents and not folder.exists():
         folder = folder.parent
     if not folder.is_dir():
         return f"フォルダ {folder} がありません"
     if not os.access(folder, os.W_OK | os.X_OK):
+        if read_only_filesystem(folder):
+            return f"フォルダ {folder} は{_READ_ONLY_MOUNT}"
         return f"フォルダ {folder} に書き込めません"
     return None
 
@@ -490,6 +515,14 @@ class _ProcdiagGroup(click.Group):
             exc.exit_code = _EXIT_USAGE
             raise
 
+    # Bare ``procdiag`` shows the help and succeeds.  click 8.1 does that; click
+    # 8.2 and later treat it as a usage error, which would be 4 here.
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not args and not ctx.resilient_parsing:
+            click.echo(ctx.get_help(), color=ctx.color)
+            ctx.exit(0)
+        return super().parse_args(ctx, args)
+
     def invoke(self, ctx: click.Context) -> Any:
         try:
             try:
@@ -502,6 +535,11 @@ class _ProcdiagGroup(click.Group):
         except BrokenPipeError:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
             sys.exit(_EXIT_CLOSED_PIPE)
+        except KeyboardInterrupt:
+            # Not click's "Aborted!" with exit 1, which check and quick give to
+            # "problems found".  130 is what a shell reports for a SIGINT.
+            click.echo("中断しました。", err=True)
+            sys.exit(_EXIT_INTERRUPTED)
         except click.UsageError as exc:
             exc.exit_code = _EXIT_USAGE
             raise
@@ -509,6 +547,9 @@ class _ProcdiagGroup(click.Group):
     def get_command(self, ctx: click.Context, cmd_name: str) -> Optional[click.Command]:
         replacement = _REMOVED_COMMANDS.get(cmd_name)
         if replacement is not None:
+            if ctx.resilient_parsing:
+                # Shell completion: nothing to offer after a removed command.
+                return click.Command(cmd_name, add_help_option=False)
             # Exit 4, not click's usage code 2: an old CI job calling a removed
             # name must not read as check's "info only" (2) and pass.
             err = click.UsageError(
@@ -665,8 +706,11 @@ def record(
                 raise
             # 1, not 4: a DB folder that is missing or read-only now (a disk
             # mounted late) can clear up, and the unit restarts on 1.
-            reason = _reason(exc) if isinstance(exc, OSError) else str(exc)
-            click.echo(f"エラー: DB を使えません: {cfg.db_path} ({reason})", err=True)
+            if isinstance(exc, OSError):
+                message = f"DB を使えません: {cfg.db_path} ({_reason(exc)})"
+            else:
+                message = _db_error(exc, cfg.db_path)
+            click.echo(f"エラー: {message}", err=True)
             sys.exit(1)
     click.echo("記録を開始します。停止するには Ctrl-C を押してください。")
     sys.exit(recorder.run())
@@ -835,7 +879,9 @@ def quick(
         if not occupied:
             out.mkdir(parents=True, exist_ok=True)
             if not os.access(out, os.W_OK | os.X_OK):
-                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+                if read_only_filesystem(out):
+                    raise OSError(errno.EROFS, _READ_ONLY_MOUNT)
+                raise PermissionError(errno.EACCES, "書き込めません")
     except OSError as exc:
         click.echo(
             f"エラー: 出力先を使えません: {out} ({exc.strerror})\n"
