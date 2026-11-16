@@ -14,17 +14,17 @@ from __future__ import annotations
 import math
 import statistics
 from bisect import bisect_left, bisect_right
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence
 
-from ..core import Confidence, Finding, Measurement, Observation, covers
+from ..core import Confidence, Finding, Measurement, Observation, Window, covers
 from ..core.util import CMDLINE_SAMPLE_CHARS
 
 if TYPE_CHECKING:
-    from ..storage import ProcIdentity
+    from ..storage import ProcIdentity, Storage
 
 # ---------------------------------------------------------------------------
 # TrendFit — result of linear regression
@@ -38,13 +38,15 @@ class TrendFit:
     ``slope_per_hour`` is the rate of change in the same unit as the series
     values (e.g. bytes/hour for RSS).  ``r2`` quantifies how well a straight
     line explains the variance (0–1; 1 is perfect).  ``span_hours`` is the
-    time the points cover, holes in the recording left out.
+    time the points cover, holes in the recording left out; ``step_seconds`` is
+    the usual spacing of the points.
     """
 
     slope_per_hour: float
     r2: float
     n: int
     span_hours: float
+    step_seconds: float = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +87,64 @@ class Period:
 # The engine gate lets a window two minutes short through, so a series inside
 # it spans more than the requirement less five minutes.  On raw series such
 # as disk rows or proc_counts this only adds leniency.  Each segment between
-# holes in the recording loses that much at its edges.
-def _series_covers(span_hours: float, hours: float, segments: int = 1) -> bool:
-    return covers(span_hours + segments * 3 / 60, hours)
+# holes in the recording loses that much at its edges.  Rows sampled less often
+# than every minute (``process_interval``) lose two steps and a minute instead.
+def _series_covers(
+    span_hours: float, hours: float, segments: int = 1, step: float = 60.0
+) -> bool:
+    lost_minutes = 2 * max(step, 60.0) / 60.0 + 1
+    return covers(span_hours + segments * lost_minutes / 60, hours)
+
+
+# A line needs this many points whatever hours a rule asks for.
+_FIT_MIN_POINTS = 12
+# Past this long a recording holds the points of any sampling interval worth
+# using, so it is never what a rule that finds none is short of.
+_FIT_SHORTFALL_MAX_HOURS = 6.0
+
+
+def fit_shortfall_hours(
+    store: "Storage",
+    window: "Window",
+    *sources: tuple[str, str],
+    min_points: int = _FIT_MIN_POINTS,
+) -> float:
+    """Hours of recording still missing before *window* can hold *min_points* points.
+
+    *sources* are ``(table, timestamp column)``; the first with rows in the
+    window gives the sampling interval.  *min_points* points stamped every step
+    span ``min_points - 1`` steps.  0.0 once the window is that long, so a
+    recording that has the points and still no line has nothing to wait for.
+    Without this, a rule whose minimum hours were set below that would run, fit
+    nothing, and read as healthy.
+    """
+    if window.observed_hours >= _FIT_SHORTFALL_MAX_HOURS:
+        return 0.0
+    for table, column in sources:
+        if not store.has_table(table):
+            continue
+        stamps = [
+            row[0]
+            for row in store.conn.execute(
+                f"SELECT DISTINCT {column} FROM {table}"
+                f" WHERE {column} BETWEEN ? AND ? ORDER BY 1",
+                (window.start_ts, window.end_ts),
+            )
+        ]
+        if stamps:
+            break
+    else:
+        return 0.0
+    steps = sorted(b - a for a, b in zip(stamps, stamps[1:]))
+    step = steps[len(steps) // 2] if steps else 60.0
+    needed = (min_points - 1) * step
+    return max(0.0, needed - window.observed_hours * 3600.0) / 3600.0
 
 
 def fit_linear(
     series: list[tuple[float, float]],
     *,
-    min_points: int = 12,
+    min_points: int = _FIT_MIN_POINTS,
     min_span_hours: float = 6.0,
     holes: Sequence[tuple[float, float]] = (),
 ) -> Optional[TrendFit]:
@@ -150,7 +201,11 @@ def fit_segments(
         sum(max(t for t, _ in seg) - min(t for t, _ in seg) for seg in segments)
         / 3600.0
     )
-    if not _series_covers(span_hours, min_span_hours, len(segments)):
+    steps = sorted(
+        b[0] - a[0] for seg in segments for a, b in zip(seg, seg[1:]) if b[0] > a[0]
+    )
+    step = steps[len(steps) // 2] if steps else 60.0
+    if not _series_covers(span_hours, min_span_hours, len(segments), step):
         return None
 
     ts_min = min(t for seg in segments for t, _ in seg)
@@ -182,7 +237,9 @@ def fit_segments(
     ss_tot = sum((y - my) ** 2 for seg, (_, my) in zip(hours, means) for _, y in seg)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 1.0
 
-    return TrendFit(slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours)
+    return TrendFit(
+        slope_per_hour=slope, r2=r2, n=n, span_hours=span_hours, step_seconds=step
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +251,13 @@ def fit_segments(
 # minutes grows while it starts up, not because it leaks.  One that ran through
 # a short stretch on its own (a PC on for half an hour a day) still counts.
 _MIN_RUN_HOURS = 1.0
+# A process that starts less than this long before the last row of another
+# process of its program continues it: a restart that starts the new process
+# before the old one has exited.
+_RESTART_OVERLAP_SEC = 300.0
+# The time between the rows of a process that has only one, and the least that
+# can be between the rows of ``proc_rollup_1m``.
+_DEFAULT_STEP_SEC = 60.0
 
 
 @dataclass
@@ -225,6 +289,26 @@ class ProcInstance:
     def last_ts(self) -> float:
         return self.runs[-1][1][-1][0]
 
+    @property
+    def step(self) -> float:
+        """The usual time between the rows of the process running last."""
+        points = self.runs[-1][1]
+        steps = sorted(b[0] - a[0] for a, b in zip(points, points[1:]))
+        return steps[len(steps) // 2] if steps else _DEFAULT_STEP_SEC
+
+    def stopped_before(self, start: float, end: float) -> bool:
+        """Whether a process of the program starting at *start* may continue it.
+
+        Its last row is at most ``_RESTART_OVERLAP_SEC`` after *start*, and the
+        recording, which ends at *end*, goes on for more than one of its steps
+        after that row: otherwise it may be running still, with another worker
+        of the program starting beside it.
+        """
+        return self.pid is None or (
+            self.last_ts <= start + _RESTART_OVERLAP_SEC
+            and end - self.last_ts > self.step
+        )
+
     def fit(
         self,
         *,
@@ -255,10 +339,16 @@ def proc_instances(
     """Follow the processes of each program in ``proc_rollup_1m`` *rows*.
 
     A process that starts once another process of the same program has stopped
-    continues that one's instance (a restart).  One that starts while every
-    instance still runs is a new instance (another worker).  When several have
-    stopped, the one that stopped last is continued.  Rows whose *column* is
-    NULL are skipped.
+    continues that one's instance (a restart), even if the old one's last row
+    is up to ``_RESTART_OVERLAP_SEC`` later.  An instance has stopped when its
+    last row is more than a step before the last row of any process: one that
+    runs to the end of the recording is running still, and a process of its
+    program that starts near the end is another worker.  One that starts while
+    every instance still runs is a new instance (another worker).  When several
+    have stopped, the one that stopped last is continued.  Rows rolled up before
+    procdiag kept processes apart (no PID) are one stretch of the program that
+    a process with a PID continues whatever the clocks say.  Rows whose
+    *column* is NULL are skipped.
     """
     runs: dict[tuple[int, Optional[int]], list[tuple[float, float]]] = {}
     for row in rows:
@@ -268,12 +358,14 @@ def proc_instances(
                 (row["ts_min"], float(v))
             )
 
+    end = max((points[-1][0] for points in runs.values()), default=0.0)
     by_program: dict[int, list[ProcInstance]] = {}
     for (proc_id, pid), points in sorted(
-        runs.items(), key=lambda kv: (kv[1][0][0], kv[0][0], kv[0][1] or 0)
+        runs.items(),
+        key=lambda kv: (kv[0][1] is not None, kv[1][0][0], kv[0][0], kv[0][1] or 0),
     ):
         instances = by_program.setdefault(proc_id, [])
-        stopped = [i for i in instances if i.last_ts <= points[0][0]]
+        stopped = [i for i in instances if i.stopped_before(points[0][0], end)]
         if stopped:
             max(stopped, key=lambda i: i.last_ts).runs.append((pid, points))
         else:
@@ -296,7 +388,9 @@ def proc_trend_observations(
     """
     observations = []
     for instance in proc_instances(rows, column):
-        fit = instance.fit(min_points=12, min_span_hours=min_span_hours, holes=holes)
+        fit = instance.fit(
+            min_points=_FIT_MIN_POINTS, min_span_hours=min_span_hours, holes=holes
+        )
         if fit is None:
             continue
         identity = identities.get(instance.proc_id)
@@ -314,6 +408,7 @@ def proc_trend_observations(
                     "r2": fit.r2,
                     "n": fit.n,
                     "span_hours": fit.span_hours,
+                    "step_seconds": fit.step_seconds,
                     "last_value": instance.last_value,
                 },
             )
@@ -428,7 +523,13 @@ def worst_process_per_program(measured: Iterable[Measurement]) -> list[Finding]:
 
 def observed_fit(obs: Observation, unit: float = 1.0) -> TrendFit:
     ev = obs.evidence
-    return TrendFit(obs.value * unit, ev["r2"], ev["n"], ev["span_hours"])
+    return TrendFit(
+        obs.value * unit,
+        ev["r2"],
+        ev["n"],
+        ev["span_hours"],
+        ev.get("step_seconds", 60.0),
+    )
 
 
 def days_until(current: float, limit: float, slope_per_hour: float) -> Optional[float]:
@@ -466,9 +567,13 @@ def confidence_from_fit(
     * ``MEDIUM`` — ``r2 >= medium_r2`` **and** the span covers ``min_observation_hours``
     * ``LOW``    — otherwise
     """
-    if fit.r2 >= high_r2 and _series_covers(fit.span_hours, high_span_hours):
+
+    def covered(hours: float) -> bool:
+        return _series_covers(fit.span_hours, hours, step=fit.step_seconds)
+
+    if fit.r2 >= high_r2 and covered(high_span_hours):
         return Confidence.HIGH
-    if fit.r2 >= medium_r2 and _series_covers(fit.span_hours, min_observation_hours):
+    if fit.r2 >= medium_r2 and covered(min_observation_hours):
         return Confidence.MEDIUM
     return Confidence.LOW
 
@@ -543,11 +648,79 @@ class Forecast:
     """When a growing value reaches its capacity.
 
     ``per_day`` is the growth per day of the fit behind ``days_left``, so the
-    two always agree: ``days_left * per_day`` is what was left.
+    two always agree: ``days_left * per_day`` is what was left.  ``one_step``
+    says most of the growth happened within a short time and the value has not
+    risen since, so the line through it says how fast the one step was, not how
+    fast the value grows.
     """
 
     days_left: float
     per_day: float
+    one_step: bool = False
+
+
+# A growth is one step when this share of it falls in a window of this share of
+# the series' time and the value then stays where the step took it, for at least
+# as long as the window: it rises by less than this share of the step again.
+# Growth that goes on to the last samples, or comes and goes as a log does, is a
+# trend, not a step.
+_ONE_STEP_SHARE = 0.7
+_ONE_STEP_WINDOW = 1 / 6
+_ONE_STEP_AFTERMATH = 0.1
+
+
+def _biggest_rise(
+    points: Sequence[tuple[float, float]], width: float
+) -> tuple[float, int]:
+    """The biggest rise of the value within *width* seconds, and where it ends.
+
+    Returns the rise and the index of the first point at the value it rises to.
+    """
+    best, best_end = 0.0, 0
+    after: deque[int] = deque()  # indexes within *width* after i, falling values
+    last = 0
+    for i, (t, value) in enumerate(points):
+        while last + 1 < len(points) and points[last + 1][0] - t <= width:
+            last += 1
+            while after and points[after[-1]][1] < points[last][1]:
+                after.pop()
+            after.append(last)
+        while after and after[0] <= i:
+            after.popleft()
+        if after and points[after[0]][1] - value > best:
+            best, best_end = points[after[0]][1] - value, after[0]
+    return best, best_end
+
+
+def _largest_rise(points: Sequence[tuple[float, float]]) -> float:
+    """The most the value rises from an earlier point to a later one."""
+    low, best = points[0][1], 0.0
+    for _, value in points:
+        low = min(low, value)
+        best = max(best, value - low)
+    return best
+
+
+def _is_one_step(points: Sequence[tuple[float, float]]) -> bool:
+    """Whether *points* rose mostly within a sixth of their time, and then stayed.
+
+    The value that follows the step may fall (an archive unpacked and removed),
+    but must not rise by more than a tenth of the step: a log that is rotated
+    rises again after each drop, and growth that has just begun rises up to the
+    last sample.
+    """
+    width = (points[-1][0] - points[0][0]) * _ONE_STEP_WINDOW
+    total = points[-1][1] - points[0][1]
+    if total <= 0 or width <= 0:
+        return False
+    rise, end = _biggest_rise(points, width)
+    if rise < _ONE_STEP_SHARE * total:
+        return False
+    after = points[end:]
+    return (
+        after[-1][0] - after[0][0] >= width
+        and _largest_rise(after) <= _ONE_STEP_AFTERMATH * rise
+    )
 
 
 def forecast_full(
@@ -583,7 +756,11 @@ def forecast_full(
 
     per_day = fit.slope_per_hour * 24.0
     remaining = max(0.0, capacity - work_pts[-1][1])
-    return Forecast(days_left=remaining / per_day, per_day=per_day)
+    return Forecast(
+        days_left=remaining / per_day,
+        per_day=per_day,
+        one_step=_is_one_step(work_pts),
+    )
 
 
 def extrapolate_full(
@@ -776,20 +953,25 @@ def _binomial_tail(n: int, p: float, k: int) -> float:
 # ---------------------------------------------------------------------------
 
 
-def detect_recurrence(events_by_day: dict[str, bool]) -> float:
+def detect_recurrence(
+    events_by_day: dict[str, bool], weights: Optional[Mapping[str, float]] = None
+) -> float:
     """Return the fraction of days on which the event occurred.
 
     *events_by_day* maps date-string keys (YYYY-MM-DD) to a boolean indicating
     whether the event occurred on that day.  Used by MEM-PRESSURE-01 to
-    measure how often chronic memory pressure was observed.
+    measure how often chronic memory pressure was observed.  A day counts as
+    much as its entry in *weights* (1.0 when it has none), so a day observed
+    for only part of it, without the event, says less against it.
 
     Returns 0.0 for an empty dict.
     """
     if not events_by_day:
         return 0.0
-    total = len(events_by_day)
-    hits = sum(1 for v in events_by_day.values() if v)
-    return hits / total
+    weights = weights or {}
+    total = sum(weights.get(day, 1.0) for day in events_by_day)
+    hits = sum(weights.get(day, 1.0) for day, hit in events_by_day.items() if hit)
+    return hits / total if total > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------

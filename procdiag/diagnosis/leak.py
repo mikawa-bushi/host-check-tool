@@ -41,6 +41,7 @@ from .trend import (
     confidence_from_fit,
     days_until,
     fit_linear,
+    fit_shortfall_hours,
     observed_fit,
     proc_details,
     proc_label,
@@ -118,6 +119,9 @@ class FdLeakRule(MeasuredRule):
     # Allow tests to override thresholds on the class.
     slope_warning_fd_h: float = _FD_LEAK_SLOPE_WARNING_FD_H
     min_r2: float = _FD_LEAK_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
@@ -231,6 +235,9 @@ class ThreadLeakRule(MeasuredRule):
     slope_warning_h: float = _THREAD_LEAK_SLOPE_WARNING_H
     min_r2: float = _THREAD_LEAK_MIN_R2
 
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
+
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
             store.rows("proc_rollup_1m", since=window.start_ts, until=window.end_ts),
@@ -307,7 +314,8 @@ class ZombieRule(MeasuredRule):
     (confidence MEDIUM — the counts are exact, the trend is a regression).  A
     blip of one or two zombies in one scan is not a trend.  For DBs recorded
     before schema v4 the count is approximated as rows with ``cpu_pct=0``,
-    ``rss=0`` and at most one thread, and the finding is marked
+    ``rss=0`` and at most one thread (kernel threads by name left out), and the
+    finding is marked
     ``confidence=LOW`` / ``method="approx"``.
     """
 
@@ -335,6 +343,11 @@ class ZombieRule(MeasuredRule):
     # Minimum slope (zombies/h) and R² to emit INFO.
     slope_warning_h: float = _ZOMBIE_SLOPE_WARNING_H
     min_r2: float = _ZOMBIE_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(
+            store, window, ("proc_counts", "ts"), ("proc_samples", "ts")
+        )
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         series = self._counted_series(store, window)
@@ -422,20 +435,23 @@ class ZombieRule(MeasuredRule):
         # Query proc_samples for zombie approximation: psutil reads a zombie as
         # cpu_pct=0, rss=0 and one thread, so rows with cpu_pct=0 (or NULL),
         # rss=0 (or NULL) and num_threads<=1 (or NULL).  Kernel threads read the
-        # same, which only shifts the level, not the trend.  Aggregated per
-        # distinct timestamp.
+        # same, and a pool of them grows and shrinks with load, so those named
+        # like one (``kworker/0:1``, ``ksoftirqd/3``: a ``/`` in the name) are
+        # left out.  Aggregated per distinct timestamp.
         try:
             rows = store.conn.execute(
                 """
-                SELECT ts,
+                SELECT s.ts,
                        COUNT(*) AS zombie_approx
-                FROM proc_samples
-                WHERE ts >= ? AND ts <= ?
-                  AND (cpu_pct = 0 OR cpu_pct IS NULL)
-                  AND (rss = 0 OR rss IS NULL)
-                  AND (num_threads <= 1 OR num_threads IS NULL)
-                GROUP BY ts
-                ORDER BY ts
+                FROM proc_samples s
+                LEFT JOIN proc_registry r ON r.proc_id = s.proc_id
+                WHERE s.ts >= ? AND s.ts <= ?
+                  AND (s.cpu_pct = 0 OR s.cpu_pct IS NULL)
+                  AND (s.rss = 0 OR s.rss IS NULL)
+                  AND (s.num_threads <= 1 OR s.num_threads IS NULL)
+                  AND (r.name IS NULL OR instr(r.name, '/') = 0)
+                GROUP BY s.ts
+                ORDER BY s.ts
                 """,
                 (window.start_ts, window.end_ts),
             ).fetchall()

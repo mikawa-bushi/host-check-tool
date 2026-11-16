@@ -46,10 +46,11 @@ _TIMESPAN_SEC = {
     "h": 3600.0,
     "d": 86400.0,
     "w": 604800.0,
+    "month": 2629800.0,
     "M": 2629800.0,
     "y": 31557600.0,
 }
-_TIMESPAN_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)(us|ms|min|s|h|d|w|M|y)")
+_TIMESPAN_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)(us|ms|min|month|s|h|d|w|M|y)")
 
 
 def available() -> bool:

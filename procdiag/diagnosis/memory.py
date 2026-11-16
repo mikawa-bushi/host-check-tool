@@ -25,6 +25,7 @@ Design doc reference: §6.2 MEM-LEAK-01 / MEM-PRESSURE-01 / SWAP-THRASH-01.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
@@ -49,6 +50,7 @@ from .trend import (
     baseline_deviation,
     confidence_from_fit,
     detect_recurrence,
+    fit_shortfall_hours,
     learn_baseline,
     observed_fit,
     proc_details,
@@ -160,6 +162,9 @@ class MemLeakRule(MeasuredRule):
     slope_warning_mb_h: float = _MEM_LEAK_SLOPE_WARNING_MB_H
     slope_critical_mb_h: float = _MEM_LEAK_SLOPE_CRITICAL_MB_H
     min_r2: float = _MEM_LEAK_MIN_R2
+
+    def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
+        return fit_shortfall_hours(store, window, ("proc_rollup_1m", "ts_min"))
 
     def observe(self, store: "Storage", window: Window) -> list[Observation]:
         return proc_trend_observations(
@@ -321,6 +326,7 @@ _MEM_PRESSURE_MIN_SWAP_OUT: int = MiB
 # Pressure days needed, and the share of the observed days they must be.
 _MEM_PRESSURE_MIN_DAYS: int = 2
 _MEM_PRESSURE_MIN_RECURRENCE: float = 0.6
+_DAY_MINUTES = 24 * 60
 
 
 def _local_day(ts: float) -> str:
@@ -418,11 +424,13 @@ class MemPressureRule(Rule):
     whole timeline so that midnight never cuts one in two.  Runs less than six
     hours apart (gaps in the data included) are one *occurrence*: a run broken
     by a dip or a missing row, or one bad night made of several runs.  An
-    occurrence counts when ``min_swap_out_bytes`` were swapped out within a
-    minute of its runs.  Taken in time order, it makes a *pressure day* of the
-    earliest local day it touches that is not one yet, so a run across
-    midnight is one day and two nights are two days, however their minutes
-    fall on either side.  It also makes a pressure day of each day it covers for
+    occurrence with swap-out within a minute of its runs is credited, in time
+    order, to the earliest local day it touches that is not a *pressure day*
+    yet, so a run across midnight is one day and two nights are two days,
+    however their minutes fall on either side.  A day is a pressure day once
+    the swap-out credited to it reaches ``min_swap_out_bytes``: one occurrence
+    that swapped that much, or several that did together (two runs a day of
+    half a MiB each).  It also makes a pressure day of each day it covers for
     ``min_day_observed_hours`` (first run's start to last run's end) with
     ``min_swap_out_bytes`` of that day's own, and the earliest day needs that
     much swap-out besides theirs: unbroken pressure with swap-out throughout is
@@ -433,9 +441,16 @@ class MemPressureRule(Rule):
     or a day cut short by a gap or a power loss) is a day only when it already
     holds the pressure.  Fires WARNING when at least ``min_pressure_days`` days
     are pressure days and they are at least ``min_recurrence_fraction`` of the
-    observed days.  A recording with fewer than ``min_pressure_days`` observed
-    days is reported as not evaluable (``recording_shortfall_hours``), never as
-    healthy.
+    observed days, where a pressure day counts as a day and any other day as
+    much as it was observed of the *typical day* (at most 1), so a few quiet
+    hours at an edge of the recording do not outweigh the days that show the
+    pattern, and a PC that runs only part of each day is not read as quiet on
+    the hours it was off.  The typical day is the median observed time of the
+    days observed for at least ``min_day_observed_hours`` (24 hours at most):
+    one long day in a recording of short ones does not make the short ones
+    count for little.  A recording with fewer than
+    ``min_pressure_days`` observed days is reported as not evaluable
+    (``recording_shortfall_hours``), never as healthy.
 
     PSI columns absent from the DB (all None) → silent (no finding).
     """
@@ -449,10 +464,12 @@ class MemPressureRule(Rule):
     requires_observed = (Capability.PSI,)
     what = (
         "sys_rollup_1m の psi_mem_max が閾値超の状態が一定時間以上途切れず続いた圧迫を、"
-        "間が 6 時間未満なら 1 回とまとめ、前後の swap_out_sum も一定量以上ある回を"
-        "そのローカル日のうちまだ数えていない最も早い日 (長く続いてその日の分だけで"
-        "スワップのある日も) の圧迫日とし、圧迫日が観測が十分なローカル日"
-        " (観測が短くても圧迫日を含む) の過半数で反復するかを判定する"
+        "間が 6 時間未満なら 1 回とまとめ、前後の swap_out_sum のある回を"
+        "そのローカル日のうちまだ圧迫日でない最も早い日 (長く続いてその日の分だけで"
+        "スワップのある日も) に数え、数えた swap_out_sum が一定量以上になった日を圧迫日とし、"
+        "圧迫日が観測が十分なローカル日 (観測が短くても圧迫日を含み、圧迫のない日は"
+        "観測が十分な日の観測時間の中央値に対する観測できた長さの割合で数える) の"
+        "過半数で反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
@@ -493,7 +510,8 @@ class MemPressureRule(Rule):
 
         need = self.min_day_observed_hours * 60
         days: set[str] = set()
-        counted: list[_Occurrence] = []
+        credit: dict[str, int] = {}
+        credited: list[tuple[_Occurrence, Optional[str], bool]] = []
         for occurrence in _occurrences(runs):
             swap_out_by_day: dict[str, int] = {}
             for bucket in occurrence.surroundings:
@@ -503,9 +521,8 @@ class MemPressureRule(Rule):
                         swap_out_by_day.get(day, 0) + swap_out_by_bucket[bucket]
                     )
             swap_out = sum(swap_out_by_day.values())
-            if swap_out < self.min_swap_out_bytes:
+            if swap_out == 0:
                 continue
-            counted.append(occurrence)
             covered = _minutes_by_day(occurrence.span)
             long_days = {
                 day
@@ -518,10 +535,22 @@ class MemPressureRule(Rule):
             spare = swap_out - sum(
                 swap_out_by_day.get(day, 0) for day in long_days - {earliest}
             )
-            if earliest is not None and spare >= self.min_swap_out_bytes:
-                days.add(earliest)
+            if earliest is not None:
+                credit[earliest] = credit.get(earliest, 0) + spare
+                if credit[earliest] >= self.min_swap_out_bytes:
+                    days.add(earliest)
             days |= long_days
+            credited.append((occurrence, earliest, swap_out >= self.min_swap_out_bytes))
 
+        # An occurrence counts on its own swap-out, or, when none of the
+        # occurrences credited to its day has enough, with the others that made
+        # that day a pressure day together.
+        enough_on_its_own = {day for _, day, own in credited if own}
+        counted = [
+            occurrence
+            for occurrence, day, own in credited
+            if own or (day in days and day not in enough_on_its_own)
+        ]
         around = {b for occurrence in counted for b in occurrence.surroundings}
         return _Pressure(
             frozenset(days),
@@ -539,6 +568,13 @@ class MemPressureRule(Rule):
             for day, minutes in observed_minutes.items()
             if minutes >= need or day in pressure_days
         }
+
+    def _typical_day_minutes(self, observed_minutes: Mapping[str, int]) -> float:
+        """The median time observed of the days with ``min_day_observed_hours`` of it."""
+        need = self.min_day_observed_hours * 60
+        whole = [minutes for minutes in observed_minutes.values() if minutes >= need]
+        typical = statistics.median(whole) if whole else _DAY_MINUTES
+        return float(min(_DAY_MINUTES, typical))
 
     def recording_shortfall_hours(self, store: "Storage", window: Window) -> float:
         """Hours still to record before ``min_pressure_days`` days are observed.
@@ -587,16 +623,24 @@ class MemPressureRule(Rule):
             return []
 
         pressure = self._pressure(rollup_rows)
-        events_by_day = self._judged_days(
-            _observed_minutes_by_day(rollup_rows), pressure.days
-        )
+        observed = _observed_minutes_by_day(rollup_rows)
+        events_by_day = self._judged_days(observed, pressure.days)
 
         n_days = len(events_by_day)
         pressure_days = sorted(d for d, hit in events_by_day.items() if hit)
         n_pressure_days = len(pressure_days)
         if n_days < self.min_pressure_days or n_pressure_days < self.min_pressure_days:
             return []
-        recurrence = detect_recurrence(events_by_day)
+        # A pressure day is a whole day.  A day without pressure counts as much
+        # as it was observed of the typical day, so a few hours at an edge do not
+        # outvote the days that show the pattern, and a PC that runs 8 hours a day
+        # has whole days of 8 hours, with or without one long day among them.
+        typical_day = self._typical_day_minutes(observed)
+        weights = {
+            day: 1.0 if hit else min(1.0, observed[day] / typical_day)
+            for day, hit in events_by_day.items()
+        }
+        recurrence = detect_recurrence(events_by_day, weights)
         if recurrence < self.min_recurrence_fraction:
             return []
 
@@ -612,6 +656,8 @@ class MemPressureRule(Rule):
             "recurrence_fraction": round(recurrence, 2),
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
+            "observed_day_equivalents": round(sum(weights.values()), 2),
+            "typical_day_hours": round(typical_day / 60.0, 2),
             "pressure_days": pressure_days,
             "swap_out_total_bytes": pressure.swap_out,
             "pressure_event_count": pressure.minutes,
@@ -640,7 +686,7 @@ class MemPressureRule(Rule):
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"
             f" {self.min_pressure_minutes}分以上途切れず続きスワップアウトを伴った圧迫のあった日が"
-            f" {n_pressure_days}/{n_days} 日"
+            f" {n_pressure_days}/{evidence['observed_day_equivalents']:g} 日"
             f" (圧迫中のスワップアウト {humanize_bytes(pressure.swap_out)})"
         )
 

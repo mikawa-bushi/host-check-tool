@@ -118,8 +118,8 @@ def _diagnose_dir_rules(store: Storage):
 
 class TestUnreadableWatchDirIsNotNoGrowth:
     def test_unreadable_only_watch_dir_leaves_the_rules_not_evaluated(self, tmp_path):
-        store = make_db(tmp_path, hours=3)
-        add_sys_baseline(store, hours=3)
+        store = make_db(tmp_path, hours=13)
+        add_sys_baseline(store, hours=13)
         _scan_into(store, tmp_path / "not-mounted-yet")
 
         diag = _diagnose_dir_rules(store)
@@ -133,8 +133,8 @@ class TestUnreadableWatchDirIsNotNoGrowth:
         data = tmp_path / "data"
         data.mkdir()
         (data / "a.bin").write_bytes(b"x" * 1000)
-        store = make_db(tmp_path, hours=3)
-        add_sys_baseline(store, hours=3)
+        store = make_db(tmp_path, hours=13)
+        add_sys_baseline(store, hours=13)
         _scan_into(store, data, tmp_path / "typo")
 
         diag = _diagnose_dir_rules(store)
@@ -146,8 +146,8 @@ class TestUnreadableWatchDirIsNotNoGrowth:
         ]
 
     def test_a_host_without_watch_dirs_keeps_the_rules_evaluated(self, tmp_path):
-        store = make_db(tmp_path, hours=3)
-        add_sys_baseline(store, hours=3)
+        store = make_db(tmp_path, hours=13)
+        add_sys_baseline(store, hours=13)
 
         diag = _diagnose_dir_rules(store)
         store.close()
