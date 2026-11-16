@@ -145,7 +145,7 @@ def test_a_failing_read_still_leaves_its_note_and_what_it_could_not_observe(tmp_
 
 
 def test_stop_does_not_wait_for_a_read_that_is_still_hanging(tmp_path, monkeypatch):
-    monkeypatch.setattr(recorder_mod, "_STOP_READ_WAIT_MAX_SEC", 0.3, raising=False)
+    monkeypatch.setattr(recorder_mod, "_STOP_WAIT_MAX_SEC", 0.3)
     kernel_log = _KernelLog(hang=6.0, hangs=10)
 
     code, _, db, took = _record(tmp_path, kernel_log, duration=0.5)
@@ -187,5 +187,5 @@ def test_the_event_samplers_are_read_on_their_own_thread_and_once_more_at_stop(
     )
     assert rec.run() == 0
 
-    assert threads[0].startswith("procdiag-")
-    assert threads[-1] == threading.main_thread().name
+    assert len(threads) >= 2
+    assert all(t.startswith("procdiag-") for t in threads)

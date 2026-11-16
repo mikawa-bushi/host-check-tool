@@ -504,6 +504,22 @@ class TestTwoLinesOfTheSameTimeAndText:
 
         assert recording.kinds == ["io_error", "io_error"]
 
+    def test_two_identical_lines_read_together_are_not_recorded_again(
+        self, journal, clock
+    ):
+        journal.log(_T0 - 100, _BOOT)
+        recording = _Recording(clock)
+        assert recording.tick() is True
+        logged = recording.after_tick(_INTERVAL) - 0.3
+        journal.log(logged, _IO_ERROR)
+        journal.log(logged, _IO_ERROR)
+        assert recording.tick() is True
+        journal.fail_cursor_reads()
+
+        assert recording.ticks(3) == [False, False, True]
+
+        assert recording.kinds == ["io_error", "io_error"]
+
     def test_a_line_read_twice_by_time_is_still_recorded_once(self, journal, clock):
         journal.log(_T0 - 100, _BOOT)
         recording = _Recording(clock)

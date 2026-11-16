@@ -1257,6 +1257,7 @@ def explain(name: Optional[str]) -> None:
     """
     from .core.rule import all_rules, get_rule
     from .core.sampler import all_samplers, get_sampler
+    from .core.util import neutralize
 
     _load_registries()
 
@@ -1296,7 +1297,10 @@ def explain(name: Optional[str]) -> None:
         )
         _print_detail(heading, sampler_cls, what_label="計測内容")
     else:
-        _fail(f"不明な名前です: {name} (procdiag explain で一覧を表示できます)")
+        _fail(
+            f"不明な名前です: {neutralize(name)} "
+            "(procdiag explain で一覧を表示できます)"
+        )
 
 
 def _group_by(registry: dict[str, type], attr: str) -> dict[str, list[str]]:

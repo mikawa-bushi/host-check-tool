@@ -23,7 +23,7 @@ from procdiag import recorder as recorder_mod
 from procdiag.config import ProcdiagConfig, SamplingConfig, WatchDir
 from procdiag.core.sampler import RunContext, SampleBatch, Sampler
 from procdiag.recorder import Recorder
-from procdiag.storage import make_row
+from procdiag.storage import Storage, make_row
 
 _CAP = 0.6
 
@@ -193,6 +193,26 @@ def test_a_read_that_ends_inside_the_stop_wait_is_kept_and_read_once_more(
     assert kept == ["kernel_log 1", "kernel_log 2"]
     noted = _rows(db, "SELECT detail FROM ops_events WHERE kind = 'sampler_failed'")
     assert not any("停止時" in d for (d,) in noted), noted
+
+
+def test_the_last_reads_are_written_by_the_stop_itself(tmp_path):
+    db = tmp_path / "stop.db"
+    store = Storage(db)
+    reader = _Reader("kernel_log", hang=0.0)
+    rec = Recorder(
+        _config(),
+        storage=store,
+        samplers={"system": FakeSampler(), "kernel_log": reader},
+        selfmeter=FakeSelfmeter(),
+        duration=0.3,
+    )
+    try:
+        assert rec.run() == 0
+        kept = [m for (m,) in _rows(db, "SELECT message FROM kernel_events")]
+    finally:
+        store.close()
+
+    assert f"kernel_log {reader.calls}" in kept
 
 
 def test_a_stuck_walk_and_a_hung_read_share_the_stop_wait(tmp_path):

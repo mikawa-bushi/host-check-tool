@@ -59,21 +59,21 @@ _EVENT_SAMPLERS = ("service", "kernel_log")
 # How long the job that starts such a read waits for it.  A read that ends this
 # soon is kept in the same tick; a slower one no longer holds the 1 s sampling.
 _EVENT_READ_WAIT_SEC = 0.1
-# What the stop waits for a read that is still running, at most.  A hung
-# journalctl and a hung systemctl wait one after the other, and the walk waits
-# too, within the service's TimeoutStopSec.
-_STOP_READ_WAIT_MAX_SEC = service.TIMEOUT_STOP_SEC / 6
 
 # How long the dir job waits for the walk it started.  A walk that ends this
 # soon (a small or missing directory) is kept in the same tick, as when walks
 # ran on the scheduler thread; a longer one no longer holds the 1 s sampling.
 _DIR_WALK_WAIT_SEC = 0.1
-# What the stop waits for a walk that is still running at most.  A walk stuck
-# on a mount holds its whole time budget, which can add up to the service's
-# TimeoutStopSec; after that systemd kills the recorder with its session open.
-_STOP_WALK_WAIT_MAX_SEC = service.TIMEOUT_STOP_SEC / 3
 # How long a walk may run past its whole time budget before it counts as stuck.
 _WALK_STUCK_SLACK_SEC = 30.0
+
+# What the stop waits for what still runs, at most, in all: the reads of the
+# event samplers (the ones running and the last ones it starts) and a watch-dir
+# walk.  A hung journalctl and a hung systemctl each hold their 10 s timeout, and
+# a walk stuck on a mount holds its whole time budget; after the service's
+# TimeoutStopSec systemd kills the recorder with its session open.  Everything
+# recorded is written before the wait, so only what is not finished is lost.
+_STOP_WAIT_MAX_SEC = service.TIMEOUT_STOP_SEC / 3
 
 
 class Recorder:
@@ -495,44 +495,81 @@ class Recorder:
             self._keep_unobserved()
         return True
 
-    def _final_event_read(self, name: str) -> None:
-        """At stop, read an event sampler once more to keep what it has not read yet.
+    def _final_event_reads(self, deadline: float) -> None:
+        """At stop, read the event samplers once more to keep what they have not read yet.
 
-        A read that still runs is waited for a little; one that does not end
-        waits on the same hung command a new read would, so none is started.
+        A read that is still running began before the last lines were logged:
+        when it ends by *deadline* it is kept and one more follows.  One that
+        does not end waits on the same hung command a new read would, so none is
+        started.  The samplers are read at once; whatever is not done by
+        *deadline* is left out and noted.
         """
-        if name in self._event_reads:
-            self._event_reads[name].join(_STOP_READ_WAIT_MAX_SEC)
-            if not self._take_event_read(name):
-                self._ctx.notes.append(
-                    Note(
-                        f"{name}_stop",
-                        f"{name}: 停止時に読み取りが終わらなかったため、最後の読み取りは"
-                        "記録していません (journalctl / systemctl が応答していない可能性)",
-                    )
-                )
-                self._keep_failure_notes(name)
-                return
-        self._run_sampler(name)
+        names = [name for name in _EVENT_SAMPLERS if name in self._samplers]
+        running = [name for name in names if name in self._event_reads]
+        pending = [name for name in names if name not in running]
+        for name in pending:
+            self._event_reads[name] = _EventRead(self._samplers[name], self._ctx)
+        for name in running:
+            if self._wait_for_read(name, deadline):
+                self._event_reads[name] = _EventRead(self._samplers[name], self._ctx)
+                pending.append(name)
+        for name in pending:
+            self._wait_for_read(name, deadline)
 
-    def _take_dir_walk(self) -> bool:
-        """Buffer the rows and notes of a finished walk, on the scheduler thread.
+    def _wait_for_read(self, name: str, deadline: float) -> bool:
+        """Keep the read of *name* once it is done, waiting until *deadline* at most.
 
-        Returns whether there are rows to flush.
+        Notes the read that is not done by then (it stays running); returns
+        whether it was done.
         """
+        self._event_reads[name].join(max(0.0, deadline - time.monotonic()))
+        if self._take_event_read(name):
+            return True
+        self._ctx.notes.append(
+            Note(
+                f"{name}_stop",
+                f"{name}: 停止時に読み取りが終わらなかったため、最後の読み取りは"
+                "記録していません (journalctl / systemctl が応答していない可能性)",
+            )
+        )
+        self._keep_failure_notes(name)
+        return False
+
+    def _take_dir_walk(self) -> None:
+        """Buffer the rows and notes of a finished walk, on the scheduler thread."""
         walk = self._dir_walk
         if walk is None:
-            return False
+            return
         if walk.running():
             self._note_stuck_walk(walk)
-            return False
+            return
         self._dir_walk = None
         for batch in walk.batches:
             self._storage.buffer(batch.table, batch.rows)
         if walk.ctx.notes:
             self._ctx.notes.extend(walk.ctx.notes)
             self._keep_failure_notes("disk")
-        return bool(walk.batches)
+
+    def _wait_for_dir_walk(self, deadline: float) -> None:
+        """Keep a walk that is still running once it is done, waiting until *deadline* at most.
+
+        A walk that is not done by then is left out and noted.
+        """
+        walk = self._dir_walk
+        if walk is None:
+            return
+        walk.join(max(0.0, min(walk.budget, deadline - time.monotonic())))
+        self._take_dir_walk()
+        if self._dir_walk is not None:
+            self._ctx.notes.append(
+                Note(
+                    "dir_walk_stop",
+                    "disk_dirs: 停止時に監視ディレクトリの走査が終わらなかったため、"
+                    "その結果は記録していません "
+                    "(マウント先が応答していない可能性)",
+                )
+            )
+            self._keep_failure_notes("disk")
 
     def _note_stuck_walk(self, walk: "_DirWalk") -> None:
         """Say once that a walk outlived its whole time budget by far.
@@ -823,33 +860,18 @@ class Recorder:
             logger.exception("スケジューラループ例外")
 
         # Graceful shutdown: the session is closed even when the last rows
-        # cannot be written.
+        # cannot be written.  What is recorded is written before anything is
+        # waited for, so a kill during the wait (systemd's TimeoutStopSec) loses
+        # none of it; the last reads and a walk that still runs come after, in
+        # one capped wait, and are written by a second flush.
+        self._flush("signal")
         try:
-            for name in _EVENT_SAMPLERS:
-                self._final_event_read(name)
+            deadline = time.monotonic() + _STOP_WAIT_MAX_SEC
+            self._final_event_reads(deadline)
+            self._wait_for_dir_walk(deadline)
         except Exception:
             logger.exception("シャットダウン例外")
-        saved = self._flush("signal")
-        # A walk stuck on a mount gets the capped wait only: what is recorded
-        # is already written by now.
-        try:
-            walk = self._dir_walk
-            if walk is not None:
-                walk.join(min(walk.budget, _STOP_WALK_WAIT_MAX_SEC))
-                if self._take_dir_walk():
-                    saved = self._flush("interval")
-                elif self._dir_walk is not None:
-                    self._ctx.notes.append(
-                        Note(
-                            "dir_walk_stop",
-                            "disk_dirs: 停止時に監視ディレクトリの走査が終わらなかったため、"
-                            "その結果は記録していません "
-                            "(マウント先が応答していない可能性)",
-                        )
-                    )
-                    self._keep_failure_notes("disk")
-        except Exception:
-            logger.exception("シャットダウン例外")
+        saved = self._flush("interval")
         if saved:
             # Roll up the just-flushed final samples so the last (up to one
             # flush-interval + 1 min) of raw data is promoted to *_rollup_1m
