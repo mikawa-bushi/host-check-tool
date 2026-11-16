@@ -349,8 +349,23 @@ def test_every_numeric_field_is_covered():
     } <= covered
 
 
-@pytest.mark.parametrize(("model", "field"), _model_float_cases())
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def _non_finite_cases() -> list:
+    """Every float field with NaN, inf and -inf, but for one that is replaced.
+
+    ``throttle_factor`` of NaN or inf is used as 1.1 (procdiag 0.6 accepted
+    them; refusing now would end ``record`` with an exit code the unit does not
+    restart on).
+    """
+    return [
+        pytest.param(model, name, value, id=f"{value}-{model.__name__}.{name}")
+        for model in MODELS
+        for name in _float_fields(model)
+        for value in (math.nan, math.inf, -math.inf)
+        if not (model is BudgetConfig and name == "throttle_factor" and not value < 0)
+    ]
+
+
+@pytest.mark.parametrize(("model", "field", "value"), _non_finite_cases())
 def test_a_non_finite_number_is_rejected(model, field, value):
     kwargs = {"path": "/x"} if model is WatchDir else {}
     with pytest.raises(Exception, match=field):

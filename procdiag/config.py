@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from pydantic import (
     BaseModel,
@@ -51,9 +51,15 @@ class _Model(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Fields that a model replaces by a usable number itself, so that a config
+    # procdiag 0.6 accepted still loads.
+    _not_finite_ok: ClassVar[frozenset[str]] = frozenset()
+
     @model_validator(mode="after")
     def _finite_numbers(self) -> "_Model":
         for name in type(self).model_fields:
+            if name in self._not_finite_ok:
+                continue
             value = getattr(self, name)
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError(f"{name} は有限の数でなければなりません: {value}")
@@ -142,9 +148,16 @@ class TriggerConfig(_Model):
 
 
 # 1.0001 would widen an interval by 0.01 % a minute: 12 days to double it.  procdiag
-# 0.6 took any factor above 0, so a smaller one is used as this, not refused: a
-# refusal ends ``record`` with exit code 4, which the unit does not restart on.
+# 0.6 took any factor above 0 (inf and NaN too), so one that does not work is
+# used as this, not refused: a refusal ends ``record`` with exit code 4, which
+# the unit does not restart on.
 _MIN_THROTTLE_FACTOR = 1.1
+
+
+def _written(value: float) -> str:
+    """*value* as the config file wrote it: 1.5 and 1 short, 1.0999999 in full."""
+    short = f"{value:g}"
+    return short if not math.isfinite(value) or float(short) == value else repr(value)
 
 
 class BudgetConfig(_Model):
@@ -156,7 +169,9 @@ class BudgetConfig(_Model):
     # Seconds after start excluded from the overhead average (start-up cost).
     warmup_sec: float = 60.0
 
-    # The factor the config file gave, when it was below the minimum.
+    _not_finite_ok: ClassVar[frozenset[str]] = frozenset({"throttle_factor"})
+
+    # The factor the config file gave, when it was not used.
     _throttle_written: Optional[float] = PrivateAttr(default=None)
 
     @field_validator("overhead_budget_pct", "throttle_max_interval")
@@ -178,21 +193,28 @@ class BudgetConfig(_Model):
 
     @model_validator(mode="after")
     def _raise_to_the_minimum_factor(self) -> "BudgetConfig":
-        if self.throttle_factor < _MIN_THROTTLE_FACTOR:
-            self._throttle_written = self.throttle_factor
+        factor = self.throttle_factor
+        if not math.isfinite(factor) or factor < _MIN_THROTTLE_FACTOR:
+            self._throttle_written = factor
             self.throttle_factor = _MIN_THROTTLE_FACTOR
         return self
 
     def throttle_notice(self) -> Optional[str]:
         """Why ``throttle_factor`` is not what the config file says, or ``None``."""
-        if self._throttle_written is None:
+        written = self._throttle_written
+        if written is None:
             return None
         minimum = f"{_MIN_THROTTLE_FACTOR:g}"
+        if not math.isfinite(written):
+            why = "有限の数ではないため自動減速に使えません"
+        else:
+            why = (
+                f"{minimum} 未満では自動減速になりません (1 に近いと間隔がほとんど広がらず、"
+                "1 以下では広がりません)"
+            )
         return (
-            f"budget.throttle_factor に {self._throttle_written:g} が書かれていますが、"
-            f"{minimum} 未満では自動減速になりません (1 に近いと間隔がほとんど広がらず、"
-            f"1 以下では広がりません)。{minimum} として使います。"
-            f"{minimum} 以上の値に書き直してください"
+            f"budget.throttle_factor に {_written(written)} が書かれていますが、{why}。"
+            f"{minimum} として使います。{minimum} 以上の値に書き直してください"
         )
 
     @field_validator("warmup_sec")
@@ -393,7 +415,7 @@ config = ProcdiagConfig(
 
     budget=BudgetConfig(
         overhead_budget_pct=1.0,   # 自己CPUオーバーヘッド上限 (%)
-        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1.1 未満は 1.1 として使う)
+        throttle_factor=1.5,       # 超過時のTier2b間隔拡大係数 (1.1 未満・inf・nan は 1.1 として使う)
         throttle_max_interval=60.0, # 自動減速で広げる Tier2b 間隔の上限 (秒)
         warmup_sec=60.0,           # 起動直後この秒数は自己負荷の判定から除外
     ),
