@@ -62,7 +62,8 @@ class Period:
     days (hours) in which a load episode started near the anchor, out of the
     ``cycles`` recorded days (hours) that include the anchor time.
     ``chance`` bounds the probability that episodes starting at random times
-    line up this well.
+    line up this well.  ``tol_sec`` is the tolerance the search used, which is
+    not always the one asked for (see :func:`detect_periodicity`).
     """
 
     kind: str  # "daily" | "hourly"
@@ -70,6 +71,7 @@ class Period:
     count: int
     cycles: int = 0
     chance: float = 1.0
+    tol_sec: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +669,7 @@ def detect_periodicity(
                 if kind == "daily"
                 else f":{minute:02d}"
             )
-            return Period(kind, anchor, count, cycles, chance)
+            return Period(kind, anchor, count, cycles, chance, tol)
     return None
 
 

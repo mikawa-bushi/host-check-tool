@@ -346,6 +346,9 @@ class Diagnosis:
     # Rules that ran but left a part unjudged whatever the recording length
     # (``Rule.coverage_notes``): rule ID -> what it left out.
     unjudged_parts: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Thresholds of the config that a rule that ran did not use (they are also
+    # in ``quality.notes``).
+    config_notes: list[str] = field(default_factory=list)
     measurements: dict[str, list[Measurement]] = field(default_factory=dict)
     folded: list[Finding] = field(default_factory=list)
     # What the recording could not observe, cut to ``window``.

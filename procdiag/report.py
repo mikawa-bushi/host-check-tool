@@ -362,7 +362,7 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
         longest = max(r.remaining_hours for r in diag.skipped_rules if r.part is None)
         parts.append(
             f"観測時間不足で未評価 {n_skip} 件"
-            f" (あと最長 {longest:.1f} 時間の記録で全ルールを評価できます)"
+            f" (全ルールを評価するには、あと少なくとも {longest:.1f} 時間の記録が必要です)"
         )
     blind = _uncovered(diag, blind=True)
     if n_unc - len(blind):
@@ -1360,7 +1360,7 @@ def _blocked_conclusion(cmp: Comparison) -> str:
     blocked = cmp.blocked_rows
     if not blocked:
         hours = cmp.hours_to_judge
-        wait = f"あと最長 {hours:.1f} 時間、" if hours is not None else ""
+        wait = f"あと少なくとも {hours:.1f} 時間、" if hours is not None else ""
         return f"判定できません。{wait}記録を続けてから比べ直してください。"
     reasons = dict.fromkeys(r.why for r in blocked)
     advice = [_BLOCKED_ADVICE[w] for w in reasons if w in _BLOCKED_ADVICE]

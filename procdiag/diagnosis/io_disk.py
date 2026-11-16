@@ -41,6 +41,7 @@ from ..core import (
     Severity,
     SkippedRule,
     Window,
+    configure_rule,
     covers,
     register,
 )
@@ -838,6 +839,19 @@ class DiskInodeRule(Rule):
     critical_days: float = _DISK_FULL_CRITICAL_DAYS
     min_trend_hours: float = _MIN_TREND_HOURS
 
+    def configure(self, config: "ProcdiagConfig") -> None:
+        """Apply the overrides, and read DISK-FULL-01's levels as it will."""
+        super().configure(config)
+        full, _ = configure_rule(DiskFullRule, config)
+        self._bytes_levels = (full.warning_pct, full.critical_pct)
+
+    # The capacity figure of a finding is cut at DISK-FULL-01's levels, so it
+    # does not read as one that rule would flag when it is not.
+    _bytes_levels: tuple[float, float] = (
+        DiskFullRule.warning_pct,
+        DiskFullRule.critical_pct,
+    )
+
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run DISK-INODE-01 against the observation window."""
         findings: list[Finding] = []
@@ -866,9 +880,7 @@ class DiskInodeRule(Rule):
                 "inodes_total": total,
                 "used_pct": _shown_pct(used_pct, self.warning_pct, self.critical_pct),
                 "bytes_used_pct": (
-                    _shown_pct(
-                        bytes_pct, DiskFullRule.warning_pct, DiskFullRule.critical_pct
-                    )
+                    _shown_pct(bytes_pct, *self._bytes_levels)
                     if bytes_pct is not None
                     else None
                 ),

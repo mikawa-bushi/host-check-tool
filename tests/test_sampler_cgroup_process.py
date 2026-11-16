@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -290,32 +291,30 @@ class TestCgroupSamplerV2:
         ids2 = {row[1] for row in b2[0].rows}
         assert ids1 == ids2, "cg_ids must be stable across collects"
 
-    def test_unit_cache_not_refreshed_immediately(self):
+    def test_unit_cache_not_refreshed_immediately(self, tmp_path):
         """Unit enumeration is cached: adding a unit mid-session is not visible."""
+        tree = tmp_path / "cgroup_tree"
+        shutil.copytree(CGROUP_TREE, tree)
         sampler, _ = self._sampler()
-        ctx = _make_ctx(cgroup_root=CGROUP_TREE)
+        ctx = _make_ctx(cgroup_root=tree)
         sampler.setup(ctx)
         b1 = sampler.collect(ctx)
         count1 = len(b1[0].rows)
 
         # Create a new service directory (should NOT be visible yet — cache).
-        new_svc = CGROUP_TREE / "system.slice" / "newtest.service"
-        new_svc.mkdir(exist_ok=True)
+        new_svc = tree / "system.slice" / "newtest.service"
+        new_svc.mkdir()
         (new_svc / "cpu.stat").write_text("usage_usec 0\n")
         (new_svc / "memory.current").write_text("0\n")
         (new_svc / "pids.current").write_text("0\n")
-        try:
-            b2 = sampler.collect(ctx)
-            count2 = len(b2[0].rows)
-            # Count should be the same because the cache TTL has not expired.
-            assert count2 == count1, (
-                "Unit cache should not refresh immediately; "
-                f"count1={count1}, count2={count2}"
-            )
-        finally:
-            import shutil
 
-            shutil.rmtree(new_svc)
+        b2 = sampler.collect(ctx)
+        count2 = len(b2[0].rows)
+        # Count should be the same because the cache TTL has not expired.
+        assert count2 == count1, (
+            "Unit cache should not refresh immediately; "
+            f"count1={count1}, count2={count2}"
+        )
 
 
 class TestCgroupSamplerV1:

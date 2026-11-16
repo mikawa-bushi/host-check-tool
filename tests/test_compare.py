@@ -402,7 +402,13 @@ class TestLabels:
             for member in enum:
                 assert member.label and member.label.isascii() is False
         for kind in NoteKind:
-            detail = {"before": "a", "after": "b", "raw_hours": 1.0, "span_hours": 2.0}
+            detail = {
+                "before": "a",
+                "after": "b",
+                "raw_hours": 1.0,
+                "span_hours": 2.0,
+                "message": "KERNEL-ERROR-01: 既定値で評価します",
+            }
             note = Note(kind, SideName.BEFORE, {**detail, "rules": ["X"]})
             assert note.message and not note.message.isascii()
 

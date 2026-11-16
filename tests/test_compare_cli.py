@@ -452,7 +452,7 @@ class TestNothingJudged:
         after = _clean_db(tmp_path / "b", hours=2)
         result = _run(before, after)
         conclusion = result.stdout.split("結果:")[1]
-        assert "あと最長 22.0 時間" in conclusion
+        assert "あと少なくとも 22.0 時間" in conclusion
         assert "記録を続けてから比べ直してください" in conclusion
 
     def test_with_only_a_6_hour_rule_the_conclusion_names_its_wait(self, tmp_path):
@@ -460,7 +460,7 @@ class TestNothingJudged:
         after = _clean_db(tmp_path / "b", hours=2)
         result = _run(before, after, "--only", "MEM-LEAK-01")
         conclusion = result.stdout.split("結果:")[1]
-        assert "あと最長 4.0 時間" in conclusion
+        assert "あと少なくとも 4.0 時間" in conclusion
 
     def test_json_names_the_rules_neither_period_could_run(self, tmp_path):
         before = _clean_db(tmp_path / "a", hours=2)

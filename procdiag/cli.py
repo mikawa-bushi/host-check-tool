@@ -109,6 +109,8 @@ def _db_guard(*dbs: object) -> Iterator[None]:
     except StorageVersionError as exc:
         _fail(f"{shown}: {exc}")
     except sqlite3.DatabaseError as exc:
+        # A comparison opens two DBs: name the one that failed, when it says.
+        shown = str(getattr(exc, "db", None) or shown)
         for db in dbs:
             if os.path.isdir(db):
                 _fail(
@@ -1255,6 +1257,7 @@ def explain(name: Optional[str]) -> None:
     """
     from .core.rule import all_rules, get_rule
     from .core.sampler import all_samplers, get_sampler
+    from .core.util import neutralize
 
     _load_registries()
 
@@ -1294,8 +1297,10 @@ def explain(name: Optional[str]) -> None:
         )
         _print_detail(heading, sampler_cls, what_label="計測内容")
     else:
-        click.echo(f"不明な名前です: {name}", err=True)
-        sys.exit(1)
+        _fail(
+            f"不明な名前です: {neutralize(name)} "
+            "(procdiag explain で一覧を表示できます)"
+        )
 
 
 def _group_by(registry: dict[str, type], attr: str) -> dict[str, list[str]]:
@@ -1371,6 +1376,11 @@ def export(
     table = "sys_samples" if rollup == "raw" else "sys_rollup_1m"
     if out_path != "-":
         _require_output(out_path)
+    elif sys.stdout is None:
+        _fail(
+            "標準出力が閉じられているため、書き出せません。"
+            "--out で書き出すファイルを指定してください"
+        )
 
     with _db_guard(resolved_db), Storage(resolved_db, read_only=True) as store:
         if out_path == "-":
@@ -1557,7 +1567,7 @@ def doctor(
 
     終了コード: 0=すべて ok/info / 2=degraded あり
     """
-    from .doctor import run_doctor
+    from .doctor import SETTING_CHECKS, run_doctor
 
     cfg = _load_config(config_path, db_path)
     checks = run_doctor(cfg, config_path=config_path)
@@ -1574,16 +1584,15 @@ def doctor(
 
         click.echo("")
         if degraded_count:
-            db_degraded = any(
-                c.name == "db_disk" and c.status == "degraded" for c in checks
-            )
+            degraded = {c.name for c in checks if c.status == "degraded"}
+            if "db_disk" in degraded:
+                effect = "記録 DB の置き場を先に確認してください"
+            elif degraded - SETTING_CHECKS:
+                effect = "記録は可能ですが該当データは欠損します"
+            else:
+                effect = "記録はできます。上の設定の項目を確認してください"
             click.echo(
-                f"{symbols['degraded']} {degraded_count} 件の降格があります。"
-                + (
-                    "記録 DB の置き場を先に確認してください"
-                    if db_degraded
-                    else "記録は可能ですが該当データは欠損します"
-                )
+                f"{symbols['degraded']} {degraded_count} 件の降格があります。{effect}"
             )
         else:
             click.echo(f"{symbols['ok']} すべての観測能力が利用可能です")

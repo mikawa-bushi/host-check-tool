@@ -166,6 +166,21 @@ def read_events(
     return events, cursor or after_cursor
 
 
+def cursor_exists(cursor: str) -> bool:
+    """Whether the journal still holds the entry *cursor* names.
+
+    ``--cursor`` starts at that entry, or at the next one when it is gone (the
+    journal was vacuumed or rotated), and ``--show-cursor`` prints the cursor of
+    the entry it shows: the one given, only when the entry is there.  A read that
+    fails says nothing, so it is "no".
+    """
+    out, _err = run_with_stderr(
+        ["journalctl", "_TRANSPORT=kernel", "-q", "--no-pager", "-o", "short-unix"]
+        + ["--show-cursor", "--cursor", cursor, "-n", "1"]
+    )
+    return bool(out) and parse_short_unix(out)[1] == cursor
+
+
 def journal_readable() -> bool:
     """Whether this process can read kernel messages from the journal."""
     out, _err = run_with_stderr(["journalctl", "-k", "-n", "1", "-q", "--no-pager"])

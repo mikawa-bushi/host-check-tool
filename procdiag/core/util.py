@@ -163,7 +163,8 @@ def should_use_color(no_color: bool = False) -> bool:
     """
     if no_color or os.environ.get("NO_COLOR"):
         return False
-    return sys.stdout.isatty()
+    # None when the shell closed file descriptor 1 (``>&-``).
+    return sys.stdout is not None and sys.stdout.isatty()
 
 
 def storable_text(text: str) -> str:

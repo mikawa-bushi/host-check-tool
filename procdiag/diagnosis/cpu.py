@@ -141,7 +141,8 @@ class CpuPeriodicRule(Rule):
             "cycles": period.cycles,
             "chance": period.chance,
             "event_count": len(timestamps),
-            "tol_minutes": self.tol_sec / 60.0,
+            "tol_sec": period.tol_sec,
+            "tol_minutes": period.tol_sec / 60.0,
             "trigger_type": trigger_type,
         }
 

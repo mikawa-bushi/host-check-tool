@@ -60,6 +60,10 @@ class DoctorCheck:
 # (status, detail) as returned by a check body.
 _Outcome = tuple[str, str]
 
+# The checks of the config file, not of what the host can observe: when only
+# these are degraded the recording is not missing data.
+SETTING_CHECKS = frozenset({"config_security", "budget"})
+
 
 def _doctor_check(
     name: str, label: str, *, what: str, on_error: str = "degraded"

@@ -355,11 +355,6 @@ class Engine:
 
         for rule_cls in rule_classes:
             rule, config_error = configure_rule(rule_cls, self.config)
-            if config_error is not None:
-                reasoning.append(
-                    f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
-                )
-                config_notes.append(config_error)
             eff_min = rule.min_observation_hours
             if not covers(observed_hours, eff_min):
                 reasoning.append(
@@ -437,6 +432,12 @@ class Engine:
                 errored.append(rule.rule_id)
                 continue
             evaluated.append(rule.rule_id)
+            if config_error is not None:
+                # Said for a rule that ran: a skipped one was not read with the default.
+                reasoning.append(
+                    f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
+                )
+                config_notes.append(config_error)
             if isinstance(rule, MeasuredRule):
                 measurements[rule.rule_id] = measured
 
@@ -499,6 +500,7 @@ class Engine:
             errored_rules=errored,
             uncovered_rules=uncovered,
             unjudged_parts=unjudged_parts,
+            config_notes=config_notes,
             measurements=measurements,
             folded=folded,
             unobserved=unobserved,

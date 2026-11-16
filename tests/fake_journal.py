@@ -4,8 +4,12 @@ What it copies from journalctl (measured on systemd 259): ``--show-cursor``
 prints the cursor of the last line shown; ``--after-cursor`` with nothing new
 echoes the cursor it was given, while ``--since`` with nothing to show prints
 no cursor; a cursor journalctl cannot parse ends the read with exit 1 and
-"Failed to seek to cursor: Invalid argument".  A cursor here is ``s=fake;i=<n>``
-for the *n*-th line.
+"Failed to seek to cursor: Invalid argument"; ``--cursor C -n 1`` shows the entry
+C names with its own cursor, or the next one (with that one's cursor) when C is
+gone, and nothing when C is past the end; ``--after-cursor`` with a cursor that is
+gone shows what is left, and with nothing left no line and no cursor.  A cursor
+here is ``s=fake;i=<n>`` for the entry numbered *n*; entries a vacuum dropped
+keep their numbers, which no later entry takes.
 
 Faults a test can arm: the next reads from a cursor fail without saying why
 (a timeout, a busy journal), every cursor is refused, the whole journal is down.
@@ -45,10 +49,19 @@ with open(root + "/journal", encoding="utf-8") as f:
     shown = [
         (i, float(ts), message)
         for i, (ts, message) in enumerate(
-            (line.rstrip("\n").split("\t", 1) for line in f if line.strip()), 1
+            (line.rstrip("\n").split("\t", 1) for line in f if line.strip()),
+            faults.get("dropped", 0) + 1,
         )
     ]
-if opt("--after-cursor"):
+newest = shown[-1][0] if shown else faults.get("dropped", 0)
+alive = False
+if opt("--cursor"):
+    given = re.fullmatch(r"s=fake;i=(\d+)", opt("--cursor"))
+    if not given:
+        sys.stderr.write("Failed to seek to cursor: Invalid argument\n")
+        sys.exit(1)
+    shown = [line for line in shown if line[0] >= int(given.group(1))][: int(opt("-n"))]
+elif opt("--after-cursor"):
     given = re.fullmatch(r"s=fake;i=(\d+)", opt("--after-cursor"))
     if faults.get("reject_cursors") or not given:
         sys.stderr.write("Failed to seek to cursor: Invalid argument\n")
@@ -61,6 +74,7 @@ if opt("--after-cursor"):
                 json.dump(faults, f)
         sys.stderr.write("journalctl: injected failure\n")
         sys.exit(1)
+    alive = faults.get("dropped", 0) < int(given.group(1)) <= newest
     shown = [line for line in shown if line[0] > int(given.group(1))]
 elif opt("--since"):
     since = float(opt("--since").lstrip("@"))
@@ -68,14 +82,14 @@ elif opt("--since"):
 if opt("--until"):
     until = float(opt("--until").lstrip("@"))
     shown = [line for line in shown if line[1] <= until]
-if opt("-n"):
+if opt("-n") and not opt("--cursor"):
     shown = shown[-int(opt("-n")) :]
 for _i, ts, message in shown:
     print(f"{ts:.6f} edge kernel: {message}")
 if "--show-cursor" in args:
     if shown:
         print(f"-- cursor: s=fake;i={shown[-1][0]}")
-    elif opt("--after-cursor"):
+    elif opt("--after-cursor") and alive:
         print(f"-- cursor: {opt('--after-cursor')}")
 """
 
@@ -98,7 +112,6 @@ class FakeJournal:
         self._lines = self._dir / "journal"
         self._lines.touch()
         (self._dir / "calls").touch()
-        self._faults: dict = {}
         monkeypatch.setenv("FAKE_JOURNAL_DIR", str(self._dir))
         monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
@@ -110,7 +123,14 @@ class FakeJournal:
 
     def newest(self) -> str:
         count = len(self._lines.read_text(encoding="utf-8").splitlines())
-        return f"s=fake;i={count}"
+        return f"s=fake;i={self._faults().get('dropped', 0) + count}"
+
+    def vacuum(self) -> None:
+        """Drop every entry logged so far, as a vacuum does the oldest ones: a
+        cursor on one of them is gone, and no later entry takes its number."""
+        count = len(self._lines.read_text(encoding="utf-8").splitlines())
+        self._lines.write_text("", encoding="utf-8")
+        self._arm(dropped=self._faults().get("dropped", 0) + count)
 
     def fail_cursor_reads(self, count: int = -1) -> None:
         """Make the next *count* reads from a cursor fail (-1: all of them)."""
@@ -139,6 +159,14 @@ class FakeJournal:
                 bounds.append("unbounded")
         return bounds
 
+    def _faults(self) -> dict:
+        """What is armed now: the stand-in counts the failures down in the file."""
+        try:
+            return json.loads((self._dir / "faults.json").read_text(encoding="utf-8"))
+        except OSError:
+            return {}
+
     def _arm(self, **faults) -> None:
-        self._faults.update(faults)
-        (self._dir / "faults.json").write_text(json.dumps(self._faults))
+        (self._dir / "faults.json").write_text(
+            json.dumps({**self._faults(), **faults}), encoding="utf-8"
+        )

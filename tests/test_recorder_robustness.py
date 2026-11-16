@@ -105,7 +105,7 @@ class TestStuckDirWalk:
     def test_the_stop_wait_leaves_room_before_the_units_timeout(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(recorder, "_STOP_WALK_WAIT_MAX_SEC", 0.3, raising=False)
+        monkeypatch.setattr(recorder, "_STOP_WAIT_MAX_SEC", 0.3)
         release = threading.Event()
         rec = _stuck_walk_recorder(tmp_path, release, seconds=100.0)
         started = time.monotonic()
@@ -127,7 +127,7 @@ class TestStuckDirWalk:
         )
 
     def test_the_cap_is_well_below_the_units_timeout(self):
-        assert recorder._STOP_WALK_WAIT_MAX_SEC <= service.TIMEOUT_STOP_SEC / 2
+        assert recorder._STOP_WAIT_MAX_SEC <= service.TIMEOUT_STOP_SEC / 3
 
     def test_a_walk_that_outlives_its_budget_is_noted_while_recording(
         self, tmp_path, monkeypatch
@@ -151,9 +151,7 @@ class TestStopFlush:
         real_flush = store.flush
 
         def flush(*, reason: str = "interval") -> int:
-            if reason == "signal":
-                raise ValueError("行を書けません")
-            return real_flush(reason=reason)
+            raise ValueError("行を書けません")
 
         store.flush = flush  # type: ignore[method-assign]
         clock = FakeClock(0.0)
