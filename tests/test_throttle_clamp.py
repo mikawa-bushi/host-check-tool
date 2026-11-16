@@ -9,14 +9,17 @@ recording: when ``record`` starts, in ``doctor``, and in ``check``.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from synth import add_sys_baseline, make_db
 
 from procdiag.cli import cli
 from procdiag.config import BudgetConfig, ProcdiagConfig
+from procdiag.diagnosis import Engine
 from procdiag.doctor import run_doctor
 from procdiag.samplers.selfmeter import SelfMeter
 
@@ -123,6 +126,51 @@ class TestCheck:
         )
         assert result.exit_code in (0, 1, 2, 3), result.output
         assert "throttle_factor" not in result.output
+
+
+class TestNotesAcrossSessions:
+    """The note names the sessions that overlap the diagnosed period, once."""
+
+    NOTICE = BudgetConfig(throttle_factor=1.05).throttle_notice()
+
+    @staticmethod
+    def _session(store, started_ts, notice=None):
+        store.conn.execute(
+            "INSERT INTO sessions (started_ts, boot_time, hostname, "
+            "procdiag_version, last_alive_ts) VALUES (?, 0, 'h', '0', ?)",
+            (started_ts, started_ts),
+        )
+        if notice:
+            store.conn.execute(
+                "INSERT INTO ops_events (ts, kind, detail) "
+                "VALUES (?, 'config_adjusted', ?)",
+                (started_ts + 1, notice),
+            )
+
+    def _notes(self, tmp_path, sessions):
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3)
+        now = time.time()
+        for hours_ago, notice in sessions:
+            self._session(store, now - hours_ago * 3600.0, notice)
+        store.conn.commit()
+        diag = Engine(ProcdiagConfig()).run(store)
+        store.close()
+        return [n for n in diag.quality.notes if "throttle_factor" in n]
+
+    def test_restarts_with_the_same_setting_give_one_note(self, tmp_path):
+        notes = self._notes(
+            tmp_path, [(2.9, self.NOTICE), (2.0, self.NOTICE), (1.0, self.NOTICE)]
+        )
+
+        assert len(notes) == 1
+        assert self.NOTICE in notes[0]
+
+    def test_a_session_that_ran_with_the_written_value_has_no_note(self, tmp_path):
+        assert self._notes(tmp_path, [(2.9, None)]) == []
+
+    def test_a_session_that_ended_before_the_period_has_no_note(self, tmp_path):
+        assert self._notes(tmp_path, [(240.0, self.NOTICE), (4.0, None)]) == []
 
 
 class TestDoctor:

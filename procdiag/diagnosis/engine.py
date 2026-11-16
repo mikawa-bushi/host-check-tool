@@ -708,14 +708,19 @@ def _hole_seconds(store: "Storage") -> float:
 
 
 def _adjusted_config_notes(store: "Storage", window: Window) -> list[str]:
-    """Where a recording in *window* ran with other settings than its config file's."""
-    return list(
-        dict.fromkeys(
-            f"記録の設定を調整して記録しました ({_local_minute(ts)} 以降): {detail}"
-            for ts, _, until, detail in store.session_events("config_adjusted")
-            if ts <= window.end_ts and until > window.start_ts
-        )
-    )
+    """Where a recording in *window* ran with other settings than its config file's.
+
+    A unit that restarts logs the same sentence in each session: one note,
+    from the first session that did.
+    """
+    first: dict[str, float] = {}
+    for ts, _, until, detail in store.session_events("config_adjusted"):
+        if ts <= window.end_ts and until > window.start_ts:
+            first.setdefault(detail, ts)
+    return [
+        f"記録の設定を調整して記録しました ({_local_minute(ts)} 以降): {detail}"
+        for detail, ts in first.items()
+    ]
 
 
 def _local_minute(ts: float) -> str:
