@@ -253,6 +253,8 @@ _MIN_RUN_HOURS = 1.0
 # process of its program continues it: a restart that starts the new process
 # before the old one has exited.
 _RESTART_OVERLAP_SEC = 300.0
+# The rows of ``proc_rollup_1m`` are a minute apart at the closest.
+_MIN_STEP_SEC = 60.0
 
 
 @dataclass
@@ -283,6 +285,26 @@ class ProcInstance:
     @property
     def last_ts(self) -> float:
         return self.runs[-1][1][-1][0]
+
+    @property
+    def step(self) -> float:
+        """The usual time between the rows of the process running last."""
+        points = self.runs[-1][1]
+        steps = sorted(b[0] - a[0] for a, b in zip(points, points[1:]))
+        return max(_MIN_STEP_SEC, steps[len(steps) // 2]) if steps else _MIN_STEP_SEC
+
+    def stopped_before(self, start: float, end: float) -> bool:
+        """Whether a process of the program starting at *start* may continue it.
+
+        Its last row is at most ``_RESTART_OVERLAP_SEC`` after *start*, and the
+        recording, which ends at *end*, goes on for more than one of its steps
+        after that row: otherwise it may be running still, with another worker
+        of the program starting beside it.
+        """
+        return self.pid is None or (
+            self.last_ts <= start + _RESTART_OVERLAP_SEC
+            and end - self.last_ts > self.step
+        )
 
     def fit(
         self,
@@ -315,9 +337,12 @@ def proc_instances(
 
     A process that starts once another process of the same program has stopped
     continues that one's instance (a restart), even if the old one's last row
-    is up to ``_RESTART_OVERLAP_SEC`` later.  One that starts while every
-    instance still runs is a new instance (another worker).  When several have
-    stopped, the one that stopped last is continued.  Rows rolled up before
+    is up to ``_RESTART_OVERLAP_SEC`` later.  An instance has stopped when its
+    last row is more than a step before the last row of any process: one that
+    runs to the end of the recording is running still, and a process of its
+    program that starts near the end is another worker.  One that starts while
+    every instance still runs is a new instance (another worker).  When several
+    have stopped, the one that stopped last is continued.  Rows rolled up before
     procdiag kept processes apart (no PID) are one stretch of the program that
     a process with a PID continues whatever the clocks say.  Rows whose
     *column* is NULL are skipped.
@@ -330,17 +355,14 @@ def proc_instances(
                 (row["ts_min"], float(v))
             )
 
+    end = max((points[-1][0] for points in runs.values()), default=0.0)
     by_program: dict[int, list[ProcInstance]] = {}
     for (proc_id, pid), points in sorted(
         runs.items(),
         key=lambda kv: (kv[0][1] is not None, kv[1][0][0], kv[0][0], kv[0][1] or 0),
     ):
         instances = by_program.setdefault(proc_id, [])
-        stopped = [
-            i
-            for i in instances
-            if i.pid is None or i.last_ts <= points[0][0] + _RESTART_OVERLAP_SEC
-        ]
+        stopped = [i for i in instances if i.stopped_before(points[0][0], end)]
         if stopped:
             max(stopped, key=lambda i: i.last_ts).runs.append((pid, points))
         else:
