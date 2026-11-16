@@ -584,13 +584,13 @@ class TestCheckDbDisk:
 
 
 class TestRunDoctor:
-    def test_returns_9_checks(self, default_config):
+    def test_returns_10_checks(self, default_config):
         checks = run_doctor(
             default_config,
             proc_root=PROC_TREE,
             cgroup_root=CGROUP_TREE,
         )
-        assert len(checks) == 9
+        assert len(checks) == 10
 
     def test_check_names_in_order(self, default_config):
         checks = run_doctor(
@@ -609,6 +609,7 @@ class TestRunDoctor:
             "sensors",
             "db_disk",
             "config_security",
+            "budget",
         ]
 
     def test_psi_ok_with_proc_tree(self, default_config):
@@ -673,15 +674,15 @@ class TestRunDoctor:
                 proc_root=PROC_TREE,
                 cgroup_root=CGROUP_TREE,
             )
-        assert len(checks) == 9
+        assert len(checks) == 10
         sensors = next(c for c in checks if c.name == "sensors")
         # sensors exceptions are caught → info status.
         assert sensors.status == "info"
 
     def test_smoke_real_machine(self):
-        """Smoke test: run_doctor on the real machine returns 9 checks without exception."""
+        """Smoke test: run_doctor on the real machine returns 10 checks without exception."""
         checks = run_doctor(ProcdiagConfig())
-        assert len(checks) == 9
+        assert len(checks) == 10
         for c in checks:
             assert isinstance(c, DoctorCheck)
             assert c.status in ("ok", "degraded", "info")
@@ -714,7 +715,7 @@ class TestDoctorCli:
         assert result.exit_code in (0, 2)
         data = json.loads(result.output)
         assert isinstance(data, list)
-        assert len(data) == 9
+        assert len(data) == 10
         for item in data:
             assert "name" in item
             assert "label" in item
@@ -886,4 +887,4 @@ class TestCheckConfigSecurity:
             config_path=str(p),
         )
         assert any(c.name == "config_security" for c in checks)
-        assert len(checks) == 9
+        assert len(checks) == 10

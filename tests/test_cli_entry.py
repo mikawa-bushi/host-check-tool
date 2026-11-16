@@ -65,6 +65,16 @@ class TestBareInvocation:
         assert "Usage:" in result.stdout
         assert "quick" in result.stdout and "check" in result.stdout
 
+    def test_bare_service_prints_its_help_and_exits_0(self, runner):
+        result = runner.invoke(cli, ["service"])
+        assert result.exit_code == 0, result.output
+        assert "Usage:" in result.stdout
+        assert "print" in result.stdout and "install" in result.stdout
+
+    def test_an_unknown_subcommand_is_still_a_usage_error(self, runner):
+        result = runner.invoke(cli, ["service", "bogus"])
+        assert result.exit_code == 4, result.output
+
 
 class TestShellCompletion:
     @staticmethod

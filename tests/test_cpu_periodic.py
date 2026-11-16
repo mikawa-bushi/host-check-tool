@@ -268,6 +268,25 @@ class TestTolerance:
     def test_unbounded_tolerance_cannot_tell_a_schedule_from_chance(self, tmp_path):
         assert self._exact_daily_job(tmp_path, float("inf")) == []
 
+    def test_zero_tolerance_is_not_the_default_one(self, tmp_path):
+        """A start that drifts 25 s a day is a schedule to ±2 min, not to ±1 s."""
+        spikes = [_MIDNIGHT_UTC + d * _D + 14 * _H + 20 + 25 * d for d in range(7)]
+        for name, tol in (("zero", 0), ("negative", -5)):
+            folder = tmp_path / name
+            folder.mkdir()
+            config = ProcdiagConfig(
+                rules=RulesConfig(overrides={"CPU-PERIODIC-01": {"tol_sec": tol}})
+            )
+            found = _findings(
+                folder, spikes, start=_MIDNIGHT_UTC, hours=7 * 24, config=config
+            )
+            assert found == [], name
+        (tmp_path / "default").mkdir()
+        default = _findings(
+            tmp_path / "default", spikes, start=_MIDNIGHT_UTC, hours=7 * 24
+        )
+        assert [f.summary for f in default] == ["日次周期スパイク (14:00 頃、7回観測)"]
+
 
 class TestScheduleAcrossTheBoundary:
     def test_daily_job_straddling_midnight_counts_every_day(self, tmp_path):

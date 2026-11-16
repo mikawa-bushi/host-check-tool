@@ -75,23 +75,24 @@ def test_negative_overhead_budget_raises():
         BudgetConfig(overhead_budget_pct=-0.5)
 
 
-@pytest.mark.parametrize("factor", [1.0, 0.5, 0.0, -1.5])
-def test_throttle_factor_that_does_not_widen_the_interval_raises(factor):
-    """1.0 widens nothing and 0.5 halves the interval at every step."""
-    with pytest.raises(Exception, match="throttle_factor.*1.1 以上"):
+@pytest.mark.parametrize("factor", [0.0, -1.5])
+def test_throttle_factor_of_zero_or_less_raises(factor):
+    """0.6 refused these as well: they are a mistake of kind, not a weak setting."""
+    with pytest.raises(Exception, match="throttle_factor.*0 より大きい"):
         BudgetConfig(throttle_factor=factor)
 
 
-@pytest.mark.parametrize("factor", [1.0001, 1.01, 1.0999])
-def test_throttle_factor_that_barely_widens_the_interval_raises(factor):
-    """1.0001 widens by 0.01 % a minute: 12 days to double the interval."""
-    with pytest.raises(Exception, match="throttle_factor.*1.1 以上"):
-        BudgetConfig(throttle_factor=factor)
+@pytest.mark.parametrize("factor", [1.0, 0.5, 1.0001, 1.05, 1.0999])
+def test_throttle_factor_below_the_minimum_is_used_as_the_minimum(factor):
+    """0.6 accepted these, so a config that has them must still start the unit."""
+    assert BudgetConfig(throttle_factor=factor).throttle_factor == 1.1
 
 
 @pytest.mark.parametrize("factor", [1.1, 1.5, 4.0])
-def test_throttle_factor_of_at_least_one_point_one_is_allowed(factor):
-    assert BudgetConfig(throttle_factor=factor).throttle_factor == factor
+def test_throttle_factor_of_at_least_one_point_one_is_kept(factor):
+    budget = BudgetConfig(throttle_factor=factor)
+    assert budget.throttle_factor == factor
+    assert budget.throttle_notice() is None
 
 
 def test_negative_psi_threshold_raises():
@@ -237,8 +238,8 @@ def test_cli_reports_an_unreadable_config_file_and_exits_4(tmp_path):
     assert "設定ファイルの読み込みに失敗しました" in result.output
 
 
-@pytest.mark.parametrize("factor", ["1.0", "0.5", "1.0001"])
-def test_cli_record_rejects_a_throttle_factor_that_does_not_widen_and_exits_4(
+@pytest.mark.parametrize("factor", ["0", "-1"])
+def test_cli_record_rejects_a_throttle_factor_of_zero_or_less_and_exits_4(
     tmp_path, monkeypatch, factor
 ):
     monkeypatch.chdir(tmp_path)

@@ -94,3 +94,27 @@ def test_a_wal_holding_data_is_left_alone(db, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert (crashed / "synth.db-wal").stat().st_size == wal_size
+
+
+def _rows(db: Path) -> int:
+    with Storage(db, read_only=True) as reader:
+        return reader.conn.execute(
+            "SELECT COUNT(*) FROM ops_events WHERE kind = 'race'"
+        ).fetchone()[0]
+
+
+def test_a_recorder_that_starts_while_a_reader_is_open_keeps_its_files_and_rows(db):
+    reader = Storage(db, read_only=True)
+    assert _names(db.parent) == ["synth.db", "synth.db-shm", "synth.db-wal"]
+    recorder = Storage(db)
+    recorder.record_event("race", "before")
+
+    reader.close()
+
+    assert "synth.db-wal" in _names(db.parent)
+    assert "synth.db-shm" in _names(db.parent)
+    recorder.record_event("race", "after")
+    assert _rows(db) == 2
+    recorder.close()
+    assert _rows(db) == 2
+    assert _names(db.parent) == ["synth.db"]
