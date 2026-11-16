@@ -1588,6 +1588,20 @@ class Storage:
             return None
         return min(lo for lo, _ in found), max(hi for _, hi in found)
 
+    def events_end(self, until: float) -> float:
+        """Where a window ending at *until* stops reading event rows.
+
+        A stop reads the kernel log and the services once more and a flush that
+        recovers from a write outage records what it dropped; both are stored
+        after the last system sample.  A window that reaches that sample takes
+        in what was stored after it (up to the clock horizon), one that ends
+        earlier ends where it says.
+        """
+        last = self.system_bounds()
+        if last is not None and until >= last[1]:
+            return max(until, _clock_horizon())
+        return until
+
     def future_bounds(self) -> Optional[Tuple[float, float]]:
         """``(min_ts, max_ts)`` of the system rows stamped in the future.
 

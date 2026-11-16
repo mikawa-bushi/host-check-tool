@@ -601,6 +601,7 @@ class Engine:
         since, until = (
             (window.start_ts, window.end_ts) if events_in_window else (None, None)
         )
+        logged_until = None if until is None else store.events_end(until)
 
         # Gap total: the holes, plus the delay seconds of each gap event
         # ("<delay>s ジョブ<name>") that is not one of them.  A job late after
@@ -636,7 +637,10 @@ class Engine:
         notes.extend(
             r["detail"]
             for r in store.rows(
-                "ops_events", since=since, until=until, where="kind = 'data_lost'"
+                "ops_events",
+                since=since,
+                until=logged_until,
+                where="kind = 'data_lost'",
             )
         )
         if window.holes:
@@ -661,7 +665,7 @@ class Engine:
                 dict.fromkeys(
                     f"記録中に失敗した処理があります ({_local_minute(ts)} 以降): {detail}"
                     for ts, _, until, detail in store.session_events("sampler_failed")
-                    if ts <= window.end_ts and until > window.start_ts
+                    if ts <= logged_until and until > window.start_ts
                 )
             )
 
