@@ -23,6 +23,7 @@ from __future__ import annotations
 import html as _html_lib
 import json
 import logging
+import secrets
 import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
@@ -85,12 +86,20 @@ _BOLD = "\033[1m"
 _GREEN = "\033[32m"
 
 
-def _c(code: str, color: bool) -> str:
-    """Return the ANSI code only when colour output is requested."""
-    return code if color else ""
-
-
+# Our colour codes travel through the lines as ``NUL <tag> <code> NUL`` and become
+# the plain code in ``_finish``.  The tag is drawn once per process, so a colour
+# code in host text (a process called "\x1b[32m") is not mistaken for ours.
+_TAG = secrets.token_hex(8)
 _OWN_SGR = (*_ANSI.values(), _RESET, _BOLD, _GREEN)
+
+
+def _mark(code: str) -> str:
+    return f"\x00{_TAG}{code}\x00"
+
+
+def _c(code: str, color: bool) -> str:
+    """Return the ANSI code (marked as ours) only when colour output is requested."""
+    return _mark(code) if color and code else ""
 
 
 def _finish(lines: List[str], color: bool) -> str:
@@ -101,7 +110,12 @@ def _finish(lines: List[str], color: bool) -> str:
     cannot clear the screen, hide the verdict or forge a line.  Only our own
     colour codes pass through, and only when colour was asked for.
     """
-    return neutralized_lines(lines, allow=_OWN_SGR if color else ())
+    text = neutralized_lines(
+        lines, allow=tuple(_mark(code) for code in _OWN_SGR) if color else ()
+    )
+    for code in _OWN_SGR if color else ():
+        text = text.replace(_mark(code), code)
+    return text
 
 
 def _related(f: Finding) -> List[str]:
@@ -363,6 +377,11 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
             f"一部が未判定 {len({r.rule_id for r in pending})} 件"
             f" (あと最長 {longest:.1f} 時間の記録で判定できます)"
         )
+    if diag.unjudged_parts:
+        parts.append(
+            f"一部を判定できていない {len(diag.unjudged_parts)} 件: "
+            f"{', '.join(diag.unjudged_parts)} (詳細は備考)"
+        )
     if n_err:
         parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
     return " / ".join(parts)
@@ -573,8 +592,7 @@ def render_terminal(
     if verbose and diag.reasoning:
         lines.append("")
         lines.append(f"{_c(_BOLD, color)}推論過程:{_c(_RESET, color)}")
-        for step in diag.reasoning:
-            lines += [f"  {line}" for line in step.splitlines() or [""]]
+        lines += [f"  {step}" for step in diag.reasoning]
 
     return _finish(lines, color)
 
@@ -602,6 +620,7 @@ def render_json(diag: Diagnosis) -> str:
             "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
             "errored_rules": list(diag.errored_rules),
             "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
+            "unjudged_rules": list(diag.unjudged_parts),
             "quality": diag.quality.to_dict(),
             "window": (
                 {"start": _iso(diag.window.start_ts), "end": _iso(diag.window.end_ts)}
@@ -1282,6 +1301,11 @@ def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
         [(rule_id, detail) for _, rule_id, detail in _skipped_items(diag.skipped_rules)]
         + [(r.rule_id, r.detail) for r in diag.uncovered_rules]
         + [(rid, "実行エラー") for rid in diag.errored_rules]
+        + [
+            (rid, note.removeprefix(f"{rid}: "))
+            for rid, notes in diag.unjudged_parts.items()
+            for note in notes
+        ]
     )
 
 
@@ -1398,8 +1422,7 @@ def render_comparison_terminal(
             if side.result and side.result.diagnosis.reasoning:
                 lines.append("")
                 lines.append(f"{_c(_BOLD, color)}推論過程 ({side.name.label}):{reset}")
-                for step in side.result.diagnosis.reasoning:
-                    lines += [f"  {line}" for line in step.splitlines() or [""]]
+                lines += [f"  {step}" for step in side.result.diagnosis.reasoning]
     return _finish(lines, color)
 
 
@@ -1440,6 +1463,7 @@ def _side_dict(side: Side) -> dict:
         "evaluated_rules": list(diag.evaluated_rules),
         "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
         "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
+        "unjudged_rules": list(diag.unjudged_parts),
         "errored_rules": list(diag.errored_rules),
         "quality": diag.quality.to_dict() if res else None,
     }

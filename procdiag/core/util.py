@@ -250,8 +250,16 @@ def dumps_json(obj: Any) -> str:
 
 
 def shell_quote(value: object) -> str:
-    """*value* as one shell word, safe to paste into a command line."""
-    return shlex.quote(str(value))
+    """*value* as one shell word, safe to paste into a command line.
+
+    A value with a backtick is written as ``$'...'`` (bash and zsh), so that no
+    backtick in the word can end the code span a suggested command sits in.
+    """
+    text = str(value)
+    if "`" not in text:
+        return shlex.quote(text)
+    escaped = text.replace("\\", "\\\\").replace("'", "\\'")
+    return "$'" + escaped.replace("`", "\\x60") + "'"
 
 
 class CounterDelta:
