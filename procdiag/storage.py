@@ -142,7 +142,7 @@ class StorageVersionError(RuntimeError):
 
 
 _NOT_PROCDIAG_DB = (
-    "procdiag の DB ではありません (スキーマ版の記録がありません)。"
+    "procdiag の DB ではありません (スキーマ版が無い、または数として読めません)。"
     "他のソフトの SQLite ファイルか、壊れた DB です。--db に別のパスを指定してください"
 )
 
