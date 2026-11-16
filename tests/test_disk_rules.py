@@ -1230,7 +1230,8 @@ class TestSnapshotThresholds:
 
 class TestPercentNeverShownAcrossAThreshold:
     @staticmethod
-    def _filled(tmp_path, *, used_pct: float):
+    def _filled(tmp_path, *, used_pct: float, inode_pct: float | None = None):
+        inode_pct = used_pct if inode_pct is None else inode_pct
         store, start = _recording(tmp_path, 2)
         total = 100 * _GiB
         used = int(total * used_pct / 100)
@@ -1244,7 +1245,7 @@ class TestPercentNeverShownAcrossAThreshold:
                 used=used,
                 avail=total - used,
                 inodes_total=1_000_000,
-                inodes_used=int(1_000_000 * used_pct / 100),
+                inodes_used=int(1_000_000 * inode_pct / 100),
                 read_only=0,
             ),
         )
@@ -1273,6 +1274,24 @@ class TestPercentNeverShownAcrossAThreshold:
         assert f.severity is Severity.WARNING
         assert "95.0%" not in f.summary and "94.9%" in f.summary
         assert f.evidence["used_pct"] == 94.9
+
+    @pytest.mark.parametrize(
+        "bytes_pct, shown", [(94.96, "94.9"), (89.96, "89.9"), (95.0, "95.0")]
+    )
+    def test_the_byte_usage_beside_an_inode_finding_is_cut_the_same_way(
+        self, tmp_path, bytes_pct, shown
+    ):
+        store = self._filled(tmp_path, used_pct=bytes_pct, inode_pct=97.0)
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+        assert f.evidence["bytes_used_pct"] == float(shown)
+        assert f"(容量の使用率は {shown}%)" in f.proposal
+
+    def test_the_byte_usage_that_does_not_reach_a_level_is_still_rounded(
+        self, tmp_path
+    ):
+        store = self._filled(tmp_path, used_pct=61.26, inode_pct=97.0)
+        (f,) = _found(_run(store, "DISK-INODE-01"), "DISK-INODE-01")
+        assert "(容量の使用率は 61.3%)" in f.proposal
 
 
 class TestUnjudgedPartsAreInTheVerdict:

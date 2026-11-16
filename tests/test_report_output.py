@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
+from shellrun import SHELLS
 from synth import (
     add_disk_series,
     add_proc_series,
@@ -228,6 +229,27 @@ def _commands(diag: Diagnosis) -> list[str]:
     return cmds
 
 
+PASTED_NAMES = [
+    "x'; touch $MARK; #`",
+    "my`app",
+    "a'b",
+    "`touch x`",
+    "$(touch x)",
+    "'$(reboot)'`",
+]
+
+
+@pytest.fixture(scope="module")
+def pasted_pgreps(tmp_path_factory):
+    """Name -> the pgrep command the proposal tells the operator to paste."""
+    commands = {}
+    for i, name in enumerate(PASTED_NAMES):
+        db = _leak_db(tmp_path_factory.mktemp(f"pasted{i}"), name)
+        diag = _diagnose(db, only=["MEM-LEAK-01"])
+        (commands[name],) = [c for c in _commands(diag) if c.startswith("pgrep")]
+    return commands
+
+
 @pytest.fixture(scope="module")
 def evil(tmp_path_factory):
     db = _leak_db(tmp_path_factory.mktemp("evil"), EVIL_NAME, mount=SPACED_MOUNT)
@@ -285,6 +307,24 @@ class TestQuotedCommands:
         assert not [c for c in _commands(diag) if c.startswith("sudo reboot")]
         (finding,) = diag.findings
         assert finding.proposal.count("`") % 2 == 0
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("name", PASTED_NAMES, ids=repr)
+    def test_the_pasted_pgrep_runs_once_on_the_name(
+        self, pasted_pgreps, stubs, shell, name
+    ):
+        pasted = stubs.paste(shell, pasted_pgreps[name])
+        assert pasted.stderr == ""
+        assert pasted.calls == [("pgrep", ["-a", "--", name])]
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_a_name_with_a_line_break_still_runs_once(self, tmp_path, stubs, shell):
+        name = "x\n'; touch $MARK; reboot #`"
+        diag = _diagnose(_leak_db(tmp_path, name), only=["MEM-LEAK-01"])
+        (pgrep,) = [c for c in _commands(diag) if c.startswith("pgrep")]
+        pasted = stubs.paste(shell, pgrep)
+        assert [c for c, _ in pasted.calls] == ["pgrep"]
+        assert len(pasted.calls[0][1]) == 3
 
     def test_html_report_carries_the_quoted_command_too(self, tmp_path):
         db = _leak_db(tmp_path, EVIL_NAME)
@@ -683,6 +723,25 @@ class TestVerboseReasoning:
         assert "推論過程:" in out
         assert _forged_lines(out) == []
 
+    def test_a_rule_that_crashed_shows_the_traceback_from_its_first_line(
+        self, tmp_path, monkeypatch
+    ):
+        from procdiag.diagnosis.memory import MemLeakRule
+
+        def boom(self, store, window):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(MemLeakRule, "assess", boom, raising=False)
+        monkeypatch.setattr(MemLeakRule, "evaluate", boom, raising=False)
+        db = _leak_db(tmp_path, "myapp")
+        out = _invoke(
+            "check", "--db", db, "--only", "MEM-LEAK-01", "--verbose", "--no-color"
+        ).output
+        lines = [line.strip() for line in out.splitlines()]
+        start = lines.index("Traceback (most recent call last):")
+        assert 'File "' in out and "boom" in out
+        assert any(line.startswith("RuntimeError: boom") for line in lines[start:])
+
     def test_compare_reasoning_keeps_a_host_name_on_one_line(self, tmp_path):
         store = make_db(tmp_path, hours=48)
         now = time.time()
@@ -728,6 +787,14 @@ class TestOwnColourCodes:
         assert self.GREEN not in out
         assert "\\x1b[32mgreen" in out
         assert "\x1b[33m" in out
+
+    def test_a_name_that_imitates_the_marking_is_shown_not_obeyed(self):
+        imitation = f"\x00{self.GREEN}\x00"
+        diag = Diagnosis(findings=[self._finding(f"app{imitation}x")], healthy=False)
+        out = render_terminal(diag, color=True)
+        assert self.GREEN not in out
+        assert "\x00" not in out
+        assert "app\\x00\\x1b[32m\\x00x" in out
 
     def test_a_comparison_does_not_obey_a_colour_code_inside_host_text(self):
         from procdiag.compare import (
