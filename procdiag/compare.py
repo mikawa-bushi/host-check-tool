@@ -300,6 +300,8 @@ class ComparisonRow:
     before: SideState
     after: SideState
     paired_by_name: bool = False
+    # The after process's identity when it is not ``identity`` (paired by name).
+    after_identity: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not (isinstance(self.before, Detected) or isinstance(self.after, Detected)):
@@ -375,6 +377,7 @@ class NoteKind(str, Enum):
     SCHEMA_DIFFERS = "schema_differs"
     RECORDING_CONFIG_DIFFERS = "recording_config_differs"
     RAW_PARTIAL = "raw_partial"
+    NOT_COMPARABLE = "not_comparable"
 
 
 @dataclass(frozen=True)
@@ -400,6 +403,11 @@ class Note:
                 "記録時の設定が異なります。"
                 "サンプリング間隔などの違いが値に影響することがあります"
             )
+        if self.kind is NoteKind.NOT_COMPARABLE:
+            return (
+                f"{', '.join(d['rules'])} は、どちらの期間も記録時間が足りず"
+                "評価できていません。問題が無いとは言えません"
+            )
         side = self.side.label if self.side else ""
         return (
             f"{side}の期間のうち生データがあるのは {d['raw_hours']:.1f} /"
@@ -417,6 +425,45 @@ class Comparison:
 
     def verdict_counts(self) -> dict[Verdict, int]:
         return {v: sum(1 for r in self.rows if r.verdict is v) for v in Verdict}
+
+    @property
+    def blocked_rows(self) -> tuple[ComparisonRow, ...]:
+        """The before problems (warning or worse) that cannot be judged after."""
+        return tuple(
+            r
+            for r in self.rows
+            if r.verdict is Verdict.NOT_EVALUABLE
+            and isinstance(r.before, Detected)
+            and r.before.severity is not Severity.INFO
+        )
+
+    @property
+    def not_comparable(self) -> bool:
+        """No row to speak of, and rules that neither period was long enough to run."""
+        return any(n.kind is NoteKind.NOT_COMPARABLE for n in self.notes)
+
+    @property
+    def hours_to_judge(self) -> Optional[float]:
+        """How long the after period must still be recorded for those rules to run.
+
+        The longest wait among the rules that blocked the verdict; once the after
+        recording is that long they run on one side at least, and the comparison
+        speaks for them.  None when no rule blocks it.
+        """
+        rules = {
+            rule
+            for n in self.notes
+            if n.kind is NoteKind.NOT_COMPARABLE
+            for rule in n.detail["rules"]
+        }
+        if self.after.result is None:
+            return None
+        waits = [
+            r.remaining_hours
+            for r in self.after.result.diagnosis.skipped_rules
+            if r.part is None and r.rule_id in rules
+        ]
+        return max(waits, default=None)
 
 
 def _rule_gap(side: Side, rule_id: str) -> Optional[Unknown]:
@@ -525,6 +572,7 @@ def _measured_rows(
         if not ((b and b.finding) or (a and a.finding)):
             continue
         shown = b or a
+        paired = bool(b and a and b.observation.identity != a.observation.identity)
         rows.append(
             ComparisonRow(
                 rule_id=rule_id,
@@ -535,9 +583,8 @@ def _measured_rows(
                 threshold=threshold,
                 before=_measured_state(gaps[0], b),
                 after=_measured_state(gaps[1], a),
-                paired_by_name=bool(
-                    b and a and b.observation.identity != a.observation.identity
-                ),
+                paired_by_name=paired,
+                after_identity=a.observation.identity if paired and a else None,
             )
         )
     return rows
@@ -579,7 +626,9 @@ _NOT_SAID = {
 }
 
 
-def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideState:
+def _plain_state(
+    side: Side, other: Side, rule_id: str, subject: str, *, at_split: bool
+) -> SideState:
     gap = _rule_gap(side, rule_id)
     if gap is not None:
         return gap
@@ -613,10 +662,15 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
             + _NOT_SAID[side.name],
         )
     if side.name is SideName.AFTER:
+        wait = f"あと {max(theirs - mine, 0.1):.1f} 時間記録"
+        if at_split:  # --at fixes the before period; --before cannot go with it
+            way = f"{wait}してください"
+        else:
+            way = f"{wait}するか、--before で修正前を修正後と同じ長さに絞ってください"
         return Unknown(
             Why.TOO_SHORT,
             f"修正後の期間 {mine:.1f} 時間は修正前の {theirs:.1f} 時間より短いため、"
-            f"検出が無くても直ったとは言えません (あと {max(theirs - mine, 0.1):.1f} 時間)",
+            f"検出が無くても直ったとは言えません ({way})",
         )
     return Unknown(
         Why.TOO_SHORT,
@@ -625,7 +679,14 @@ def _plain_state(side: Side, other: Side, rule_id: str, subject: str) -> SideSta
     )
 
 
-def _note_list(before: Side, after: Side) -> list[Note]:
+def _waiting_rules(side: Side) -> list[str]:
+    """The rules *side* was too short to run at all."""
+    if side.result is None:
+        return []
+    return [r.rule_id for r in side.result.diagnosis.skipped_rules if r.part is None]
+
+
+def _note_list(before: Side, after: Side, *, has_rows: bool) -> list[Note]:
     notes = [
         Note(kind, detail={"before": b, "after": a})
         for kind, b, a in (
@@ -637,6 +698,13 @@ def _note_list(before: Side, after: Side) -> list[Note]:
     configs = (before.recording_config, after.recording_config)
     if None not in configs and configs[0] != configs[1]:
         notes.append(Note(NoteKind.RECORDING_CONFIG_DIFFERS))
+    # With a row, the comparison says what happened to that problem.  With
+    # none, "nothing found" holds for the rules that ran, and a rule neither
+    # period could run says nothing about either.
+    after_waiting = set(_waiting_rules(after))
+    waiting = [r for r in _waiting_rules(before) if r in after_waiting]
+    if waiting and not has_rows:
+        notes.append(Note(NoteKind.NOT_COMPARABLE, detail={"rules": waiting}))
     for side in (before, after):
         res = side.result
         if res is None or not 0 < res.raw_hours < res.window.observed_hours - 1 / 60:
@@ -661,7 +729,9 @@ def _note_list(before: Side, after: Side) -> list[Note]:
     return notes
 
 
-def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Comparison:
+def build_comparison(
+    before: Side, after: Side, config: "ProcdiagConfig", *, at_split: bool = False
+) -> Comparison:
     rows: list[ComparisonRow] = []
     measured = {
         rid
@@ -688,13 +758,18 @@ def build_comparison(before: Side, after: Side, config: "ProcdiagConfig") -> Com
                 identity=None,
                 headline=None,
                 threshold=None,
-                before=_plain_state(before, after, rule_id, subject),
-                after=_plain_state(after, before, rule_id, subject),
+                before=_plain_state(before, after, rule_id, subject, at_split=at_split),
+                after=_plain_state(after, before, rule_id, subject, at_split=at_split),
             )
         )
     order = list(Verdict)
     rows.sort(key=lambda r: (order.index(r.verdict), r.rule_id, r.subject))
-    return Comparison(before, after, tuple(rows), tuple(_note_list(before, after)))
+    return Comparison(
+        before,
+        after,
+        tuple(rows),
+        tuple(_note_list(before, after, has_rows=bool(rows))),
+    )
 
 
 def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
@@ -702,8 +777,9 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
 
     1: a warning/critical problem remains or appeared after the fix
        (see :attr:`ComparisonRow.remaining`).
-    3: a side has no data, or a warning/critical before finding cannot be
-       judged after (record longer, or within raw retention).
+    3: a side has no data, a warning/critical before finding cannot be
+       judged after (record longer, or within raw retention), or nothing was
+       found and neither period was long enough to run some rule.
     2: only info problems remain after (0 with ``exit_zero_on_info``).
     """
     remaining = [r.remaining for r in cmp.rows if r.remaining is not None]
@@ -711,12 +787,7 @@ def exit_code(cmp: Comparison, *, exit_zero_on_info: bool = False) -> int:
         return 1
     if cmp.before.result is None or cmp.after.result is None:
         return 3
-    if any(
-        r.verdict is Verdict.NOT_EVALUABLE
-        and isinstance(r.before, Detected)
-        and r.before.severity is not Severity.INFO
-        for r in cmp.rows
-    ):
+    if cmp.blocked_rows or cmp.not_comparable:
         return 3
     if remaining and not exit_zero_on_info:
         return 2
@@ -791,8 +862,10 @@ def run_compare(
                 only,
                 skip,
             )
-            span = after.result.window.span_hours if after.result else 0.0
-            hours = max(span, engine.required_hours(only=only, skip=skip))
+            # Hours recorded, as the verdicts count them: a gap in the after
+            # period does not make the period before it longer.
+            recorded = after.result.window.observed_hours if after.result else 0.0
+            hours = max(recorded, engine.required_hours(only=only, skip=skip))
             before_period = Period(request.at - hours * 3600.0, request.at)
         else:
             after = _evaluate_side(
@@ -802,4 +875,6 @@ def run_compare(
         before = _evaluate_side(
             SideName.BEFORE, before_store, before_period, engine, only, skip
         )
-    return build_comparison(before, after, config)
+    return build_comparison(
+        before, after, config, at_split=isinstance(request, SplitRequest)
+    )

@@ -488,3 +488,79 @@ class TestSplitBoundary:
         before, after = self._split(tmp_path, self._AT - 3600.0 - 0.0005)
         assert before.end_ts == self._AT - 0.0005
         assert after.start_ts == self._AT + 59.9995
+
+
+def _timed(name, diag, hours):
+    return Side(
+        name=name,
+        db=Path("one.db"),
+        hostname="host-a",
+        schema_version="4",
+        recording_config="{}",
+        requested=Period(None, None),
+        result=Evaluated(Window(0.0, hours * 3600.0), hours, diag),
+    )
+
+
+class TestSpanAllowance:
+    @staticmethod
+    def _verdict(after_hours):
+        before = _diag(
+            findings=[_finding("DISK-FULL-01", "/var")], evaluated=["DISK-FULL-01"]
+        )
+        after = _diag(evaluated=["DISK-FULL-01"])
+        cmp = build_comparison(
+            _timed(SideName.BEFORE, before, 24.0),
+            _timed(SideName.AFTER, after, after_hours),
+            _CFG,
+        )
+        return cmp.rows[0]
+
+    def test_an_after_period_two_minutes_short_still_counts_as_as_long(self):
+        row = self._verdict(24.0 - 2 / 60)
+        assert row.verdict is Verdict.RESOLVED
+
+    def test_an_after_period_three_minutes_short_does_not(self):
+        row = self._verdict(24.0 - 3 / 60)
+        assert row.verdict is Verdict.NOT_EVALUABLE and row.why is Why.TOO_SHORT
+
+
+class TestNothingToCompare:
+    @staticmethod
+    def _short(*, rules=("MEM-LEAK-01", "FD-LEAK-01")):
+        return _diag(
+            evaluated=["CPU-SATURATION-01"],
+            skipped_rules=[SkippedRule(r, r, 6.0, 4.0) for r in rules],
+        )
+
+    def test_rules_skipped_in_both_periods_make_the_comparison_not_judged(self):
+        cmp = _compare(self._short(), self._short())
+        assert cmp.rows == ()
+        (note,) = [n for n in cmp.notes if n.kind is NoteKind.NOT_COMPARABLE]
+        assert note.detail["rules"] == ["MEM-LEAK-01", "FD-LEAK-01"]
+        assert exit_code(cmp) == 3
+        assert exit_code(cmp, exit_zero_on_info=True) == 3
+
+    def test_only_the_rules_skipped_in_both_count(self):
+        cmp = _compare(self._short(), self._short(rules=("FD-LEAK-01", "ZOMBIE-01")))
+        (note,) = [n for n in cmp.notes if n.kind is NoteKind.NOT_COMPARABLE]
+        assert note.detail["rules"] == ["FD-LEAK-01"]
+
+    def test_a_rule_skipped_in_one_period_only_is_not_enough(self):
+        cmp = _compare(_diag(evaluated=["MEM-LEAK-01"]), self._short())
+        assert not [n for n in cmp.notes if n.kind is NoteKind.NOT_COMPARABLE]
+        assert exit_code(cmp) == 0
+
+    def test_a_judged_row_is_not_overruled_by_a_rule_waiting_in_both(self):
+        before = _diag(
+            findings=[_finding("DISK-FULL-01", "/var")],
+            evaluated=["DISK-FULL-01"],
+            skipped_rules=[SkippedRule("MEM-LEAK-01", "x", 6.0, 4.0)],
+        )
+        after = _diag(
+            evaluated=["DISK-FULL-01"],
+            skipped_rules=[SkippedRule("MEM-LEAK-01", "x", 6.0, 4.0)],
+        )
+        cmp = _compare(before, after)
+        assert [r.verdict for r in cmp.rows] == [Verdict.RESOLVED]
+        assert exit_code(cmp) == 0

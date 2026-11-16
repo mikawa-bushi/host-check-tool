@@ -343,6 +343,9 @@ class Diagnosis:
     skipped_rules: list[SkippedRule] = field(default_factory=list)
     errored_rules: list[str] = field(default_factory=list)  # evaluate() raised
     uncovered_rules: list[UncoveredRule] = field(default_factory=list)
+    # Rules that ran but left a part unjudged whatever the recording length
+    # (``Rule.coverage_notes``): rule ID -> what it left out.
+    unjudged_parts: dict[str, tuple[str, ...]] = field(default_factory=dict)
     measurements: dict[str, list[Measurement]] = field(default_factory=dict)
     folded: list[Finding] = field(default_factory=list)
     # What the recording could not observe, cut to ``window``.
@@ -355,6 +358,7 @@ class Diagnosis:
             not self.skipped_rules
             and not self.errored_rules
             and not self.uncovered_rules
+            and not self.unjudged_parts
         )
 
     @property

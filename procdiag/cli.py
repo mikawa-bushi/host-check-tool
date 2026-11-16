@@ -336,24 +336,25 @@ def _period_notes(store: "Storage", diag: Diagnosis, *, chosen: bool) -> list[st
     if window is None:
         return []
     notes = []
+    hours = window.observed_hours
     recorded = store.system_bounds()
     if not chosen and recorded and recorded[0] < window.start_ts - 60:
         notes.append(
             f"記録は {_local_minute(recorded[0])} からありますが、診断したのは"
             f"生データの残る {_local_minute(window.start_ts)} 以降の"
-            f" {window.span_hours:.1f} 時間です。それより前も診断するには --since を"
+            f" {hours:.1f} 時間です。それより前も診断するには --since を"
             "指定してください (期間が長いほど時間とメモリを使います)。"
         )
     raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
-    raw_hours = (raw[1] - raw[0]) / 3600.0 if raw else 0.0
+    raw_hours = window.observed_hours_between(*raw) if raw else 0.0
     raw_rules = [
         rid
         for rid in diag.evaluated_rules
         if (cls := get_rule(rid)) and set(cls.requires_rows) & set(RAW_TABLES)
     ]
-    if raw_rules and 0 < raw_hours < window.span_hours - 1 / 60:
+    if raw_rules and 0 < raw_hours < hours - 1 / 60:
         notes.append(
-            f"期間 {window.span_hours:.1f} 時間のうち生データがあるのは"
+            f"期間 {hours:.1f} 時間のうち生データがあるのは"
             f" {raw_hours:.1f} 時間です。{', '.join(raw_rules)} は"
             "生データのある範囲だけで評価しました。"
         )
@@ -374,12 +375,13 @@ def _diagnose(
     """Run the rules on *db*; return ``(diagnosis, charts, meta_hostname)``.
 
     Without *since* / *until* the engine picks the period (the raw samples).
-    With either, the rules run over the records in ``[since, until)`` and the
-    command exits with code 3 when there are none.  Charts and the recorded
+    With either, the rules run over the records in ``[since, until)``; with
+    none in it the diagnosis has no data (exit code 3) and is still returned,
+    so ``-o`` writes a report instead of leaving an old one.  Charts and the recorded
     hostname are only needed for HTML output, so they are read (inside the
     open connection) only when *with_charts* is set and are ``None`` otherwise.
     """
-    from .core import Window
+    from .core import Diagnosis, Window
     from .diagnosis import Engine
     from .report import build_charts
     from .storage import Storage
@@ -400,7 +402,9 @@ def _diagnose(
                     else "DB に記録がありません。"
                 )
                 click.echo(f"エラー: 指定した期間に記録がありません。{where}", err=True)
-                sys.exit(_EXIT_NO_DATA)
+                empty = Diagnosis(findings=[], healthy=False, no_data=True)
+                empty.quality.notes.append(f"指定した期間に記録がありません。{where}")
+                return empty, None, store.meta().get("hostname")
             window = Window(*bounds)
         diag = Engine(cfg, verbose=verbose).run(
             store, only=only, skip=skip, window=window
@@ -428,6 +432,7 @@ def _render_html(
     diag: Diagnosis,
     charts: Optional[ChartData],
     meta_hostname: Optional[str],
+    snapshot: Optional[list] = None,
 ) -> str:
     """The self-contained HTML report, as ``check`` and ``quick`` write it."""
     from .report import render_html
@@ -437,6 +442,7 @@ def _render_html(
         charts,
         hostname_label=cfg.report.hostname_label,
         meta_hostname=meta_hostname,
+        snapshot=snapshot,
     )
 
 
@@ -757,7 +763,7 @@ def check(
     elif fmt == "html":
         text = _render_html(cfg, diag, charts, meta_hostname)
     else:
-        color = should_use_color(no_color)
+        color = should_use_color(no_color) and not output
         text = report_mod.render_terminal(diag, color=color, verbose=verbose)
 
     if output:
@@ -881,7 +887,7 @@ def quick(
     report = out / "report.html"
     try:
         report.write_text(
-            _render_html(cfg, diag, charts, meta_hostname), encoding="utf-8"
+            _render_html(cfg, diag, charts, meta_hostname, items), encoding="utf-8"
         )
     except OSError as exc:
         report_error = (
@@ -945,11 +951,16 @@ def quick(
     "--format",
     "fmt",
     type=click.Choice(["text", "json"]),
-    default="text",
-    help="出力フォーマット。",
+    default=None,
+    help="出力フォーマット (既定: --output の拡張子が .json なら json、"
+    "それ以外は text)。",
 )
 @click.option(
-    "--output", type=click.Path(), default=None, help="結果をファイルに書き出す。"
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="結果をファイルに書き出す (例: -o compare.txt)。",
 )
 @click.option("--verbose", is_flag=True, help="推論過程と修正後の提案を表示する。")
 @click.option("--no-color", is_flag=True, help="ANSI カラーを無効化する。")
@@ -968,7 +979,7 @@ def compare(
     after_spec: Optional[str],
     only: Optional[str],
     skip: Optional[str],
-    fmt: str,
+    fmt: Optional[str],
     output: Optional[str],
     verbose: bool,
     no_color: bool,
@@ -981,8 +992,10 @@ def compare(
     (例: '2026-10-28 09:00'、'2026-10-28T00:00Z')。
 
     終了コード: 0=修正後に critical・warning なし (修正前の検出はすべて判定できた) /
-    1=修正後に critical・warning あり / 2=修正後に info のみ /
-    3=判定できない検出がある・期間に記録がない / 4=前提条件エラー
+    1=修正後に critical・warning が残っている (「変化なし」「悪化」「改善
+    (しきい値以上)」を含む)・新たに出た / 2=修正後に info のみ /
+    3=判定できない検出がある・期間に記録がない・検出が無くてもどちらの期間も記録時間が
+    足りず評価できないルールがある / 4=前提条件エラー
     """
     from . import report as report_mod
     from .compare import CompareError, PeriodsRequest, plan_request, run_compare
@@ -992,6 +1005,8 @@ def compare(
     if dbs and db_path:
         click.echo("エラー: --db と DB の位置引数は同時に指定できません", err=True)
         sys.exit(_EXIT_USAGE)
+    suffix = Path(output or "").suffix.lower()
+    fmt = fmt or ("json" if _FORMAT_BY_SUFFIX.get(suffix) == "json" else "text")
     cfg = _load_config(config_path, db_path)
     only_ids, skip_ids = _split_ids(only), _split_ids(skip)
     _validate_rules(cfg, only_ids, skip_ids)
@@ -1022,7 +1037,7 @@ def compare(
         text = report_mod.render_comparison_json(result)
     else:
         text = report_mod.render_comparison_terminal(
-            result, color=should_use_color(no_color), verbose=verbose
+            result, color=should_use_color(no_color) and not output, verbose=verbose
         )
 
     if output:

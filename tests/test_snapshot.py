@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import namedtuple
 
 import pytest
 from click.testing import CliRunner
+from shellrun import SHELLS
 
 import procdiag.snapshot as snap
 from procdiag.cli import cli
@@ -276,3 +278,65 @@ class TestRunAndCli:
             assert data["summary"]["warning"] == 1
         else:
             assert "[WARN] CPU: 高い" in result.output and "→ 確認" in result.output
+
+
+class TestHintsQuoteTheMountPoint:
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize(
+        "label", ["x'; touch $MARK; #`", "usb`disk", "a'b", "$(reboot)`"], ids=repr
+    )
+    def test_a_hostile_label_is_one_argument_when_pasted(
+        self, monkeypatch, tmp_path, stubs, shell, label
+    ):
+        mount = tmp_path / label
+        mount.mkdir()
+        parts = [_Part("/dev/sdb1", str(mount), "ext4", "rw")]
+        monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
+        monkeypatch.setattr(
+            snap.psutil, "disk_usage", lambda mp: _Usage(100, 97, 3, 97.0)
+        )
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (1000, 990))
+
+        items = {i.name: i for i in snap._check_disks(ProcdiagConfig())}
+
+        (du,) = [
+            c
+            for c in re.findall(r"`([^`]*)`", items[f"disk:{mount}"].hint)
+            if c.startswith("du ")
+        ]
+        assert stubs.paste(shell, du).calls == [("du", ["-sh", f"{mount}/*"])]
+        (inodes,) = [
+            c
+            for c in re.findall(r"`([^`]*)`", items[f"inode:{mount}"].hint)
+            if "du --inodes" in c
+        ]
+        assert stubs.paste(shell, inodes).calls == [
+            ("sudo", ["du", "--inodes", "-x", str(mount)])
+        ]
+
+    def test_a_mount_point_with_a_space_is_one_argument_of_each_command(
+        self, monkeypatch, tmp_path
+    ):
+        import shlex
+
+        mount = tmp_path / "USB DISK"
+        mount.mkdir()
+        parts = [_Part("/dev/sdb1", str(mount), "ext4", "rw")]
+        monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
+        monkeypatch.setattr(
+            snap.psutil, "disk_usage", lambda mp: _Usage(100, 97, 3, 97.0)
+        )
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (1000, 990))
+
+        items = {i.name: i for i in snap._check_disks(ProcdiagConfig())}
+
+        usage = re.findall(r"`([^`]*)`", items[f"disk:{mount}"].hint)
+        (du,) = [c for c in usage if c.startswith("du ")]
+        assert shlex.split(du.split("|")[0])[-1] == f"{mount}/*"
+        inodes = re.findall(r"`([^`]*)`", items[f"inode:{mount}"].hint)
+        (du,) = [c for c in inodes if "du --inodes" in c]
+        assert shlex.split(du.split("|")[0])[-1] == str(mount)

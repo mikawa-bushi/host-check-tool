@@ -23,12 +23,13 @@ from __future__ import annotations
 import html as _html_lib
 import json
 import logging
+import secrets
 import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import procdiag
 from procdiag.compare import (
@@ -42,6 +43,7 @@ from procdiag.compare import (
     SideState,
     Unknown,
     Verdict,
+    Why,
 )
 from procdiag.compare import exit_code as compare_exit_code
 from procdiag.core import (
@@ -62,6 +64,7 @@ from procdiag.core.util import dumps_json, neutralize, neutralized_lines
 from procdiag.diagnosis.cpu import CpuSaturationRule, CpuSinglecoreRule
 from procdiag.diagnosis.engine import holes_note
 from procdiag.diagnosis.io_disk import usable_bytes
+from procdiag.snapshot import CRITICAL, INFO, OK, WARNING, SnapshotItem
 from procdiag.spikes import culprits
 from procdiag.storage import Storage
 
@@ -84,12 +87,20 @@ _BOLD = "\033[1m"
 _GREEN = "\033[32m"
 
 
-def _c(code: str, color: bool) -> str:
-    """Return the ANSI code only when colour output is requested."""
-    return code if color else ""
-
-
+# Our colour codes travel through the lines as ``NUL <tag> <code> NUL`` and become
+# the plain code in ``_finish``.  The tag is drawn once per process, so a colour
+# code in host text (a process called "\x1b[32m") is not mistaken for ours.
+_TAG = secrets.token_hex(8)
 _OWN_SGR = (*_ANSI.values(), _RESET, _BOLD, _GREEN)
+
+
+def _mark(code: str) -> str:
+    return f"\x00{_TAG}{code}\x00"
+
+
+def _c(code: str, color: bool) -> str:
+    """Return the ANSI code (marked as ours) only when colour output is requested."""
+    return _mark(code) if color and code else ""
 
 
 def _finish(lines: List[str], color: bool) -> str:
@@ -100,7 +111,12 @@ def _finish(lines: List[str], color: bool) -> str:
     cannot clear the screen, hide the verdict or forge a line.  Only our own
     colour codes pass through, and only when colour was asked for.
     """
-    return neutralized_lines(lines, allow=_OWN_SGR if color else ())
+    text = neutralized_lines(
+        lines, allow=tuple(_mark(code) for code in _OWN_SGR) if color else ()
+    )
+    for code in _OWN_SGR if color else ():
+        text = text.replace(_mark(code), code)
+    return text
 
 
 def _related(f: Finding) -> List[str]:
@@ -362,6 +378,11 @@ def _coverage_summary(diag: Diagnosis) -> str | None:
             f"一部が未判定 {len({r.rule_id for r in pending})} 件"
             f" (あと最長 {longest:.1f} 時間の記録で判定できます)"
         )
+    if diag.unjudged_parts:
+        parts.append(
+            f"一部を判定できていない {len(diag.unjudged_parts)} 件: "
+            f"{', '.join(diag.unjudged_parts)} (詳細は備考)"
+        )
     if n_err:
         parts.append(f"実行エラー {n_err} 件: {', '.join(diag.errored_rules)}")
     return " / ".join(parts)
@@ -572,8 +593,7 @@ def render_terminal(
     if verbose and diag.reasoning:
         lines.append("")
         lines.append(f"{_c(_BOLD, color)}推論過程:{_c(_RESET, color)}")
-        for step in diag.reasoning:
-            lines += [f"  {line}" for line in step.splitlines() or [""]]
+        lines += [f"  {step}" for step in diag.reasoning]
 
     return _finish(lines, color)
 
@@ -601,6 +621,7 @@ def render_json(diag: Diagnosis) -> str:
             "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
             "errored_rules": list(diag.errored_rules),
             "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
+            "unjudged_rules": list(diag.unjudged_parts),
             "quality": diag.quality.to_dict(),
             "window": (
                 {"start": _iso(diag.window.start_ts), "end": _iso(diag.window.end_ts)}
@@ -944,6 +965,7 @@ def render_html(
     *,
     hostname_label: str | None = None,
     meta_hostname: str | None = None,
+    snapshot: Sequence[SnapshotItem] | None = None,
 ) -> str:
     """Render a self-contained HTML report.
 
@@ -953,6 +975,9 @@ def render_html(
     3. 時系列チャート — inline SVG charts from ChartData
     4. スパイクイベント一覧 — from ChartData.spikes
     5. 観測品質 — ObservationQuality details
+
+    With *snapshot* (``quick``, which checks the host first) an いまの状態
+    section with those items follows the summary.
 
     No external resources are referenced (no <script src>, no <link href>,
     no http:// / https:// URLs) — requirement from design doc §1.2.
@@ -974,6 +999,7 @@ def render_html(
 <h1>{_esc(title)}</h1>
 <p style="color:#888;font-size:.85rem;">生成日時: {_esc(generated_at)} / procdiag {_esc(procdiag.__version__)} ／ 時刻はすべてホストのローカルタイム</p>
 {_summary_section(diag)}
+{_snapshot_section(snapshot)}
 {_proposal_section(diag)}
 {_charts_section(charts)}
 {_spike_section(charts)}
@@ -1026,6 +1052,36 @@ def _summary_section(diag: Diagnosis) -> str:
 {_coverage_html(diag)}<table>
   <thead><tr><th></th><th>ルールID</th><th>対象</th><th>サマリ</th><th>確信度</th></tr></thead>
   <tbody>{finding_rows}</tbody>
+</table>
+"""
+
+
+_SNAPSHOT_BADGE = {
+    CRITICAL: ("badge-crit", "重大"),
+    WARNING: ("badge-warn", "警告"),
+    INFO: ("badge-info", "参考"),
+    OK: ("badge-ok", "正常"),
+}
+
+
+def _snapshot_section(items: Sequence[SnapshotItem] | None) -> str:
+    """いまの状態: the snapshot ``quick`` took before it recorded, one row per item."""
+    if items is None:
+        return ""
+    rows = "".join(
+        f'<tr><td><span class="{_SNAPSHOT_BADGE[i.status][0]}">'
+        f"{_SNAPSHOT_BADGE[i.status][1]}</span></td>"
+        f"<td>{_esc(i.category)}</td><td>{_esc(i.label)}</td>"
+        f"<td>{_esc(i.detail)}</td><td>{_esc(i.hint)}</td></tr>"
+        for i in items
+    )
+    count = {s: sum(1 for i in items if i.status == s) for s in (CRITICAL, WARNING)}
+    return f"""
+<h2>いまの状態 (snapshot)</h2>
+<p>記録を始める前に確認した、いまのホストの状態です。重大 {count[CRITICAL]} 件 / 警告 {count[WARNING]} 件。</p>
+<table>
+  <thead><tr><th></th><th>分類</th><th>項目</th><th>状態</th><th>対処</th></tr></thead>
+  <tbody>{rows}</tbody>
 </table>
 """
 
@@ -1281,7 +1337,36 @@ def _unevaluated_items(side: Side) -> List[Tuple[str, str]]:
         [(rule_id, detail) for _, rule_id, detail in _skipped_items(diag.skipped_rules)]
         + [(r.rule_id, r.detail) for r in diag.uncovered_rules]
         + [(rid, "実行エラー") for rid in diag.errored_rules]
+        + [
+            (rid, note.removeprefix(f"{rid}: "))
+            for rid, notes in diag.unjudged_parts.items()
+            for note in notes
+        ]
     )
+
+
+_BLOCKED_ADVICE = {
+    Why.TOO_SHORT: "記録時間が足りないものは、記録を続けてから比べ直してください。",
+    Why.PAIRED_BY_NAME: (
+        "名前だけで突き合わせたものは、記録を続けても判定できません。"
+        "行に示した両方の値から判断してください。"
+    ),
+}
+_ROW_REASONS = "理由を行ごとに示しています。"
+
+
+def _blocked_conclusion(cmp: Comparison) -> str:
+    """Why exit code 3, and for each reason whether recording longer helps."""
+    blocked = cmp.blocked_rows
+    if not blocked:
+        hours = cmp.hours_to_judge
+        wait = f"あと最長 {hours:.1f} 時間、" if hours is not None else ""
+        return f"判定できません。{wait}記録を続けてから比べ直してください。"
+    reasons = dict.fromkeys(r.why for r in blocked)
+    advice = [_BLOCKED_ADVICE[w] for w in reasons if w in _BLOCKED_ADVICE]
+    if any(w not in _BLOCKED_ADVICE for w in reasons):
+        advice.append(f"それ以外は、{_ROW_REASONS}" if advice else _ROW_REASONS)
+    return "判定できない検出があります。" + "".join(advice)
 
 
 def _compare_conclusion(cmp: Comparison) -> str:
@@ -1291,7 +1376,7 @@ def _compare_conclusion(cmp: Comparison) -> str:
     if cmp.before.result is None or cmp.after.result is None:
         return "片方の期間に記録がないため比較できません。"
     if code == 3:
-        return "判定できない検出があります。記録を続けてから比べ直してください。"
+        return _blocked_conclusion(cmp)
     if not cmp.rows:
         scope = (
             ""
@@ -1375,8 +1460,7 @@ def render_comparison_terminal(
             if side.result and side.result.diagnosis.reasoning:
                 lines.append("")
                 lines.append(f"{_c(_BOLD, color)}推論過程 ({side.name.label}):{reset}")
-                for step in side.result.diagnosis.reasoning:
-                    lines += [f"  {line}" for line in step.splitlines() or [""]]
+                lines += [f"  {step}" for step in side.result.diagnosis.reasoning]
     return _finish(lines, color)
 
 
@@ -1417,6 +1501,7 @@ def _side_dict(side: Side) -> dict:
         "evaluated_rules": list(diag.evaluated_rules),
         "skipped_rules": [r.to_dict() for r in diag.skipped_rules],
         "uncovered_rules": [r.to_dict() for r in diag.uncovered_rules],
+        "unjudged_rules": list(diag.unjudged_parts),
         "errored_rules": list(diag.errored_rules),
         "quality": diag.quality.to_dict() if res else None,
     }
@@ -1435,6 +1520,7 @@ def _row_dict(row: ComparisonRow) -> dict:
         "title": row.title,
         "subject": row.subject,
         "identity": row.identity,
+        "after_identity": row.after_identity,
         "verdict": row.verdict.value,
         "why": row.why.value,
         "label": row.label,

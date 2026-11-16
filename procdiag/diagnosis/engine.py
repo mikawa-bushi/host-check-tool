@@ -89,8 +89,32 @@ _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
 def _inert(value: object) -> object:
-    """Every substituted string is neutralised: host text stays on its line."""
-    return neutralize(value) if isinstance(value, str) else value
+    """Every substituted string is neutralised: host text stays on its line.
+
+    A backtick is shown as ``\\x60``: the proposals put commands between
+    backticks, so a name must not be able to open or close such a span.
+    """
+    if isinstance(value, str):
+        return neutralize(value).replace("`", "\\x60")
+    return value
+
+
+def _traceback_lines(exc: BaseException) -> list[str]:
+    """*exc* as reasoning steps, one per line of the stack.
+
+    The message after the stack can carry host text, so it stays one step and
+    its line breaks are shown as escapes when the report is rendered.
+    """
+    lines = [
+        line
+        for frame in traceback.format_tb(exc.__traceback__)
+        for line in frame.rstrip("\n").split("\n")
+    ]
+    return [
+        "Traceback (most recent call last):",
+        *lines,
+        *(m.rstrip("\n") for m in traceback.format_exception_only(exc)),
+    ]
 
 
 def _make_jinja_env() -> Environment:
@@ -313,6 +337,7 @@ class Engine:
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
         unjudged: list[str] = []
+        unjudged_parts: dict[str, tuple[str, ...]] = {}
         coverage_cache: dict[tuple[str, str], bool] = {}
         unobserved = (
             [p for u in store.unobserved_periods() if (p := u.within(window))]
@@ -343,7 +368,7 @@ class Engine:
                         rule_id=rule.rule_id,
                         title=rule.title,
                         required_hours=eff_min,
-                        remaining_hours=eff_min - observed_hours,
+                        remaining_hours=max(eff_min - observed_hours, 0.1),
                     )
                 )
                 continue
@@ -365,6 +390,7 @@ class Engine:
                     continue
                 shortfall = rule.recording_shortfall_hours(store, window)
                 if shortfall > 0:
+                    shortfall = max(shortfall, 0.1)
                     reasoning.append(
                         f"{rule.rule_id}: 判定に必要な観測が足りないためスキップ "
                         f"(あと {shortfall:.1f}h)"
@@ -383,7 +409,10 @@ class Engine:
                     found = rule.report(measured)
                 else:
                     found = rule.evaluate(store, window)
-                unjudged.extend(rule.coverage_notes(store, window))
+                notes = rule.coverage_notes(store, window)
+                if notes:
+                    unjudged_parts[rule.rule_id] = notes
+                unjudged.extend(notes)
                 pending = rule.pending_parts(store, window)
                 if pending:
                     waits = "、".join(
@@ -401,7 +430,7 @@ class Engine:
                 )
                 reasoning.append(msg)
                 if self.verbose:
-                    reasoning.append(traceback.format_exc())
+                    reasoning.extend(_traceback_lines(exc))
                 errored.append(rule.rule_id)
                 continue
             evaluated.append(rule.rule_id)
@@ -458,10 +487,11 @@ class Engine:
             quality=quality,
             no_data=not has_data,
             window=window if has_data else None,
-            evaluated_rules=evaluated,
+            evaluated_rules=evaluated if has_data else [],
             skipped_rules=skipped,
             errored_rules=errored,
             uncovered_rules=uncovered,
+            unjudged_parts=unjudged_parts,
             measurements=measurements,
             folded=folded,
             unobserved=unobserved,
