@@ -5,6 +5,7 @@ the space other users can write (schema 6)."""
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import time
 from collections import namedtuple
@@ -1663,6 +1664,186 @@ class TestAnotherMediumOfTheSameSize:
         assert f.evidence["days_left"] is not None
 
 
+def _grown(start, total_gb, used_gb_at, *, hours=12, cut=(), mountpoint="/data"):
+    """A row each minute of *hours*, the usage ``used_gb_at(minute)`` of *total_gb*.
+
+    The minutes in the ``(from, to)`` stretches of *cut* have no row.
+    """
+    return [
+        {
+            "ts": start + m * 60,
+            "mountpoint": mountpoint,
+            "total": total_gb * _GiB,
+            "used": int(used_gb_at(m) * _GiB),
+            "read_only": 0,
+        }
+        for m in range(int(hours * 60) + 1)
+        if not any(lo <= m < hi for lo, hi in cut)
+    ]
+
+
+def _bursts(m, *, first=20, gb_an_hour=2.0):
+    """An hourly job that adds *gb_an_hour* in its first ten minutes, flat otherwise."""
+    return first + gb_an_hour * (m // 60 + min(1.0, (m % 60) / 10))
+
+
+def _noisy(used_gb_at, sd_mb, seed):
+    rng = random.Random(seed)
+    return lambda m: used_gb_at(m) + rng.gauss(0, sd_mb) / 1024
+
+
+class TestAGapInTheRowsOfABurstyOrNoisyDisk:
+    @pytest.mark.parametrize(
+        ("gap", "gb_an_hour", "total_gb"),
+        [
+            (30, 2, 64),
+            (60, 2, 64),
+            (120, 2, 64),
+            (240, 2, 64),
+            (180, 10, 200),
+            (240, 10, 200),
+        ],
+    )
+    def test_a_disk_that_grows_in_bursts_keeps_its_forecast_across_a_gap(
+        self, tmp_path, gap, gb_an_hour, total_gb
+    ):
+        store, start = _recording(tmp_path, 12)
+        used = lambda m: _bursts(m, gb_an_hour=gb_an_hour)  # noqa: E731
+        _disk(store, _grown(start, total_gb, used, cut=[(360, 360 + gap)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.severity is Severity.CRITICAL
+        assert f.evidence["days_left"] < 1
+        assert diag.skipped_rules == []
+
+    @pytest.mark.parametrize(
+        ("sd_mb", "seed"), [(100, 2), (100, 3), (300, 1), (300, 2), (300, 3)]
+    )
+    def test_usage_that_scatters_keeps_its_forecast_across_a_gap_of_an_hour(
+        self, tmp_path, sd_mb, seed
+    ):
+        store, start = _recording(tmp_path, 12)
+        used = _noisy(lambda m: 20 + m / 60, sd_mb, seed)
+        _disk(store, _grown(start, 64, used, cut=[(360, 420)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] == pytest.approx(1.3, abs=0.2)
+        assert diag.skipped_rules == []
+
+    @pytest.mark.parametrize("gap", [120, 240])
+    def test_one_row_after_a_gap_goes_on_at_the_rate_before_it(self, tmp_path, gap):
+        store, start = _recording(tmp_path, 12)
+        rows = _grown(start, 200, lambda m: 100 + 2 * m / 60, cut=[(720 - gap, 720)])
+        assert rows[-1]["ts"] - rows[-2]["ts"] == (gap + 1) * 60
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] == pytest.approx(1.6, abs=0.2)
+        assert diag.skipped_rules == []
+
+    def test_a_stick_of_the_same_size_swapped_in_scattering_usage_is_another_one(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        used = _noisy(lambda m: 5 + 0.5 * m / 60 + (12 if m >= 480 else 0), 100, 4)
+        _disk(store, _grown(start, 32, used, cut=[(420, 480)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert ("DISK-FULL-01", "/data") in _pending(diag)
+
+    def test_a_stick_swapped_in_a_gap_before_the_last_row_is_another_one(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        used = lambda m: 100 + 2 * m / 60 + (36 if m >= 720 else 0)  # noqa: E731
+        _disk(store, _grown(start, 200, used, cut=[(600, 720)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert ("DISK-FULL-01", "/data") in _pending(diag)
+
+    def test_a_stick_swapped_while_a_job_adds_in_bursts_is_another_one(self, tmp_path):
+        store, start = _recording(tmp_path, 12)
+        used = lambda m: _bursts(m) + (10 if m >= 420 else 0)  # noqa: E731
+        _disk(store, _grown(start, 64, used, cut=[(360, 420)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert ("DISK-FULL-01", "/data") in _pending(diag)
+
+    def test_a_stick_swapped_for_an_emptier_one_of_the_same_size_is_another_one(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 12)
+        used = lambda m: 100 + 2 * m / 60 - (60 if m >= 480 else 0)  # noqa: E731
+        _disk(store, _grown(start, 200, used, cut=[(420, 480)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert ("DISK-FULL-01", "/data") in _pending(diag)
+
+    def test_a_modest_jump_in_a_disk_that_grows_steadily_is_another_one(self, tmp_path):
+        store, start = _recording(tmp_path, 12)
+        _disk(
+            store,
+            _steady(start, 7.0, total=100)
+            + _steady(start, 12, from_h=7.0 + 6 / 60, total=100, shift=3),
+        )
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert ("DISK-FULL-01", "/media/usb") in _pending(diag)
+
+    def test_a_few_rows_before_a_gap_do_not_decide_the_rate_across_it(self, tmp_path):
+        store, start = _recording(tmp_path, 7)
+        used = _noisy(lambda m: 20 + m / 60, 200, 5)
+        _disk(store, _grown(start, 64, used, hours=7, cut=[(0, 10), (14, 75)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] == pytest.approx(1.5, abs=0.3)
+        assert diag.skipped_rules == []
+
+    def test_a_swap_is_judged_without_the_rows_before_an_earlier_one(self, tmp_path):
+        store, start = _recording(tmp_path, 12)
+        used = (
+            lambda m: 30 + 2 * m / 60 + (0 if m < 310 else -30 if m < 350 else -4)
+        )  # noqa: E731
+        _disk(store, _grown(start, 200, used, cut=[(300, 310), (340, 350)]))
+
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+
+        assert f.evidence["days_left"] == pytest.approx(3.1, abs=0.2)
+
+    def test_a_swap_is_judged_without_the_rows_before_a_change_of_size(self, tmp_path):
+        store, start = _recording(tmp_path, 12)
+        small = _grown(start, 100, lambda m: 30 + 2 * m / 60, hours=5)
+        large = _grown(
+            start,
+            200,
+            lambda m: 30 + 2 * m / 60 + (30 if m < 350 else 4),
+            cut=[(0, 301), (340, 350)],
+        )
+        _disk(store, small + large)
+
+        (f,) = _found(_run(store, "DISK-FULL-01"), "DISK-FULL-01")
+
+        assert f.evidence["days_left"] == pytest.approx(3.0, abs=0.2)
+
+
 class TestFilesystemWhoseSizeDrifts:
     @staticmethod
     def _tank(tmp_path, wobble):
@@ -1958,6 +2139,22 @@ class TestAGrowthThatIsOneStep:
 
         (f,) = _found(diag, "DISK-FULL-01")
         assert f.evidence["days_left"] is not None
+
+    @staticmethod
+    def _quarter_hour_steps():
+        return [(h / 4, 1) for h in range(1, 12)]
+
+    def test_a_copy_of_two_thirds_of_the_growth_is_still_a_trend(self, tmp_path):
+        diag = self._copy(tmp_path, 6.5, [(3.0, 10)] + self._quarter_hour_steps())
+
+        (f,) = _found(diag, "DISK-FULL-01")
+        assert f.evidence["days_left"] is not None
+
+    def test_a_copy_of_three_quarters_of_the_growth_is_one_step(self, tmp_path):
+        diag = self._copy(tmp_path, 6.5, [(3.0, 20)] + self._quarter_hour_steps())
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert "DISK-FULL-01" in diag.unjudged_parts
 
     def test_a_copy_that_takes_forty_minutes_is_one_step(self, tmp_path):
         store, start = _recording(tmp_path, 6.5)

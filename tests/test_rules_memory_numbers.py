@@ -1107,7 +1107,7 @@ class TestMemPressureEdgeDaysAreWeighedByTheirObservation:
 
     @pytest.mark.parametrize(
         ("start_hour", "hours", "fraction"),
-        [(15, 66, 0.73), (17, 64, 0.75), (16, 68, 0.71), (14.5, 65, 0.74)],
+        [(15, 66, 0.65), (17, 64, 0.67), (16, 68, 0.64), (14.5, 65, 0.66)],
     )
     def test_quiet_edge_days_do_not_outvote_a_daily_pattern(
         self, tmp_path, local_tz, start_hour, hours, fraction
@@ -1200,7 +1200,7 @@ class TestMemPressureEdgeDaysAreWeighedByTheirObservation:
         store.close()
 
 
-class TestMemPressureLongestDayIsAtMostTwentyFourHours:
+class TestMemPressureTypicalDayIsAtMostTwentyFourHours:
     def test_a_day_of_twenty_five_hours_does_not_shorten_the_days_of_twenty_four(
         self, tmp_path, local_tz
     ):
@@ -1221,7 +1221,29 @@ class TestMemPressureLongestDayIsAtMostTwentyFourHours:
 
         assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 3)
         assert f.evidence["recurrence_fraction"] == 0.67
-        assert f.evidence["full_day_hours"] == 24.0
+        assert f.evidence["typical_day_hours"] == 24.0
+        store.close()
+
+    def test_a_day_of_twenty_four_and_one_of_twenty_five_hours_are_a_day_of_twenty_four(
+        self, tmp_path, local_tz
+    ):
+        local_tz("America/New_York")
+        store = make_db(tmp_path)
+        midnight = time.mktime(datetime(2026, 10, 31).timetuple())
+        minutes = (24 + 25) * 60
+        pressure = {d * 1440 + 14 * 60 + k: 9.0 for d in (0, 1) for k in range(30)}
+        _pressure_recording(
+            store,
+            midnight,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 2)
+        assert f.evidence["typical_day_hours"] == 24.0
         store.close()
 
 
@@ -1343,6 +1365,150 @@ class TestMemPressureOfAPcThatRunsPartOfEachDay:
         store.close()
 
 
+_WEEKDAYS = (0, 1, 2, 3, 4, 7, 8, 9, 10, 11)
+
+
+class TestMemPressureTypicalDayIsWhatMostDaysObserve:
+    @staticmethod
+    def _schedule(tmp_path, days, pressure_days):
+        """A PC on ``days[day] = (first hour, hours on)``, with 30 minutes of
+        pressure at 10:00 on *pressure_days*; day 0 starts at local midnight."""
+        tmp_path.mkdir(exist_ok=True)
+        store = make_db(tmp_path)
+        minutes = (max(days) + 1) * 1440
+        on = {
+            m
+            for day, (first, hours) in days.items()
+            for m in range(day * 1440 + first * 60, day * 1440 + (first + hours) * 60)
+        }
+        pressure = _windows(0, minutes, [(d, 10 * 60, 30) for d in pressure_days])
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+            missing=frozenset(range(minutes)) - on,
+        )
+        return store
+
+    @staticmethod
+    def _weeks(saturday=None):
+        days = {d: (8, 8) for d in _WEEKDAYS}
+        if saturday:
+            days[5] = saturday
+        return days
+
+    @pytest.mark.parametrize(("pressure", "fires"), [(5, False), (6, False), (7, True)])
+    def test_a_whole_saturday_does_not_make_eight_hour_weekdays_weigh_a_third(
+        self, tmp_path, local_tz, pressure, fires
+    ):
+        local_tz("JST-9")
+        store = self._schedule(tmp_path, self._weeks((0, 24)), _WEEKDAYS[:pressure])
+
+        found = _run(store, "MEM-PRESSURE-01")
+
+        assert bool(found) is fires
+        if found:
+            (f,) = found
+            assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (
+                7,
+                11,
+            )
+            assert f.evidence["typical_day_hours"] == 8.0
+            assert f.evidence["observed_day_equivalents"] == 11.0
+            assert "7/11 日" in f.summary
+        store.close()
+
+    def test_the_same_weekdays_without_the_saturday_are_judged_the_same_way(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = self._schedule(tmp_path, self._weeks(), _WEEKDAYS[:6])
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["recurrence_fraction"] == 0.6
+        assert f.evidence["typical_day_hours"] == 8.0
+        store.close()
+
+    @pytest.mark.parametrize("saturday", [(8, 12), (6, 16)])
+    def test_a_longer_day_that_is_not_a_whole_day_does_not_change_the_weekdays_either(
+        self, tmp_path, local_tz, saturday
+    ):
+        local_tz("JST-9")
+        store = self._schedule(tmp_path, self._weeks(saturday), _WEEKDAYS[:6])
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    def test_six_hour_days_and_one_whole_day_are_judged_by_the_six_hours(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        days = {d: (9, 6) for d in range(6)}
+        days[6] = (0, 24)
+        store = self._schedule(tmp_path, days, (0, 1, 2, 3))
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    def test_the_typical_day_is_the_median_not_the_shortest_of_the_days(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        days = {0: (9, 6), 1: (9, 6), 2: (4, 16), 3: (4, 16)}
+        store = self._schedule(tmp_path, days, (2, 3))
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["recurrence_fraction"] == 0.65
+        assert f.evidence["observed_day_equivalents"] == 3.09
+        assert f.evidence["typical_day_hours"] == 11.0
+        store.close()
+
+    def test_a_day_with_less_than_six_hours_does_not_shorten_the_typical_day(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        days = {0: (9, 4), 1: (9, 4), 2: (4, 16), 3: (4, 16), 4: (4, 16), 5: (9, 6)}
+        store = self._schedule(tmp_path, days, (0, 1, 2, 3))
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["n_total_days"] == 6
+        assert f.evidence["typical_day_hours"] == 16.0
+        store.close()
+
+    def test_days_that_are_all_too_short_to_be_judged_without_pressure_show_a_whole_day(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        days = {d: (9, 4) for d in range(7)}
+        store = self._schedule(tmp_path, days, range(7))
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["n_total_days"] == 7
+        assert f.evidence["recurrence_fraction"] == 1.0
+        assert f.evidence["typical_day_hours"] == 24.0
+        store.close()
+
+    def test_the_basis_says_how_the_typical_day_was_chosen(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = self._schedule(tmp_path, self._weeks((0, 24)), _WEEKDAYS[:7])
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        basis = next(
+            line for line in f.proposal.splitlines() if line.startswith("[根拠]")
+        )
+        assert "中央値 (この記録では 8 時間" in basis
+        assert "観測日 11 日は 11 日分" in basis
+        assert "7 / 11 日 (64%)" in f.proposal.splitlines()[0]
+        store.close()
+
+
 class TestMemPressureShowsTheRatioItUsed:
     @staticmethod
     def _found(tmp_path, local_tz, start_hour, hours):
@@ -1400,8 +1566,8 @@ class TestMemPressureShowsTheRatioItUsed:
             line for line in f.proposal.splitlines() if line.startswith("[根拠]")
         )
         assert "圧迫日 2 / 観測日 4" in basis
-        assert "観測日 4 日は 2.75 日分になり" in basis
-        assert "24 時間" in basis
+        assert "観測日 4 日は 3.09 日分になり" in basis
+        assert "中央値 (この記録では 16.5 時間。上限は 24 時間)" in basis
 
     def test_whole_days_are_shown_as_plain_day_counts(self, tmp_path, local_tz):
         f = self._found(tmp_path, local_tz, 0, 48)
