@@ -325,10 +325,10 @@ def _recorded_cpu_count(store: "Storage") -> int | None:
     keeps ``avg_pct_max`` as it is: a count guessed from the samples can fall
     short on a busy host and loosen the limit.
     """
-    try:
-        count = int(store.meta().get("cpu_count", ""))
-    except ValueError:
+    text = store.meta().get("cpu_count", "")
+    if not (text.isascii() and text.isdigit()):  # int() takes " 2 " and "+2"
         return None
+    count = int(text)
     return count if count >= 1 else None
 
 

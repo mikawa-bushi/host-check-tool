@@ -177,7 +177,7 @@ class OomKillRule(Rule):
         "OOM kill の決定論的証拠となる"
     )
     manual_commands = [
-        "journalctl -k | grep -i oom",
+        "journalctl -k -b all | grep -i oom",
         "dmesg | grep -i oom",
         "dmesg | grep -i 'killed process'",
         "cat /proc/sys/vm/overcommit_memory",
@@ -655,7 +655,11 @@ class ServiceRestartRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run SERVICE-RESTART-01 against the observation window."""
-        rows = store.rows("service_events", since=window.start_ts, until=window.end_ts)
+        rows = store.rows(
+            "service_events",
+            since=window.start_ts,
+            until=store.events_end(window.end_ts),
+        )
 
         by_unit: dict[str, list] = {}
         for row in rows:
@@ -785,7 +789,7 @@ class KernelErrorRule(Rule):
         "カーネルログにだけ記録されることが多い"
     )
     manual_commands = [
-        "journalctl -k -p warning --since '2 days ago'",
+        "journalctl -k -b all -p warning --since '2 days ago'",
         "dmesg -T | grep -iE 'error|fail|blocked|segfault|disconnect'",
     ]
 
@@ -793,7 +797,11 @@ class KernelErrorRule(Rule):
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run KERNEL-ERROR-01 against the observation window."""
-        rows = store.rows("kernel_events", since=window.start_ts, until=window.end_ts)
+        rows = store.rows(
+            "kernel_events",
+            since=window.start_ts,
+            until=store.events_end(window.end_ts),
+        )
 
         by_kind: dict[str, list] = {}
         for row in rows:

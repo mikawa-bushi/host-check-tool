@@ -331,6 +331,8 @@ def test_closing_the_terminal_stops_record_unless_started_with_nohup(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # A runner started under nohup ignores SIGHUP and the child inherits it.
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL),
     )
     try:
         _wait_for_session(db_path)

@@ -929,7 +929,7 @@ class FsReadOnlyRule(Rule):
     )
     manual_commands = [
         "grep ' ro,' /proc/mounts",
-        "journalctl -k | grep -iE 'remount|EXT4-fs error|I/O error'",
+        "journalctl -k -b all | grep -iE 'remount|EXT4-fs error|I/O error'",
     ]
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:

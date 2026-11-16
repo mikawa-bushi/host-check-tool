@@ -5,7 +5,7 @@
 [影響予測] 異常停止のたびに書き込み中のデータが失われ、ファイルシステムや DB が破損する可能性があります。頻発する場合は生産設備との通信断・データ欠落につながります。
 {% else %}[検出] 記録プロセス (procdiag record) が停止処理なしで終了しました ({{ evidence.count }} 回)。ホスト自体は稼働を続けていました。
 [根拠] 記録セッション履歴で、停止記録のないまま同じ起動 (boot) の中で次の記録が始まっています。SIGKILL (kill -9)・OOM Killer・記録プロセス自身の異常終了が考えられます。
-[暫定対処] `journalctl -u procdiag-record -n 100` と `journalctl -k | grep -i oom` で、記録プロセスが強制終了された理由を確認してください。
+[暫定対処] `journalctl -u procdiag-record -n 100` と `journalctl -k -b all | grep -i oom` で、記録プロセスが強制終了された理由を確認してください。
 [恒久対処] OOM Killer が原因の場合はメモリ不足 (MEM-PRESSURE-01 / OOM-KILL-01) への対処を、手動停止が原因の場合は `systemctl stop` など正規の停止手順を使ってください。
 [影響予測] 記録が途切れた区間は診断できません。観測品質の「欠測」として扱われます。
 {% endif %}
