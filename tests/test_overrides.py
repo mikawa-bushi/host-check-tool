@@ -191,3 +191,53 @@ class TestEngineAndCli:
         charts = build_charts(store, config=_cfg({"CPU-SATURATION-01": {"bogus": 1}}))
         store.close()
         assert charts.psi_cpu_threshold == CpuSaturationRule.psi_threshold
+
+
+class TestMeaninglessValues:
+    """A cap or tolerance of 0 or less hides evidence or is meaningless."""
+
+    CASES = [
+        ("CPU-PERIODIC-01", "tol_sec"),
+        ("OOM-KILL-01", "max_findings"),
+        ("IO-BOTTLENECK-01", "top_n"),
+        ("KERNEL-ERROR-01", "max_samples"),
+    ]
+
+    @pytest.mark.parametrize(("rule_id", "name"), CASES)
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_cli_refuses_it_at_startup(self, tmp_path, rule_id, name, value):
+        cfg = tmp_path / "config.py"
+        cfg.write_text(
+            "from procdiag.config import ProcdiagConfig, RulesConfig\n"
+            f"config = ProcdiagConfig(db_path={str(tmp_path / 'p.db')!r},\n"
+            f"    rules=RulesConfig(overrides={{{rule_id!r}: {{{name!r}: {value}}}}}))\n",
+            encoding="utf-8",
+        )
+        result = CliRunner().invoke(
+            cli, ["record", "--duration", "1s", "--config", str(cfg)]
+        )
+        assert result.exit_code == 4, result.output
+        assert name in result.output and "0 より大きい" in result.output
+        assert not (tmp_path / "p.db").exists()
+
+    @pytest.mark.parametrize(("rule_id", "name"), CASES)
+    def test_a_positive_value_is_accepted(self, rule_id, name):
+        assert validate_rule_overrides({rule_id: {name: 3}}) == []
+
+    def test_an_unbounded_tolerance_is_still_accepted(self):
+        assert (
+            validate_rule_overrides({"CPU-PERIODIC-01": {"tol_sec": float("inf")}})
+            == []
+        )
+
+    def test_tol_sec_of_zero_does_not_break_periodicity_detection(self):
+        from procdiag.diagnosis import detect_periodicity
+
+        day = 86400.0
+        base = 1_780_000_000.0 - (1_780_000_000.0 % day)
+        starts = [base + k * day + 3600 + j for k in range(6) for j in (0, 30)]
+        minutes = [base + 60.0 * i for i in range(6 * 1440)]
+        period = detect_periodicity(
+            starts, tol_sec=0.0, min_events=3, recorded_minutes=minutes
+        )
+        assert period is not None and period.count == 6
