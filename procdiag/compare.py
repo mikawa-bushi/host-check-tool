@@ -833,8 +833,10 @@ def run_compare(
                 only,
                 skip,
             )
-            span = after.result.window.span_hours if after.result else 0.0
-            hours = max(span, engine.required_hours(only=only, skip=skip))
+            # Hours recorded, as the verdicts count them: a gap in the after
+            # period does not make the period before it longer.
+            recorded = after.result.window.observed_hours if after.result else 0.0
+            hours = max(recorded, engine.required_hours(only=only, skip=skip))
             before_period = Period(request.at - hours * 3600.0, request.at)
         else:
             after = _evaluate_side(

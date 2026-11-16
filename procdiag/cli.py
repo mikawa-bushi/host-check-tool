@@ -336,24 +336,25 @@ def _period_notes(store: "Storage", diag: Diagnosis, *, chosen: bool) -> list[st
     if window is None:
         return []
     notes = []
+    hours = window.observed_hours
     recorded = store.system_bounds()
     if not chosen and recorded and recorded[0] < window.start_ts - 60:
         notes.append(
             f"記録は {_local_minute(recorded[0])} からありますが、診断したのは"
             f"生データの残る {_local_minute(window.start_ts)} 以降の"
-            f" {window.span_hours:.1f} 時間です。それより前も診断するには --since を"
+            f" {hours:.1f} 時間です。それより前も診断するには --since を"
             "指定してください (期間が長いほど時間とメモリを使います)。"
         )
     raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
-    raw_hours = (raw[1] - raw[0]) / 3600.0 if raw else 0.0
+    raw_hours = window.observed_hours_between(*raw) if raw else 0.0
     raw_rules = [
         rid
         for rid in diag.evaluated_rules
         if (cls := get_rule(rid)) and set(cls.requires_rows) & set(RAW_TABLES)
     ]
-    if raw_rules and 0 < raw_hours < window.span_hours - 1 / 60:
+    if raw_rules and 0 < raw_hours < hours - 1 / 60:
         notes.append(
-            f"期間 {window.span_hours:.1f} 時間のうち生データがあるのは"
+            f"期間 {hours:.1f} 時間のうち生データがあるのは"
             f" {raw_hours:.1f} 時間です。{', '.join(raw_rules)} は"
             "生データのある範囲だけで評価しました。"
         )
