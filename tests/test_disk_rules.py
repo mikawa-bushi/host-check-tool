@@ -1844,6 +1844,64 @@ class TestAGapInTheRowsOfABurstyOrNoisyDisk:
         assert f.evidence["days_left"] == pytest.approx(3.0, abs=0.2)
 
 
+def _nightly(m, *, job_gb=10.0):
+    """Slow growth, and a job that adds *job_gb* in the hour from 14:00 each day."""
+    hours = m / 60
+    if hours < 14:
+        return 60 + 0.1 * hours
+    days, into = divmod(hours - 14, 24)
+    return 60 + 0.1 * hours + job_gb * (days + min(1.0, into))
+
+
+def _rotated_log(m, *, gb_an_hour=0.5):
+    """A log that grows *gb_an_hour* and is deleted at the start of each day."""
+    return 25.6 + gb_an_hour * (m / 60 % 24)
+
+
+class TestAGapInTheRowsIsNotAnotherMedium:
+    @pytest.mark.parametrize("gap", [90, 120, 240])
+    def test_a_gap_that_swallows_a_nightly_job_does_not_end_the_forecast(
+        self, tmp_path, gap
+    ):
+        store, start = _recording(tmp_path, 48)
+        _disk(store, _grown(start, 200, _nightly, hours=48, cut=[(2250, 2250 + gap)]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        findings = _found(diag, "DISK-FULL-01")
+        assert [f.severity for f in findings] == [Severity.WARNING]
+        assert findings[0].evidence["days_left"] == pytest.approx(8.5, abs=0.5)
+        assert diag.skipped_rules == []
+
+    def test_a_gap_that_swallows_a_nightly_job_does_not_end_the_inode_forecast(
+        self, tmp_path
+    ):
+        store, start = _recording(tmp_path, 48)
+        rows = _grown(start, 200, _nightly, hours=48, cut=[(2250, 2370)])
+        for row in rows:
+            row["inodes_total"] = 10_000_000
+            row["inodes_used"] = int(row["used"] / _GiB * 5e4)
+        _disk(store, rows)
+
+        diag = _run(store, "DISK-INODE-01")
+
+        findings = _found(diag, "DISK-INODE-01")
+        assert [f.evidence["days_left"] is not None for f in findings] == [True]
+        assert diag.skipped_rules == []
+
+    @pytest.mark.parametrize("cut", [(2820, 2880), (2760, 2880), (2880, 2940)])
+    def test_a_gap_beside_a_log_rotation_does_not_make_the_disk_critical(
+        self, tmp_path, cut
+    ):
+        store, start = _recording(tmp_path, 66)
+        _disk(store, _grown(start, 64, _rotated_log, hours=66, cut=[cut]))
+
+        diag = _run(store, "DISK-FULL-01")
+
+        assert _found(diag, "DISK-FULL-01") == []
+        assert diag.skipped_rules == []
+
+
 class TestFilesystemWhoseSizeDrifts:
     @staticmethod
     def _tank(tmp_path, wobble):
