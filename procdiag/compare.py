@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+import sqlite3
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Union
 
 from .core import (
     Diagnosis,
@@ -378,6 +379,7 @@ class NoteKind(str, Enum):
     RECORDING_CONFIG_DIFFERS = "recording_config_differs"
     RAW_PARTIAL = "raw_partial"
     NOT_COMPARABLE = "not_comparable"
+    CONFIG_FALLBACK = "config_fallback"
 
 
 @dataclass(frozen=True)
@@ -408,6 +410,8 @@ class Note:
                 f"{', '.join(d['rules'])} は、どちらの期間も記録時間が足りず"
                 "評価できていません。問題が無いとは言えません"
             )
+        if self.kind is NoteKind.CONFIG_FALLBACK:
+            return str(d["message"])
         side = self.side.label if self.side else ""
         return (
             f"{side}の期間のうち生データがあるのは {d['raw_hours']:.1f} /"
@@ -705,6 +709,15 @@ def _note_list(before: Side, after: Side, *, has_rows: bool) -> list[Note]:
     waiting = [r for r in _waiting_rules(before) if r in after_waiting]
     if waiting and not has_rows:
         notes.append(Note(NoteKind.NOT_COMPARABLE, detail={"rules": waiting}))
+    fallbacks = dict.fromkeys(
+        message
+        for side in (before, after)
+        if side.result
+        for message in side.result.diagnosis.config_notes
+    )
+    notes.extend(
+        Note(NoteKind.CONFIG_FALLBACK, detail={"message": m}) for m in fallbacks
+    )
     for side in (before, after):
         res = side.result
         if res is None or not 0 < res.raw_hours < res.window.observed_hours - 1 / 60:
@@ -802,15 +815,16 @@ def _evaluate_side(
     only: Optional[list[str]],
     skip: Optional[list[str]],
 ) -> Side:
-    meta = store.meta()
-    bounds = store.system_bounds(period.since, before=period.until)
-    result = None
-    if bounds is not None:
-        diag = engine.run(store, only=only, skip=skip, window=Window(*bounds))
-        window = diag.window or Window(*bounds)
-        raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
-        raw_hours = window.observed_hours_between(*raw) if raw else 0.0
-        result = Evaluated(window, raw_hours, diag)
+    with _naming(store.path):
+        meta = store.meta()
+        bounds = store.system_bounds(period.since, before=period.until)
+        result = None
+        if bounds is not None:
+            diag = engine.run(store, only=only, skip=skip, window=Window(*bounds))
+            window = diag.window or Window(*bounds)
+            raw = store.time_bounds("sys_samples", window.start_ts, window.end_ts)
+            raw_hours = window.observed_hours_between(*raw) if raw else 0.0
+            result = Evaluated(window, raw_hours, diag)
     return Side(
         name=name,
         db=store.path,
@@ -822,9 +836,20 @@ def _evaluate_side(
     )
 
 
+@contextmanager
+def _naming(db: Path) -> Iterator[None]:
+    """Let an sqlite error say which DB of the comparison raised it (``exc.db``)."""
+    try:
+        yield
+    except sqlite3.DatabaseError as exc:
+        exc.db = db  # type: ignore[attr-defined]
+        raise
+
+
 def _open(stack: ExitStack, db: Path) -> Storage:
     try:
-        return stack.enter_context(Storage(db, read_only=True))
+        with _naming(db):
+            return stack.enter_context(Storage(db, read_only=True))
     except StorageVersionError as exc:
         raise CompareError(f"{db}: {exc}") from exc
 
