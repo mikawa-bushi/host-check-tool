@@ -41,6 +41,7 @@ class ThermalSampler(Sampler):
     title = "CPU温度・クロック (サーマルスロットリング検出)"
     tier = "T3"
     interval_key = "thermal_interval"
+    capability = Capability.THERMAL
     requires_root = False
     what = "CPU最大温度と現在/最大クロックを定期記録する"
     why = "熱によるクロック低下(物理制限)はPSI(需要)と区別できないため、温度×クロック比で識別する"

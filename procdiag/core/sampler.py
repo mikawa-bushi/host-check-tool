@@ -106,6 +106,11 @@ class RunContext:
         self.unobserved[capability] = reason
 
 
+# A sampler that feeds a capability and has not read once by its second failed
+# run in a row has not observed it in this recording.
+_UNREAD_AFTER_FAILURES = 2
+
+
 class Sampler:
     """Base class for all samplers.
 
@@ -123,6 +128,11 @@ class Sampler:
     what: str = ""
     why: str = ""
     manual_commands: list[str] = []
+    # What the rules that read this sampler's rows need to have been observed
+    # (None: they can tell a quiet recording from an unread one by the rows).
+    capability: Optional[Capability] = None
+    _failed_runs: int = 0
+    _read_ok: bool = False
 
     def setup(self, ctx: RunContext) -> None:
         """One-time initialisation called before the first collect.
@@ -154,17 +164,34 @@ class Sampler:
         whenever nothing drains it.  Consecutive identical notes from the same
         sampler are therefore de-duplicated; a successful collect resets the
         guard so a *new* failure is still recorded once.
+
+        A sampler with a :attr:`capability` that fails its first two runs
+        without ever having read makes the session lack that capability, so
+        the rules that need it are not evaluated as "no problem".
         """
         try:
             batches = self.collect(ctx)
-            self._last_run_note = None
-            return batches
         except Exception as e:  # never let one sampler kill the loop
             note = f"{self.name}: collect失敗 ({e})"
             if getattr(self, "_last_run_note", None) != note:
                 ctx.notes.append(Note(self.name, note))
                 self._last_run_note = note
+            self._failed_runs += 1
+            if (
+                self.capability is not None
+                and not self._read_ok
+                and self._failed_runs == _UNREAD_AFTER_FAILURES
+            ):
+                ctx.lacks(
+                    self.capability,
+                    f"{self.name}: {self.capability.label}を読む処理が続けて失敗し、"
+                    f"一度も読めていないため観測できていません ({e})",
+                )
             return []
+        self._last_run_note = None
+        self._failed_runs = 0
+        self._read_ok = True
+        return batches
 
 
 # --- registry -----------------------------------------------------------------

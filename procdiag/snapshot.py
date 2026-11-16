@@ -341,11 +341,13 @@ def _check_disks(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
                 status = CRITICAL
                 hint = (
                     "ファイルシステムのエラーで自動的に読み取り専用化した可能性があります。"
-                    "`journalctl -k | grep -iE 'EXT4-fs error|I/O error'` を確認してください"
+                    "`journalctl -k -b all | grep -iE 'EXT4-fs error|I/O error'` を確認してください"
                 )
             else:
                 status = INFO
-                hint = "意図した設定でなければ `journalctl -k` を確認してください"
+                hint = (
+                    "意図した設定でなければ `journalctl -k -b all` を確認してください"
+                )
             items.append(
                 item(
                     status,
@@ -463,8 +465,8 @@ def _check_services(item: _Item, config: ProcdiagConfig) -> List[SnapshotItem]:
     worst = restarted[0][1] if restarted else 0
     r_status = WARNING if worst >= warn_at else (INFO if restarted else OK)
     r_hint = (
-        "異常終了して systemd が自動再起動しています。"
-        "`journalctl -u <unit>` でエラーを確認してください"
+        "systemd が自動再起動しています (正常に終了した後の再起動も含みます)。"
+        "`journalctl -u <unit>` で終了の理由を確認してください"
     )
     items.append(
         restart_item(
@@ -503,7 +505,7 @@ def _check_kernel_log(item: _Item) -> List[SnapshotItem]:
         item(
             status,
             detail,
-            "`journalctl -k --since '24 hours ago' -p warning` で内容を確認してください",
+            "`journalctl -k -b all --since '24 hours ago' -p warning` で内容を確認してください",
         )
     ]
 

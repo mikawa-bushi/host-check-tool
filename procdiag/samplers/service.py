@@ -52,6 +52,7 @@ class ServiceSampler(Sampler):
     title = "systemd サービスの再起動・failed"
     tier = "T3"
     interval_key = "service_interval"
+    capability = Capability.SYSTEMD
     what = "systemd が自動再起動した回数 (NRestarts) の増加と failed 状態への遷移を記録する"
     why = (
         "クラッシュ→自動再起動を繰り返すサービスは一瞬で active に戻るため、"
@@ -88,6 +89,8 @@ class ServiceSampler(Sampler):
             return []
         units = systemd.list_service_units()
         info = systemd.show_units(units) if units else None
+        if units is None or (units and info is None):
+            raise OSError("systemctl でサービスの状態を読めませんでした")
         if not info:
             return []
 
@@ -99,7 +102,9 @@ class ServiceSampler(Sampler):
             result = props.get("Result") or None
             n_restarts = systemd.n_restarts(props)
             if n_restarts is not None:
-                prev = self._restarts.get(unit, n_restarts)
+                # A unit loaded after the first poll started at 0.
+                first_seen = n_restarts if since is None else 0
+                prev = self._restarts.get(unit, first_seen)
                 # A manual start or reset-failed sets NRestarts back to 0, so a
                 # lower value is the number of restarts since then.
                 new = n_restarts - prev if n_restarts >= prev else n_restarts
@@ -128,6 +133,10 @@ class ServiceSampler(Sampler):
                 kind = "failed_at_start" if since is None else "failed"
                 rows.append(self._event(ts, unit, kind, 0, result))
             self._failed[unit] = failed
+        # A unit that was collected is loaded again from scratch: counter 0,
+        # not failed.
+        self._restarts = {u: n for u, n in self._restarts.items() if u in info}
+        self._failed = {u: f for u, f in self._failed.items() if u in info}
 
         failures = None
         if unclassified and self._journal:

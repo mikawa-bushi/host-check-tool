@@ -60,15 +60,23 @@ def available() -> bool:
     )
 
 
-def run(args: List[str]) -> Optional[str]:
-    """Run a command and return stdout, or None on any failure (incl. timeout)."""
+def run_with_stderr(args: List[str]) -> Tuple[Optional[str], str]:
+    """Run a command: ``(stdout, stderr)``, with stdout None on any failure.
+
+    A command that did not run or timed out has no stderr (``""``).
+    """
     try:
         result = subprocess.run(
             args, capture_output=True, text=True, timeout=_TIMEOUT_SEC
         )
     except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout if result.returncode == 0 else None
+        return None, ""
+    return (result.stdout if result.returncode == 0 else None), result.stderr
+
+
+def run(args: List[str]) -> Optional[str]:
+    """Run a command and return stdout, or None on any failure (incl. timeout)."""
+    return run_with_stderr(args)[0]
 
 
 def _unit_names(args: List[str]) -> Optional[List[str]]:

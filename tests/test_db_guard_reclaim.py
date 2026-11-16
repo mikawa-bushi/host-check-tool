@@ -234,6 +234,9 @@ class TestSizeLimitLadder:
     def test_configured_rollup_retention_is_not_cut_by_raw_rungs(self, tmp_path):
         db = tmp_path / "long.db"
         _build_db(db, raw_hours=40, rollup_days=120, procs=6, rollup_procs=1)
+        with Storage(db) as store:
+            store.rollup_incremental()  # what the recorder adds before the guard runs
+            store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         config = ProcdiagConfig(
             retention=RetentionConfig(
                 raw="48h",

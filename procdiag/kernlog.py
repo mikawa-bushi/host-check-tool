@@ -17,9 +17,12 @@ import math
 import re
 from typing import List, NamedTuple, Optional, Tuple
 
-from .systemd import run
+from .systemd import run_with_stderr
 
 _MAX_MESSAGE = 300
+# What journalctl prints when the --after-cursor value is not a cursor
+# ("Failed to seek to cursor: Invalid argument", exit 1).
+_CURSOR_REJECTED = "Failed to seek to cursor"
 
 # (kind, Japanese label, pattern).  Order matters: the first match wins, so the
 # specific filesystem patterns are tried before the generic "I/O error".
@@ -79,6 +82,10 @@ KINDS: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = (
 LABELS = {kind: label for kind, label, _ in KINDS}
 
 
+class CursorRejected(Exception):
+    """journalctl says the cursor it was given is not a cursor it can seek to."""
+
+
 class KernelEvent(NamedTuple):
     ts: float
     kind: str
@@ -136,7 +143,10 @@ def read_events(
     the range.  Earlier boots are included: ``-k`` would limit the read to the
     running boot and hide the lines logged before a reboot or a power loss.
     ``events`` is None when the journal cannot be read at all (no journalctl,
-    no permission).
+    no permission) or the read failed; the returned cursor is then *after_cursor*,
+    still where the next read resumes.  :class:`CursorRejected` is raised when
+    journalctl itself says it cannot seek to *after_cursor* (a failed read says
+    nothing about the cursor).
     """
     args = ["journalctl", "_TRANSPORT=kernel", "-q", "--no-pager"]
     args += ["-o", "short-unix", "--show-cursor"]
@@ -146,7 +156,9 @@ def read_events(
         args += ["--since", f"@{math.floor(since)}"]
     if until is not None:
         args += ["--until", f"@{math.ceil(until)}"]
-    out = run(args)
+    out, err = run_with_stderr(args)
+    if out is None and after_cursor and _CURSOR_REJECTED in err:
+        raise CursorRejected(after_cursor)
     # journalctl exits 0 with no output when it may not read the system journal.
     if out is None or (not out.strip() and not journal_readable()):
         return None, after_cursor
@@ -156,13 +168,13 @@ def read_events(
 
 def journal_readable() -> bool:
     """Whether this process can read kernel messages from the journal."""
-    out = run(["journalctl", "-k", "-n", "1", "-q", "--no-pager"])
+    out, _err = run_with_stderr(["journalctl", "-k", "-n", "1", "-q", "--no-pager"])
     return bool(out and out.strip())
 
 
 def newest_cursor() -> Optional[str]:
     """Cursor of the newest kernel message; None when the journal is unreadable."""
-    out = run(
+    out, _err = run_with_stderr(
         ["journalctl", "_TRANSPORT=kernel", "-n", "1", "-q", "--no-pager"]
         + ["-o", "short-unix", "--show-cursor"]
     )

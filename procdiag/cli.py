@@ -665,7 +665,13 @@ def record(
 
     with _db_guard(cfg.db_path):
         try:
-            recorder = Recorder(cfg, duration=duration_sec)
+            recorder = Recorder(
+                cfg,
+                duration=duration_sec,
+                on_start=lambda: click.echo(
+                    "記録を開始します。停止するには Ctrl-C を押してください。"
+                ),
+            )
         except (OSError, sqlite3.OperationalError) as exc:
             if Path(cfg.db_path).is_dir():
                 raise
@@ -674,7 +680,6 @@ def record(
             reason = _reason(exc) if isinstance(exc, OSError) else str(exc)
             click.echo(f"エラー: DB を使えません: {cfg.db_path} ({reason})", err=True)
             sys.exit(1)
-    click.echo("記録を開始します。停止するには Ctrl-C を押してください。")
     sys.exit(recorder.run())
 
 

@@ -41,6 +41,9 @@ SYSTEM_DB = f"/var/lib/{SYSTEM_STATE_DIR}/procdiag.db"
 # Other failures can clear up, so they keep Restart=on-failure: exit 1 when the
 # DB cannot be opened, created or written (a disk mounted late, a full disk).
 PRECONDITION_EXIT_STATUS = 4
+# The generated unit's TimeoutStopSec: after it systemd kills the recorder,
+# which then leaves its session unclosed.
+TIMEOUT_STOP_SEC = 30
 
 _PLAIN_WORD = re.compile(r"[A-Za-z0-9_@+=:,./-]+")
 _C_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
@@ -134,7 +137,7 @@ RestartSec=10
 # 設定・引数・DB ファイルの誤り (終了コード {PRECONDITION_EXIT_STATUS}) は、再起動しても直らないので再起動しない
 RestartPreventExitStatus={PRECONDITION_EXIT_STATUS}
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec={TIMEOUT_STOP_SEC}
 Nice=10
 CPUQuota=2%
 

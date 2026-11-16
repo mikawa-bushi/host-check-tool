@@ -33,6 +33,7 @@ injected at construction time.  In production, the recorder binds
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -187,6 +188,12 @@ class CgroupSampler(Sampler):
         rows: list[tuple] = []
 
         for unit_path in self._units:
+            # A unit the registry cannot take (a DB that cannot be written)
+            # costs its own row, not the whole tick, and keeps its baselines.
+            try:
+                cg_id = self._resolve_cg(unit_path, ts)
+            except sqlite3.Error:
+                continue
             unit_dir = ctx.cgroup_root / unit_path
             io_rbytes_delta, io_wbytes_delta = self._io_deltas(
                 unit_path, _parse_io_stat(unit_dir / "io.stat"), ctx.sys_root
@@ -198,7 +205,7 @@ class CgroupSampler(Sampler):
                 make_row(
                     "cg_samples",
                     ts=ts,
-                    cg_id=self._resolve_cg(unit_path, ts),
+                    cg_id=cg_id,
                     cpu_usec_delta=self._delta(
                         unit_path, "cpu", _parse_cpu_stat(unit_dir / "cpu.stat")
                     ),

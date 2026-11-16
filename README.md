@@ -73,7 +73,7 @@ procdiag bundle
 | `procdiag record` | 常駐ループで CPU/メモリ/ディスクを記録 |
 | `procdiag check` | 記録済みデータに診断ルールを実行し改善提案を出力 (`-o report.html` / `-o report.json` でファイルに) |
 | `procdiag compare` | 対策の前後 (1 つの DB の 2 期間、または 2 つの DB) を同じルール・しきい値で比べる |
-| `procdiag status` | 記録期間・サンプル数・自己負荷を表示 (生サンプルが期限切れで 1 分集計だけ残った DB も期間を示す。サイズは `-wal` を含む) |
+| `procdiag status` | 記録期間・サンプル数・自己負荷・直近イベントを表示 (生サンプルが期限切れで 1 分集計だけ残った DB も期間を示す。サイズは `-wal` を含む) |
 | `procdiag doctor` | 記録開始前にホストの観測能力 (PSI/cgroup/権限/センサ等) を診断 |
 | `procdiag explain [RULE\|sampler]` | ルールまたはサンプラーの詳細を表示 (引数なしでルールをカテゴリ別、サンプラーを Tier 別に一覧表示) |
 | `procdiag export` | 記録データを CSV または JSON でエクスポート |
