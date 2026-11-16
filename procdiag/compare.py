@@ -300,9 +300,8 @@ class ComparisonRow:
     before: SideState
     after: SideState
     paired_by_name: bool = False
-    after_identity: Optional[str] = (
-        None  # the after process, when it is not ``identity``
-    )
+    # The after process's identity when it is not ``identity`` (paired by name).
+    after_identity: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not (isinstance(self.before, Detected) or isinstance(self.after, Detected)):
