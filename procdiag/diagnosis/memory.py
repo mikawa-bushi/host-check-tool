@@ -441,10 +441,12 @@ class MemPressureRule(Rule):
     holds the pressure.  Fires WARNING when at least ``min_pressure_days`` days
     are pressure days and they are at least ``min_recurrence_fraction`` of the
     observed days, where a pressure day counts as a day and any other day as
-    much as it was observed of its 24 hours, so a few quiet hours at an edge of
-    the recording do not outweigh the days that show the pattern.  A recording with fewer than ``min_pressure_days`` observed
-    days is reported as not evaluable (``recording_shortfall_hours``), never as
-    healthy.
+    much as it was observed of the longest day in the recording (24 hours at
+    most), so a few quiet hours at an edge of the recording do not outweigh the
+    days that show the pattern, and a PC that runs only part of each day is not
+    read as quiet on the hours it was off.  A recording with fewer than
+    ``min_pressure_days`` observed days is reported as not evaluable
+    (``recording_shortfall_hours``), never as healthy.
 
     PSI columns absent from the DB (all None) → silent (no finding).
     """
@@ -462,7 +464,8 @@ class MemPressureRule(Rule):
         "そのローカル日のうちまだ圧迫日でない最も早い日 (長く続いてその日の分だけで"
         "スワップのある日も) に数え、数えた swap_out_sum が一定量以上になった日を圧迫日とし、"
         "圧迫日が観測が十分なローカル日 (観測が短くても圧迫日を含み、圧迫のない日は"
-        "観測できた長さの割合で数える) の過半数で反復するかを判定する"
+        "記録で最も長く観測できた日に対する観測できた長さの割合で数える) の過半数で"
+        "反復するかを判定する"
     )
     why = (
         "断続的なメモリ圧力はスパイクとして見えず、PSI の反復パターンで初めて"
@@ -618,10 +621,12 @@ class MemPressureRule(Rule):
         if n_days < self.min_pressure_days or n_pressure_days < self.min_pressure_days:
             return []
         # A pressure day is a whole day.  A day without pressure counts as much
-        # as it was observed, so a few hours at an edge of the recording do not
-        # outvote the days that show the pattern.
+        # as it was observed of the longest day in the recording, so a few hours
+        # at an edge do not outvote the days that show the pattern, and a PC that
+        # runs 8 hours a day has whole days of 8 hours.
+        full_day = float(min(_DAY_MINUTES, max(observed.values())))
         weights = {
-            day: 1.0 if hit else min(1.0, observed[day] / _DAY_MINUTES)
+            day: 1.0 if hit else min(1.0, observed[day] / full_day)
             for day, hit in events_by_day.items()
         }
         recurrence = detect_recurrence(events_by_day, weights)
@@ -640,6 +645,8 @@ class MemPressureRule(Rule):
             "recurrence_fraction": round(recurrence, 2),
             "n_pressure_days": n_pressure_days,
             "n_total_days": n_days,
+            "observed_day_equivalents": round(sum(weights.values()), 2),
+            "full_day_hours": round(full_day / 60.0, 2),
             "pressure_days": pressure_days,
             "swap_out_total_bytes": pressure.swap_out,
             "pressure_event_count": pressure.minutes,
@@ -668,7 +675,7 @@ class MemPressureRule(Rule):
         summary = (
             f"慢性メモリ圧迫: psi_mem_max > {self.psi_threshold} が"
             f" {self.min_pressure_minutes}分以上途切れず続きスワップアウトを伴った圧迫のあった日が"
-            f" {n_pressure_days}/{n_days} 日"
+            f" {n_pressure_days}/{evidence['observed_day_equivalents']:g} 日"
             f" (圧迫中のスワップアウト {humanize_bytes(pressure.swap_out)})"
         )
 
