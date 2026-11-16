@@ -470,7 +470,21 @@ def test_commands_that_never_open_the_db_do_not_warn_about_it(
 
     result = CliRunner().invoke(cli, [*command, "--config", str(config)])
 
-    assert "警告" not in result.output, result.output
+    assert "以前の版" not in result.output, result.output
+
+
+def test_compare_of_two_given_dbs_does_not_warn_about_the_configs_db(
+    tmp_path, monkeypatch
+):
+    config, old = _old_place(tmp_path, monkeypatch)
+    other = tmp_path / "other.db"
+    other.write_bytes(old.read_bytes())
+
+    result = CliRunner().invoke(
+        cli, ["compare", str(old), str(other), "--config", str(config)]
+    )
+
+    assert "以前の版" not in result.output, result.output
 
 
 def test_doctor_still_checks_the_folder_of_a_db_found_at_the_old_place(
@@ -557,7 +571,7 @@ def test_the_db_option_drops_the_old_place_warning(tmp_path, monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
-    assert "警告" not in result.output
+    assert "以前の版" not in result.output
 
 
 def test_a_config_reached_through_a_link_keeps_the_link_in_db_path(tmp_path):

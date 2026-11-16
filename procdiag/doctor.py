@@ -210,14 +210,14 @@ def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
     )
     if not os.access(folder, os.W_OK | os.X_OK):
         return "degraded", f"{folder} に書き込めません — {fix}"
-    if db_path.exists() and not os.access(db_path, os.R_OK | os.W_OK):
+    if os.path.exists(db_path) and not os.access(db_path, os.R_OK | os.W_OK):
         return "degraded", f"{db_path} に書き込めません — {fix}"
 
     free = shutil.disk_usage(folder).free
     min_free_mb = config.retention.min_free_disk_mb
 
     db_size_str = ""
-    if db_path.exists():
+    if os.path.exists(db_path):
         db_size_str = f"  (既存 DB サイズ: {db_path.stat().st_size / MiB:.1f} MB)"
 
     if free < min_free_mb * MiB:

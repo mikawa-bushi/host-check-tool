@@ -111,7 +111,7 @@ def _db_guard(*dbs: object) -> Iterator[None]:
         _fail(f"{shown}: {exc}")
     except sqlite3.DatabaseError as exc:
         for db in dbs:
-            if Path(str(db)).is_dir():
+            if os.path.isdir(db):
                 _fail(
                     f"DB を使えません: {db} (ディレクトリです。DB ファイルを指定してください)"
                 )
@@ -212,7 +212,10 @@ _quiet_option = click.option(
 
 
 def _load_config(
-    config_path: Optional[str], db_path: Optional[str] = None
+    config_path: Optional[str],
+    db_path: Optional[str] = None,
+    *,
+    uses_db: bool = True,
 ) -> ProcdiagConfig:
     """Load the config (``./config.py`` by default) with an optional DB override.
 
@@ -220,7 +223,8 @@ def _load_config(
     option is given as an empty string (an unset shell variable, say) instead
     of being silently taken for "not given".  Warns on stderr when the DB is
     the one an older procdiag kept in the current folder
-    (:meth:`~procdiag.config.ProcdiagConfig.db_path_notice`).
+    (:meth:`~procdiag.config.ProcdiagConfig.db_path_notice`), unless the command
+    never opens the config's DB (*uses_db* False).
     """
     from .config import load_config
 
@@ -233,8 +237,8 @@ def _load_config(
         click.echo(f"エラー: {exc}", err=True)
         sys.exit(_EXIT_USAGE)
     if db_path is not None:
-        cfg = cfg.model_copy(update={"db_path": os.path.expanduser(db_path)})
-    notice = cfg.db_path_notice()
+        cfg = cfg.with_db_path(db_path)
+    notice = cfg.db_path_notice() if uses_db else None
     if notice:
         click.echo(f"警告: {notice}", err=True)
     if cfg.rules.overrides or cfg.rules.disabled:
@@ -280,7 +284,7 @@ def _ensure_db_and_config(
     instead of overloading the diagnosis code 1.
     """
     cfg = _load_config(config_path, db_path)
-    if not Path(cfg.db_path).exists():
+    if not os.path.exists(cfg.db_path):
         click.echo(_DB_MISSING_MSG.format(db=cfg.db_path), err=True)
         sys.exit(_EXIT_USAGE)
     return cfg, cfg.db_path
@@ -431,6 +435,9 @@ def _diagnose(
             store, only=only, skip=skip, window=window
         )
         diag.quality.notes.extend(_period_notes(store, diag, chosen=chosen))
+        notice = cfg.db_path_notice() if db == cfg.db_path else None
+        if notice:
+            diag.quality.notes.insert(0, notice)
         if with_charts:
             shown = diag.window
             charts = build_charts(
@@ -654,7 +661,7 @@ def snapshot(
     from . import snapshot as snapshot_mod
     from .core.util import should_use_color
 
-    cfg = _load_config(config_path)
+    cfg = _load_config(config_path, uses_db=False)
     items = snapshot_mod.run_snapshot(cfg)
     hostname = _host_label(cfg)
     if fmt == "json":
@@ -702,7 +709,7 @@ def record(
         try:
             recorder = Recorder(cfg, duration=duration_sec)
         except (OSError, sqlite3.OperationalError) as exc:
-            if Path(cfg.db_path).is_dir():
+            if os.path.isdir(cfg.db_path):
                 raise
             # 1, not 4: a DB folder that is missing or read-only now (a disk
             # mounted late) can clear up, and the unit restarts on 1.
@@ -872,7 +879,7 @@ def quick(
             err=True,
         )
         sys.exit(_EXIT_USAGE)
-    cfg = _load_config(config_path)
+    cfg = _load_config(config_path, uses_db=False)
     out = Path(out_dir or time.strftime("procdiag-quick-%Y%m%d-%H%M%S"))
     try:
         occupied = out.exists() and (not out.is_dir() or any(out.iterdir()))
@@ -1038,7 +1045,7 @@ def compare(
     if dbs and db_path:
         click.echo("エラー: --db と DB の位置引数は同時に指定できません", err=True)
         sys.exit(_EXIT_USAGE)
-    cfg = _load_config(config_path, db_path)
+    cfg = _load_config(config_path, db_path, uses_db=not dbs)
     only_ids, skip_ids = _split_ids(only), _split_ids(skip)
     _validate_rules(cfg, only_ids, skip_ids)
     if output:

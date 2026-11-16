@@ -288,6 +288,15 @@ class ProcdiagConfig(_Model):
             raise ValueError("db_path が空です。DB ファイルのパスを指定してください")
         return os.path.expanduser(v)
 
+    def with_db_path(self, db_path: str) -> "ProcdiagConfig":
+        """A copy that records into *db_path*, ``~`` expanded.
+
+        The path is the user's own choice, so it has no old-place notice to give.
+        """
+        cfg = self.model_copy(update={"db_path": os.path.expanduser(db_path)})
+        cfg._db_fallback = None
+        return cfg
+
     def db_path_notice(self) -> Optional[str]:
         """Why ``db_path`` is not where the config file says, or ``None``.
 
@@ -451,14 +460,16 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
 
     Raises :class:`ValueError` with a Japanese message on any loading error.
     """
+    # os.path.exists, not Path.exists: before Python 3.12 the latter raises
+    # PermissionError for a path below a folder that cannot be entered.
     implicit = path is None
     if path is None:
         candidate = DEFAULT_CONFIG_PATH
-        if not candidate.exists():
+        if not os.path.exists(candidate):
             return ProcdiagConfig()
         path = candidate
 
-    if not Path(path).exists():
+    if not os.path.exists(path):
         raise ValueError(f"設定ファイルが見つかりません: {path}")
 
     if implicit:
@@ -485,6 +496,13 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
         # Bytes: Python then honours a BOM or a "coding:" line, as for any .py.
         source = Path(path).read_bytes()
         exec(compile(source, str(path), "exec"), namespace)  # noqa: S102
+    except SystemExit as e:
+        # Not an Exception: left alone it would end procdiag with the file's code.
+        said = f"\n{e.code}" if isinstance(e.code, str) else f" (終了コード {e.code})"
+        raise ValueError(
+            f"設定ファイルが sys.exit() でプログラムを終わらせようとしました: {path}"
+            f"{said}{hint}"
+        ) from e
     except Exception as e:
         raise ValueError(
             f"設定ファイルの読み込みに失敗しました: {path}\n{e}{hint}"
@@ -504,7 +522,7 @@ def load_config(path: Optional[Path] = None) -> ProcdiagConfig:
     if not Path(cfg.db_path).is_absolute():
         db = Path(os.path.abspath(path)).parent / cfg.db_path
         old = Path(os.path.abspath(cfg.db_path))
-        if not db.exists() and old.is_file():
+        if not os.path.exists(db) and os.path.isfile(old):
             cfg = cfg.model_copy(update={"db_path": str(old)})
             cfg._db_fallback = (str(old), str(db))
         else:

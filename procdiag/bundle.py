@@ -22,6 +22,7 @@ the copy then leaves out.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -106,7 +107,7 @@ def create_bundle(
             result.files.append(name)
 
         db_src = Path(config.db_path)
-        if db_src.exists():
+        if os.path.exists(db_src):
             db_copy = root / "procdiag.db"
             copy_db(db_src, db_copy, keep_cmdline=keep_cmdline)
             result.files.append("procdiag.db")
