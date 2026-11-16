@@ -184,6 +184,33 @@ class TestIoBottleneckEpisodes:
         assert "backup" not in names
         store.close()
 
+    def test_the_longest_episode_is_reported_when_a_shorter_one_follows_it(
+        self, tmp_path
+    ):
+        def procs(ts):
+            second = ts - _T0
+            if 600 <= second < 2400:
+                return [_proc(ts, 3, write=10 * _MiB)]
+            if 3000 <= second < 4200:
+                return [_proc(ts, 2, write=10 * _MiB)]
+            return []
+
+        store = _io_store(
+            tmp_path,
+            [4800],
+            lambda s, i: 600 <= i < 2400 or 3000 <= i < 4200,
+            procs=procs,
+        )
+
+        (f,) = _run(store, "IO-BOTTLENECK-01")
+
+        assert f.evidence["duration_minutes"] == pytest.approx(30.0, abs=1.0)
+        assert _T0 + 540 <= f.evidence["episode_start"] <= _T0 + 660
+        names = [p["name"] for p in f.evidence["top_writers"]]
+        assert names[0] == "plc-logger"
+        assert "backup" not in names
+        store.close()
+
 
 class TestIoBottleneckCulprit:
     @staticmethod

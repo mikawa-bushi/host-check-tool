@@ -445,12 +445,30 @@ class TestServiceSampler:
             "b.service": [(1700000200.0, "core-dump")],
         }
 
+    def test_a_structured_failure_line_needs_no_english_message(self, monkeypatch):
+        from procdiag import systemd
+
+        entry = {
+            "__REALTIME_TIMESTAMP": str(1700000100 * 10**6),
+            "UNIT": "a.service",
+            "MESSAGE": "a.service: 失敗しました。",
+            "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c",
+            "UNIT_RESULT": "timeout",
+        }
+        monkeypatch.setattr(systemd, "run", lambda args: json.dumps(entry))
+
+        assert systemd.unit_failures(["a.service"], 1700000000.0) == {
+            "a.service": [(1700000100.0, "timeout")]
+        }
+
     @pytest.mark.parametrize(
         ("value", "seconds"),
         [
             ("0", 0.0),
             ("100ms", 0.1),
             ("1min 30s", 90.0),
+            ("1month 2w", 2629800.0 + 2 * 604800.0),
+            ("1y 1month", 31557600.0 + 2629800.0),
             ("infinity", None),
             ("x", None),
         ],
@@ -687,6 +705,154 @@ class TestServiceRestartFromPolls:
         f = _diagnose(store)["db.service"]
 
         assert f.evidence["failed_count"] == 3
+
+
+class TestServiceRestartMatchingPolicy:
+    """Which failure lines a poll's restarts are matched with (the sampler)."""
+
+    unit = "collector.service"
+
+    def _events(self, tmp_path, monkeypatch, restarts, journal, **props):
+        """The ``(kind, n_restarts, result)`` rows recorded over polls with
+        NRestarts *restarts*; *journal* is ``(seconds into the recording, result)``."""
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        _record_session(
+            store,
+            monkeypatch,
+            [{self.unit: _unit(n, restart="always", **props)} for n in restarts],
+            start=start,
+            journal=(
+                None
+                if journal is None
+                else [_failure_line(start + t, self.unit, r) for t, r in journal]
+            ),
+        )
+        store.flush()
+        rows = [
+            (r["kind"], r["n_restarts"], r["result"])
+            for r in store.rows("service_events")
+        ]
+        store.close()
+        return rows
+
+    def test_a_failure_line_is_matched_with_one_restart_only(
+        self, tmp_path, monkeypatch
+    ):
+        rows = self._events(
+            tmp_path,
+            monkeypatch,
+            [0, 1, 2],
+            [(_POLL - 400, "signal"), (2 * _POLL - 100, "core-dump")],
+            RestartUSec="10min",
+        )
+
+        assert rows == [("restart", 1, "signal"), ("restart", 1, "core-dump")]
+
+    def test_a_poll_takes_the_oldest_lines_for_its_restarts(
+        self, tmp_path, monkeypatch
+    ):
+        rows = self._events(
+            tmp_path,
+            monkeypatch,
+            [0, 1, 2],
+            [(_POLL - 200, "signal"), (_POLL - 100, "core-dump")],
+            RestartUSec="10min",
+        )
+
+        assert rows == [("restart", 1, "signal"), ("restart", 1, "core-dump")]
+
+    def test_a_poll_counts_no_more_failures_than_systemd_restarted(
+        self, tmp_path, monkeypatch
+    ):
+        rows = self._events(
+            tmp_path,
+            monkeypatch,
+            [0, 1],
+            [(_POLL - 200, "signal"), (_POLL - 100, "signal"), (_POLL - 50, "signal")],
+        )
+
+        assert rows == [("restart", 1, "signal")]
+
+    def test_the_exit_reason_is_that_of_the_matched_line(self, tmp_path, monkeypatch):
+        rows = self._events(
+            tmp_path,
+            monkeypatch,
+            [0, 1],
+            [(_POLL - 100, "oom-kill")],
+            Result="success",
+        )
+
+        assert rows == [("restart", 1, "oom-kill")]
+
+    @pytest.mark.parametrize(
+        ("seconds_before_the_previous_poll", "kind"),
+        [(5, "restart"), (20, "restart_clean")],
+    )
+    def test_a_failure_logged_just_before_the_previous_poll_still_counts(
+        self, tmp_path, monkeypatch, seconds_before_the_previous_poll, kind
+    ):
+        rows = self._events(
+            tmp_path,
+            monkeypatch,
+            [0, 0, 1],
+            [(_POLL - seconds_before_the_previous_poll, "signal")],
+            RestartUSec="0",
+        )
+
+        assert [r[0] for r in rows] == [kind]
+
+    def test_a_failure_logged_after_the_poll_is_not_its_cause(self, monkeypatch):
+        from test_sampler_cgroup_process import _make_ctx
+
+        from procdiag import systemd
+        from procdiag.samplers import service as svc_mod
+
+        poll = time.time()
+        monkeypatch.setattr(svc_mod.systemd, "available", lambda: True)
+        monkeypatch.setattr(svc_mod.kernlog, "journal_readable", lambda: True)
+        monkeypatch.setattr(svc_mod.systemd, "list_service_units", lambda: [self.unit])
+        polls = iter([_unit(0, restart="always"), _unit(1, restart="always")])
+        monkeypatch.setattr(
+            svc_mod.systemd, "show_units", lambda units: {self.unit: next(polls)}
+        )
+        monkeypatch.setattr(
+            systemd,
+            "unit_failures",
+            lambda units, since: {self.unit: [(poll + 60, "signal")]},
+        )
+        sampler = svc_mod.ServiceSampler()
+        ctx = _make_ctx()
+        sampler.setup(ctx)
+        monkeypatch.setattr(svc_mod.time, "time", lambda: poll)
+        sampler.collect(ctx)
+        (batch,) = sampler.collect(ctx)
+
+        assert [(r[2], r[3]) for r in batch.rows] == [("restart_clean", 1)]
+
+    def test_restarts_after_a_clean_exit_policy_carry_no_result(
+        self, tmp_path, monkeypatch
+    ):
+        start = time.time() - 3 * _HOUR
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3, start_ts=start)
+        _record_session(
+            store,
+            monkeypatch,
+            [
+                {self.unit: _unit(k, restart="on-success", Result="exit-code")}
+                for k in range(5)
+            ],
+            start=start,
+            journal=None,
+        )
+
+        f = _diagnose(store)[self.unit]
+
+        assert f.evidence["restarts_clean"] == 4
+        assert f.evidence["results"] == []
+        assert "原因" not in f.summary
 
 
 # ---------------------------------------------------------------------------

@@ -1086,6 +1086,260 @@ class TestMemPressureOccurrences:
         store.close()
 
 
+class TestMemPressureEdgeDaysAreWeighedByTheirObservation:
+    @staticmethod
+    def _daily_1400(tmp_path, start_hour, hours):
+        tmp_path.mkdir(exist_ok=True)
+        store = make_db(tmp_path)
+        minutes = int(hours * 60)
+        pressure = _windows(
+            int(start_hour * 60), minutes, [(d, 14 * 60, 30) for d in range(5)]
+        )
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_hour * 3600,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+        return store
+
+    @pytest.mark.parametrize(
+        ("start_hour", "hours", "fraction"),
+        [(15, 66, 0.73), (17, 64, 0.75), (16, 68, 0.71), (14.5, 65, 0.74)],
+    )
+    def test_quiet_edge_days_do_not_outvote_a_daily_pattern(
+        self, tmp_path, local_tz, start_hour, hours, fraction
+    ):
+        local_tz("JST-9")
+        store = self._daily_1400(tmp_path, start_hour, hours)
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 4)
+        assert f.evidence["recurrence_fraction"] == pytest.approx(fraction, abs=0.006)
+        store.close()
+
+    def test_the_same_days_without_the_edge_days_say_the_same(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = self._daily_1400(tmp_path, 0, 48)
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 2)
+        assert f.evidence["recurrence_fraction"] == 1.0
+        store.close()
+
+    @pytest.mark.parametrize(("edge_hours", "fires"), [(6, True), (9, False)])
+    def test_a_quiet_edge_day_counts_as_much_as_it_was_observed(
+        self, tmp_path, local_tz, edge_hours, fires
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        start_hour = 24 - edge_hours
+        minutes = (edge_hours + 24 * 3) * 60
+        pressure = _windows(
+            start_hour * 60, minutes, [(1, 14 * 60, 30), (2, 14 * 60, 30)]
+        )
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start_hour * 3600,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        found = _run(store, "MEM-PRESSURE-01")
+
+        assert bool(found) is fires
+        store.close()
+
+    def test_pressure_on_two_of_five_whole_days_is_still_not_most_of_them(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        minutes = 5 * 24 * 60
+        pressure = _windows(0, minutes, [(1, 14 * 60, 30), (3, 14 * 60, 30)])
+        _pressure_recording(
+            store,
+            _local_midnight_jst(),
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    def test_a_day_of_twenty_five_hours_counts_as_one_day_not_more(
+        self, tmp_path, local_tz
+    ):
+        local_tz("America/New_York")
+        store = make_db(tmp_path)
+        midnight = time.mktime(datetime(2026, 10, 31).timetuple())
+        minutes = (24 + 25 + 24) * 60
+        pressure = {
+            d * 1440 + (60 if d == 2 else 0) + 14 * 60 + k: 9.0
+            for d in (0, 2)
+            for k in range(30)
+        }
+        _pressure_recording(
+            store,
+            midnight,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (2, 3)
+        assert f.evidence["recurrence_fraction"] == 0.67
+        store.close()
+
+
+class TestMemPressureSmallSwapOutOfSeveralRuns:
+    @staticmethod
+    def _runs_a_day(tmp_path, hours, run_hours, swap):
+        """Twenty-minute runs at *run_hours* every day, *swap* bytes in each."""
+        tmp_path.mkdir(exist_ok=True)
+        store = make_db(tmp_path)
+        minutes = hours * 60
+        pressure = {
+            d * 1440 + h * 60 + k: 9.0
+            for d in range(hours // 24 + 1)
+            for h in run_hours
+            for k in range(20)
+            if d * 1440 + h * 60 + k < minutes
+        }
+        swap_out = {
+            d * 1440 + h * 60 + 5: swap
+            for d in range(hours // 24 + 1)
+            for h in run_hours
+            if d * 1440 + h * 60 + 5 < minutes
+        }
+        _pressure_recording(
+            store, _local_midnight_jst(), minutes, pressure=pressure, swap_out=swap_out
+        )
+        return store
+
+    def test_two_runs_a_day_with_half_a_mebibyte_each_make_the_day(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = self._runs_a_day(tmp_path, 72, (6, 18), _MiB // 2)
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert (f.evidence["n_pressure_days"], f.evidence["n_total_days"]) == (3, 3)
+        assert f.evidence["pressure_event_count"] == 6 * 20
+        assert f.evidence["swap_out_total_bytes"] == 6 * (_MiB // 2)
+        store.close()
+
+    def test_the_report_numbers_follow_the_credited_runs(self, tmp_path, local_tz):
+        local_tz("JST-9")
+        store = self._runs_a_day(tmp_path, 72, (6, 18), _MiB // 2)
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        basis = next(
+            line for line in f.proposal.splitlines() if line.startswith("[根拠]")
+        )
+        assert "圧迫日 3 / 観測日 3、反復率 1.0" in basis
+        assert "超過分数は合計 120 分" in basis
+        assert f"swap_out 合計 {6 * (_MiB // 2)} バイト" in basis
+        store.close()
+
+    def test_a_run_without_swap_out_is_not_counted_with_the_ones_that_made_the_day(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        tmp_path.mkdir(exist_ok=True)
+        store = make_db(tmp_path)
+        minutes = 72 * 60
+        pressure = {
+            d * 1440 + h * 60 + k: 9.0
+            for d in range(3)
+            for h in (6, 14, 22)
+            for k in range(20)
+        }
+        swap_out = {
+            d * 1440 + h * 60 + 5: int(0.6 * _MiB) for d in range(3) for h in (14, 22)
+        }
+        _pressure_recording(
+            store, _local_midnight_jst(), minutes, pressure=pressure, swap_out=swap_out
+        )
+
+        (f,) = _run(store, "MEM-PRESSURE-01")
+
+        assert f.evidence["pressure_event_count"] == 3 * 2 * 20
+        store.close()
+
+    def test_three_runs_a_day_with_less_than_a_mebibyte_in_all_do_not(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = self._runs_a_day(tmp_path, 72, (6, 14, 22), int(0.3 * _MiB))
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    def test_two_runs_a_day_with_less_than_a_mebibyte_in_all_do_not(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = self._runs_a_day(tmp_path, 72, (6, 18), int(0.4 * _MiB))
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+    def test_weak_runs_of_one_night_across_midnight_are_still_one_day(
+        self, tmp_path, local_tz
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        start = 20 * 60
+        minutes = 30 * 60
+        pressure = _windows(start, minutes, [(0, 23 * 60 + 45, 30)])
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start * 60,
+            minutes,
+            pressure=pressure,
+            swap_out={m: _MiB // 4 for m in pressure},
+        )
+
+        assert _run(store, "MEM-PRESSURE-01") == []
+        store.close()
+
+
+class TestMemPressureLongDayBoundary:
+    @pytest.mark.parametrize(("end_minute", "days"), [(6 * 60, 2), (6 * 60 - 1, 1)])
+    def test_a_day_needs_six_hours_of_an_unbroken_run_to_be_its_own_pressure_day(
+        self, tmp_path, local_tz, end_minute, days
+    ):
+        local_tz("JST-9")
+        store = make_db(tmp_path)
+        start = 12 * 60
+        minutes = 24 * 60
+        pressure = _windows(start, minutes, [(0, 18 * 60, 6 * 60 + end_minute)])
+        _pressure_recording(
+            store,
+            _local_midnight_jst() + start * 60,
+            minutes,
+            pressure=pressure,
+            swap_out={m: 2 * _MiB for m in pressure},
+        )
+
+        found = _run(store, "MEM-PRESSURE-01")
+
+        assert bool(found) is (days == 2)
+        if found:
+            assert found[0].evidence["n_pressure_days"] == 2
+        store.close()
+
+
 class TestMemPressureNeedsObservedDays:
     def _all_day_pressure(self, tmp_path, start, hours, quiet_hours=0):
         tmp_path.mkdir(exist_ok=True)

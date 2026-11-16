@@ -24,7 +24,7 @@ from test_compare import _leak, _leak_cmp
 from procdiag import storage
 from procdiag.cli import cli
 from procdiag.compare import Clear, Detected, Verdict
-from procdiag.config import ProcdiagConfig
+from procdiag.config import ProcdiagConfig, RulesConfig
 from procdiag.core import Confidence, Finding, Measurement, Observation, Severity
 from procdiag.diagnosis import Engine
 from procdiag.diagnosis.memory import select_pss_targets
@@ -302,6 +302,34 @@ class TestLeakingProgramRestarted:
             assert f.evidence["pids"] == [5000, 5001]
         store.close()
 
+    @pytest.mark.parametrize(
+        ("overlap_min", "reported"), [(0, True), (2, True), (6, True), (7, False)]
+    )
+    def test_the_new_process_may_start_minutes_before_the_old_one_stops(
+        self, tmp_path, overlap_min, reported
+    ):
+        def processes(h):
+            alive = []
+            if h < 4 + overlap_min / 60:
+                alive.append((0, 5000, 100 * _MiB + 5 * _MiB * h, 40 + int(2 * h), 10))
+            if h >= 4:
+                age = h - 4
+                alive.append(
+                    (0, 5001, 100 * _MiB + 5 * _MiB * age, 40 + int(2 * age), 10)
+                )
+            return alive
+
+        store, _ = _recording(
+            tmp_path, 8, [("collector", "/opt/plc/collector")], processes
+        )
+
+        found = _findings(store, ["MEM-LEAK-01"])
+
+        assert bool(found) is reported
+        if reported:
+            assert found[0].evidence["pids"] == [5000, 5001]
+        store.close()
+
     def test_a_flat_program_restarted_at_another_level_is_not_a_leak(self, tmp_path):
         def processes(h):
             return [
@@ -543,9 +571,13 @@ class TestOomVictim:
         crisis=True,
         kernel_pid=1000,
         peak_rss=None,
+        oom_line_at=0,
         program=("plc-gateway", "/opt/plc/gateway --port 502"),
     ):
-        """One hour at 10 s: the *program* (PID 1000, 3 GiB) is killed at 30 min."""
+        """One hour at 10 s: the *program* (PID 1000, 3 GiB) is killed at 30 min.
+
+        The kernel logs the kill *oom_line_at* seconds after its last sample.
+        """
         t0 = time.time() // 60 * 60 - 2 * _HOUR
         kill = t0 + 1800
         store = make_db(tmp_path, hours=1)
@@ -567,7 +599,8 @@ class TestOomVictim:
         store.buffer("sys_samples", sys_rows)
         store.buffer("proc_samples", procs)
         store.buffer(
-            "kernel_events", [(kill, "oom", _oom_line(kernel_pid, program[0]))]
+            "kernel_events",
+            [(kill + oom_line_at, "oom", _oom_line(kernel_pid, program[0]))],
         )
         store.flush(reason="synth")
         return store
@@ -585,6 +618,20 @@ class TestOomVictim:
         assert "Killed process 1000 (plc-gateway)" in f.evidence["kernel_line"]
         assert f.confidence is Confidence.HIGH
         assert "PID 1000" in f.summary
+        store.close()
+
+    @pytest.mark.parametrize(
+        ("oom_line_at", "matched"),
+        [(-180, True), (-181, False), (60, True), (61, False)],
+    )
+    def test_the_kernel_line_names_the_victim_only_around_its_last_sample(
+        self, tmp_path, oom_line_at, matched
+    ):
+        store = self._oom(tmp_path, respawn=True, oom_line_at=oom_line_at)
+
+        found = self._run(store)
+
+        assert bool(found) is matched
         store.close()
 
     def test_the_kernel_line_reports_a_kill_without_a_host_wide_crisis(self, tmp_path):
@@ -826,14 +873,19 @@ class TestOomWithoutKernelLineJudgesTheProgramsSpan:
         (f,) = _oom_findings(store)
 
         assert "PID 3101" in f.summary
-        assert "生存 2.5分, プログラムとして 302.5分 動作," in f.summary
+        assert "生存 2.5分, 同じプログラムの最初のプロセスから 302.5分," in f.summary
         detected, basis = [
             line
             for line in f.proposal.splitlines()
             if line.startswith(("[検出]", "[根拠]"))
         ]
-        assert "生存期間 2.5 分、プログラムとしては 302.5 分)" in detected
-        assert "生存期間は 2.5分 だが、同じプログラムが 302.5分 >= 10分" in basis
+        assert (
+            "生存期間 2.5 分、同じプログラムの最初のプロセスから 302.5 分)" in detected
+        )
+        assert (
+            "生存期間は 2.5分 だが、同じプログラムは最初のプロセスから 302.5分 >= 10分"
+            in basis
+        )
         store.close()
 
     def test_the_program_span_is_not_mentioned_when_the_process_lived_long(
@@ -845,9 +897,49 @@ class TestOomWithoutKernelLineJudgesTheProgramsSpan:
 
         assert f.evidence["lifetime_minutes"] == 14.5
         assert "program_lifetime_minutes" not in f.evidence
-        assert "プログラムとして" not in f.summary
-        assert "プログラムとしては" not in f.proposal
+        assert "同じプログラムの最初のプロセスから" not in f.summary
+        assert "同じプログラムの最初のプロセスから" not in f.proposal
         assert "生存期間 14.5分 >= 10分 の長命プロセス" in f.proposal
+        store.close()
+
+    def test_a_program_recorded_for_exactly_ten_minutes_is_suspected(self, tmp_path):
+        store = self._recorded(tmp_path, [(3100, 700, 721)])
+
+        (f,) = _oom_findings(store)
+
+        assert f.evidence["lifetime_minutes"] == 10.0
+        store.close()
+
+    def test_a_program_recorded_for_just_under_ten_minutes_is_not(self, tmp_path):
+        store = self._recorded(tmp_path, [(3100, 700, 720)])
+
+        assert _oom_findings(store) == []
+        store.close()
+
+    def test_the_ten_minutes_follow_the_setting_in_the_report(self, tmp_path):
+        store = self._recorded(tmp_path, [(3100, 0, 600), (3101, 600, 606)])
+        config = ProcdiagConfig(
+            rules=RulesConfig(overrides={"OOM-KILL-01": {"min_lifetime_s": 120}})
+        )
+
+        diag = Engine(config).run(store, only=["OOM-KILL-01"])
+
+        (f,) = diag.findings
+        assert f.evidence["min_lifetime_minutes"] == 2.0
+        assert "生存期間 2.5分 >= 2分 の長命プロセス" in f.proposal
+        assert ">= 10分" not in f.proposal
+        store.close()
+
+    def test_the_ten_minutes_of_the_program_span_follow_the_setting_too(self, tmp_path):
+        store = self._recorded(tmp_path, [(3100, 0, 600), (3101, 600, 606)])
+        config = ProcdiagConfig(
+            rules=RulesConfig(overrides={"OOM-KILL-01": {"min_lifetime_s": 300}})
+        )
+
+        diag = Engine(config).run(store, only=["OOM-KILL-01"])
+
+        (f,) = diag.findings
+        assert "最初のプロセスから 302.5分 >= 5分 記録されていた" in f.proposal
         store.close()
 
     @pytest.mark.parametrize(
@@ -1044,6 +1136,52 @@ class TestDatabaseFromBeforePids:
         assert f.evidence["pid"] == 777
         assert f.evidence["n"] == 8 * 60
         assert f.evidence["slope_mb_per_h"] == pytest.approx(5.0, rel=0.01)
+
+
+class TestClockStepBackAcrossThePidBump:
+    @pytest.mark.parametrize(
+        ("legacy", "with_pids"),
+        [(range(0, 240), range(120, 360)), (range(120, 360), range(0, 240))],
+        ids=["rows-after-the-step-start-later", "rows-after-the-step-start-first"],
+    )
+    def test_rows_without_a_pid_and_the_rows_after_them_are_one_leak_whatever_the_clock_says(
+        self, tmp_path, legacy, with_pids
+    ):
+        start = _start(8)
+        store = make_db(tmp_path, hours=8)
+        add_sys_baseline(store, hours=8, start_ts=start)
+        proc_id = _register(store, "svc", "/opt/plc/svc", start)
+
+        def rollup(table, m, level, **pid):
+            rss = int(level * _MiB + 5 * _MiB * m / 60)
+            return make_row(
+                table,
+                ts_min=start + m * 60,
+                proc_id=proc_id,
+                cpu_avg=1.0,
+                cpu_max=1.0,
+                rss_avg=rss,
+                rss_max=rss,
+                fds_max=40,
+                threads_max=10,
+                **pid,
+            )
+
+        store.buffer(
+            "proc_rollup_1m", [rollup("proc_rollup_1m", m, 100) for m in legacy]
+        )
+        store.buffer(
+            "proc_pid_rollup_1m",
+            [rollup("proc_pid_rollup_1m", m, 90, pid=777) for m in with_pids],
+        )
+        store.flush(reason="synth")
+
+        (f,) = _findings(store, ["MEM-LEAK-01"])
+
+        assert f.evidence["pids"] == [777]
+        assert f.evidence["n"] == 240 + 240
+        assert f.evidence["slope_mb_per_h"] == pytest.approx(5.0, rel=0.01)
+        store.close()
 
 
 class TestPerProcessRollupsAreKeptInBounds:

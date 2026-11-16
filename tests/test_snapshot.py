@@ -340,3 +340,52 @@ class TestHintsQuoteTheMountPoint:
         inodes = re.findall(r"`([^`]*)`", items[f"inode:{mount}"].hint)
         (du,) = [c for c in inodes if "du --inodes" in c]
         assert shlex.split(du.split("|")[0])[-1] == str(mount)
+
+
+class TestOneFilesystemUnderSeveralMountPoints:
+    def test_a_bind_mount_is_listed_once_but_keeps_its_own_read_only_flag(
+        self, monkeypatch, tmp_path
+    ):
+        data = tmp_path / "data"
+        view = tmp_path / "view"
+        data.mkdir()
+        view.mkdir()
+        parts = [
+            _Part("/dev/sdb1", str(data), "ext4", "rw,relatime"),
+            _Part("/dev/sdb1", str(view), "ext4", "ro,relatime"),
+        ]
+        monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
+        monkeypatch.setattr(
+            snap.psutil, "disk_usage", lambda mp: _Usage(100, 96, 4, 96.0)
+        )
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (1000, 960))
+
+        st = _statuses(snap._check_disks(ProcdiagConfig()))
+
+        assert st == {
+            f"disk:{data}": "critical",
+            f"inode:{data}": "critical",
+            f"ro:{view}": "info",
+        }
+
+    def test_two_devices_of_the_same_size_are_two_disks(self, monkeypatch, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        parts = [
+            _Part("/dev/sdb1", str(a), "ext4", "rw"),
+            _Part("/dev/sdc1", str(b), "ext4", "rw"),
+        ]
+        monkeypatch.setattr(snap.psutil, "disk_partitions", lambda all=False: parts)
+        monkeypatch.setattr(
+            snap.psutil, "disk_usage", lambda mp: _Usage(100, 50, 50, 50.0)
+        )
+        import procdiag.samplers.disk as disk_mod
+
+        monkeypatch.setattr(disk_mod, "_inode_usage", lambda mp: (1000, 100))
+
+        st = _statuses(snap._check_disks(ProcdiagConfig()))
+
+        assert set(st) == {f"disk:{a}", f"inode:{a}", f"disk:{b}", f"inode:{b}"}

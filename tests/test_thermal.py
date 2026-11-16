@@ -101,6 +101,181 @@ class TestThermalTimeAlignment:
         assert _diagnose(tmp_path, cooldown_after_each_job) == []
 
 
+_HOT = (92.0, 2000.0)
+_COOL = (55.0, _MAX_MHZ)
+
+
+def _spell(start, count, step, sample=_HOT):
+    return [(start + i * step, *sample, _MAX_MHZ) for i in range(count)]
+
+
+def _diagnose_rows(tmp_path, rows):
+    """Run THERMAL-01 over *rows* (``(ts, °C, MHz, max MHz)``) in a 24 h recording."""
+    tmp_path.mkdir(exist_ok=True)
+    store = make_db(tmp_path, hours=24)
+    add_sys_baseline(store, hours=24)
+    store.buffer("thermal_samples", sorted(rows))
+    store.flush()
+    diag = Engine(ProcdiagConfig()).run(store, only=["THERMAL-01"])
+    store.close()
+    assert diag.evaluated_rules == ["THERMAL-01"]
+    return diag.findings
+
+
+def _t0():
+    return time.time() - 24 * 3600 + 120
+
+
+class TestThermalRunLength:
+    def test_the_total_follows_the_spacing_of_the_samples_in_each_session(
+        self, tmp_path
+    ):
+        t0 = _t0()
+        rows = _spell(t0, 12, 300.0) + _spell(t0 + 3600, 6 * 360, 10.0, _COOL)
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["duration_minutes"] == pytest.approx(60.0, abs=0.1)
+
+    def test_a_short_spell_after_a_slow_session_is_not_stretched(self, tmp_path):
+        t0 = _t0()
+        rows = _spell(t0, 72, 300.0, _COOL) + _spell(t0 + 6 * 3600, 600, 1.0)
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["duration_minutes"] == pytest.approx(10.0, abs=0.1)
+
+    def test_a_recorder_stop_does_not_join_hot_samples_into_one_run(self, tmp_path):
+        t0 = _t0()
+        rows = (
+            _spell(t0 - 300, 30, 10.0, _COOL)
+            + _spell(t0, 2, 10.0)
+            + _spell(t0 + 7200, 1, 10.0)
+            + _spell(t0 + 7210, 30, 10.0, _COOL)
+        )
+
+        assert _diagnose_rows(tmp_path, rows) == []
+
+    def test_hot_spells_either_side_of_a_stop_are_each_judged_on_their_own(
+        self, tmp_path
+    ):
+        t0 = _t0()
+        rows = (
+            _spell(t0, 12, 10.0)
+            + _spell(t0 + 7200, 12, 10.0)
+            + _spell(t0 + 120, 12, 10.0, _COOL)
+            + _spell(t0 + 7320, 12, 10.0, _COOL)
+        )
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["sample_count"] == 24
+        assert f.evidence["duration_minutes"] == pytest.approx(4.0, abs=0.1)
+
+    def test_three_seconds_of_hot_samples_a_second_apart_are_not_sustained(
+        self, tmp_path
+    ):
+        t0 = _t0()
+        rows = _spell(t0, 3, 1.0) + _spell(t0 + 3, 600, 1.0, _COOL)
+
+        assert _diagnose_rows(tmp_path, rows) == []
+
+    def test_half_a_minute_of_hot_samples_a_second_apart_is_sustained(self, tmp_path):
+        t0 = _t0()
+        rows = _spell(t0, 30, 1.0) + _spell(t0 + 30, 600, 1.0, _COOL)
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["duration_minutes"] == pytest.approx(0.5, abs=0.01)
+
+    def test_ten_minutes_of_hot_samples_five_minutes_apart_are_sustained(
+        self, tmp_path
+    ):
+        t0 = _t0()
+        rows = _spell(t0, 2, 300.0) + _spell(t0 + 600, 100, 300.0, _COOL)
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["duration_minutes"] == pytest.approx(10.0, abs=0.1)
+
+    def test_one_hot_sample_five_minutes_from_the_next_is_not_sustained(self, tmp_path):
+        t0 = _t0()
+        rows = _spell(t0, 1, 300.0) + _spell(t0 + 300, 100, 300.0, _COOL)
+
+        assert _diagnose_rows(tmp_path, rows) == []
+
+    def test_three_samples_at_the_default_interval_are_sustained_two_are_not(
+        self, tmp_path
+    ):
+        t0 = _t0()
+
+        two = _spell(t0, 2, 10.0) + _spell(t0 + 20, 600, 10.0, _COOL)
+        three = _spell(t0, 3, 10.0) + _spell(t0 + 30, 600, 10.0, _COOL)
+
+        assert _diagnose_rows(tmp_path / "two", two) == []
+        (f,) = _diagnose_rows(tmp_path / "three", three)
+        assert f.evidence["sample_count"] == 3
+
+    def test_a_hot_spell_at_the_very_end_of_the_recording_counts_its_last_sample(
+        self, tmp_path
+    ):
+        t0 = _t0()
+        rows = _spell(t0, 100, 10.0, _COOL) + _spell(t0 + 1000, 3, 10.0)
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.evidence["duration_minutes"] == pytest.approx(0.5, abs=0.01)
+
+    def test_the_finding_spans_the_first_to_the_last_hot_sample(self, tmp_path):
+        t0 = _t0()
+        rows = (
+            _spell(t0, 100, 10.0, _COOL)
+            + _spell(t0 + 1000, 30, 10.0)
+            + _spell(t0 + 1300, 100, 10.0, _COOL)
+        )
+
+        (f,) = _diagnose_rows(tmp_path, rows)
+
+        assert f.detected_at == pytest.approx((t0 + 1000, t0 + 1290))
+
+    def test_exactly_80_degrees_is_hot_and_just_under_is_not(self, tmp_path):
+        t0 = _t0()
+        cool = _spell(t0 + 100, 100, 10.0, _COOL)
+
+        (f,) = _diagnose_rows(
+            tmp_path / "hot", _spell(t0, 10, 10.0, (80.0, 2000.0)) + cool
+        )
+        assert f.evidence["peak_temp_c"] == 80.0
+        assert (
+            _diagnose_rows(
+                tmp_path / "cool", _spell(t0, 10, 10.0, (79.9, 2000.0)) + cool
+            )
+            == []
+        )
+
+    def test_exactly_85_percent_of_the_max_clock_is_not_throttled(self, tmp_path):
+        t0 = _t0()
+        cool = _spell(t0 + 100, 100, 10.0, _COOL)
+
+        assert (
+            _diagnose_rows(tmp_path / "at", _spell(t0, 10, 10.0, (92.0, 3400.0)) + cool)
+            == []
+        )
+        (f,) = _diagnose_rows(
+            tmp_path / "under", _spell(t0, 10, 10.0, (92.0, 3399.0)) + cool
+        )
+        assert f.evidence["median_freq_ratio"] == pytest.approx(0.85, abs=0.001)
+
+    def test_the_report_says_how_long_a_run_must_last(self, tmp_path):
+        t0 = _t0()
+        (f,) = _diagnose_rows(
+            tmp_path, _spell(t0, 30, 10.0) + _spell(t0 + 300, 100, 10.0, _COOL)
+        )
+
+        assert "25 秒以上 (2 回以上) 続いた期間" in f.proposal
+        assert "記録が途切れた前後は続いたと数えない" in f.proposal
+
+
 class TestThermalRule:
     def test_detects_throttling(self, tmp_path):
         db = tmp_path / "th.db"
@@ -192,8 +367,16 @@ class TestCpuTemperature:
                 51.0,
             ),
             ({"cpu_thermal": [_Sensor("", 55.0, None, None)], "nvme": _NVME}, 55.0),
+            (
+                {
+                    "coretemp": _IDLE_CPU,
+                    "acpitz": [_Sensor("", 90.0, None, None)],
+                    "soc_thermal": [_Sensor("", 95.0, None, None)],
+                },
+                48.0,
+            ),
         ],
-        ids=["intel", "amd", "arm"],
+        ids=["intel", "amd", "arm", "hotter-system-zone"],
     )
     def test_records_the_cpu_not_a_hotter_drive_or_gpu(
         self, monkeypatch, sensors, cpu_temp

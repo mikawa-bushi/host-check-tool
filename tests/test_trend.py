@@ -273,6 +273,20 @@ class TestDetectPeriodicity:
         assert period is not None
         assert (period.kind, period.anchor, period.count) == ("hourly", ":45", 5)
 
+    @pytest.mark.parametrize("tol_sec", [8 * _HOUR, 10 * _HOUR, 1e9, float("inf")])
+    def test_a_tolerance_wider_than_a_third_of_the_cycle_matches_nothing(self, tol_sec):
+        """+-8 h around a time of day covers the whole day, so every start fits."""
+        ts = _daily_timestamps(7, hour=14, minute=20)
+
+        assert detect_periodicity(ts, tol_sec=tol_sec, min_events=3) is None
+
+    def test_a_tolerance_of_a_second_or_less_is_one_second(self):
+        ts = [t + 20 for t in _daily_timestamps(7, hour=14, minute=0)]
+
+        for tol_sec in (0.0, 0.5, 1.0):
+            period = detect_periodicity(ts, tol_sec=tol_sec, min_events=3)
+            assert (period.kind, period.anchor, period.count) == ("daily", "14:00", 7)
+
     def test_irregular_returns_none(self):
         """Timestamps with no pattern should return None."""
         import random
