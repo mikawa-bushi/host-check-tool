@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, Optional
 from . import spikes
 from .config import ProcdiagConfig
 from .core.result import Capability
-from .core.sampler import RunContext, SampleBatch, Sampler
+from .core.sampler import Note, RunContext, SampleBatch, Sampler
 from .core.util import MiB
 from .scheduler import TierScheduler
 from .storage import TABLE_COLUMNS, Storage
@@ -152,8 +152,9 @@ class Recorder:
         self._session_id: Optional[int] = None
         self._flush_interval = 60.0
         self._retention_interval = 3600.0
-        # Keys of the notes this session has already kept.
+        # Keys of the notes and capabilities this session has already kept.
         self._noted: set[str] = set()
+        self._unobserved_kept: set[Capability] = set()
         self._ran = False
         self._dir_walk: Optional[_DirWalk] = None
 
@@ -268,16 +269,23 @@ class Recorder:
             self._storage.buffer(batch.table, batch.rows)
         if self._ctx.notes:
             self._keep_failure_notes()
+        if len(self._ctx.unobserved) > len(self._unobserved_kept):
+            self._keep_unobserved()
         return batches
 
     def _keep_failure_notes(self) -> None:
-        """Keep the first note of each key (a sampler's collect failure) of this session in the DB.
+        """Keep the first note of each key of this session in the DB.
 
-        Once per key: a sampler that fails on every tick must not fill the DB
-        with the same note.  ``check`` shows them in its quality notes.
+        The notes are the samplers' collect failures and the watch dirs they
+        cannot read.  Once per key: a sampler that fails on every tick must not
+        fill the DB with the same note.  ``check`` shows them in its quality
+        notes.  A plain string (what a custom sampler appended before notes had
+        keys) is keyed by the text before its first ``": "``, the sampler name.
         """
         notes, self._ctx.notes = self._ctx.notes, []
         for note in notes:
+            if isinstance(note, str):
+                note = Note(note.partition(": ")[0], note)
             if note.key in self._noted:
                 continue
             self._noted.add(note.key)
@@ -285,6 +293,22 @@ class Recorder:
                 self._storage.record_event("sampler_failed", note.text)
             except sqlite3.Error as exc:
                 logger.error("サンプラーの失敗を記録 DB に書き込めません: %s", exc)
+
+    def _keep_unobserved(self) -> None:
+        """Keep in the DB what this session cannot observe, once per capability.
+
+        What a session cannot observe goes with its data, so ``check`` does
+        not read the rules that needed it as "no problem".  A sampler that
+        starts to fail for good mid-session adds to it too.
+        """
+        for capability, reason in self._ctx.unobserved.items():
+            if capability in self._unobserved_kept:
+                continue
+            self._unobserved_kept.add(capability)
+            try:
+                self._storage.record_unobserved(capability, reason)
+            except sqlite3.Error as exc:
+                logger.error("観測できない項目を記録 DB に書き込めません: %s", exc)
 
     # ------------------------------------------------------------------
     # Spike handling
@@ -388,6 +412,12 @@ class Recorder:
                 "記録 DB に書き込めません (%s): %s。書けるようになるまで記録をメモリに残します",
                 self._storage.path,
                 exc,
+            )
+            return False
+        except Exception:
+            # Not SQLite's: still no reason to end the session unclosed.
+            logger.exception(
+                "記録 DB への書き込みで想定外の例外 (%s)", self._storage.path
             )
             return False
         return True
@@ -548,15 +578,16 @@ class Recorder:
         for name, sampler in self._samplers.items():
             try:
                 sampler.setup(self._ctx)
-            except Exception:
+            except Exception as exc:
                 logger.exception("サンプラーsetup例外 (name=%s)", name)
-        # What this session cannot observe goes with its data, so check does
-        # not read the rules that needed it as "no problem".
-        for capability, reason in self._ctx.unobserved.items():
-            try:
-                self._storage.record_unobserved(capability, reason)
-            except sqlite3.Error as exc:
-                logger.error("観測できない項目を記録 DB に書き込めません: %s", exc)
+                capability = getattr(sampler, "capability", None)
+                if capability is not None:
+                    self._ctx.lacks(
+                        capability,
+                        f"{name}: セットアップに失敗したため{capability.label}を"
+                        f"観測できていません ({exc})",
+                    )
+        self._keep_unobserved()
         if self._trigger is None:
             self._trigger = self._build_trigger()
 
