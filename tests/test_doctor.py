@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -332,6 +333,26 @@ class TestCheckSensors:
         assert result.status == "info"
         assert "温度センサなし" in result.detail
 
+    @pytest.mark.parametrize("chip", ["nvme", "drivetemp", "iwlwifi_1", "amdgpu"])
+    def test_a_host_with_only_non_cpu_sensors_has_no_cpu_temperature(self, chip):
+        reading = SimpleNamespace(label="Composite", current=41.0, high=80.0)
+        with patch(
+            "procdiag.doctor.psutil.sensors_temperatures",
+            return_value={chip: [reading]},
+        ):
+            result = _check_sensors()
+        assert result.status == "info"
+        assert "温度センサなし" in result.detail
+
+    def test_a_cpu_sensor_is_a_temperature_sensor(self):
+        reading = SimpleNamespace(label="Package id 0", current=52.0, high=100.0)
+        with patch(
+            "procdiag.doctor.psutil.sensors_temperatures",
+            return_value={"nvme": [reading], "coretemp": [reading]},
+        ):
+            result = _check_sensors()
+        assert result.status == "ok"
+
     def test_exception_returns_info(self):
         with patch(
             "procdiag.doctor.psutil.sensors_temperatures",
@@ -463,6 +484,99 @@ class TestCheckDbDisk:
         assert result.status == "degraded"
         assert "予期しない例外" in result.detail
 
+    def test_degraded_when_the_db_path_is_a_directory(self, tmp_path, monkeypatch):
+        (tmp_path / "adir").mkdir()
+        check = _doctor(tmp_path, monkeypatch, "--db", str(tmp_path / "adir"))
+        assert check["db_disk"]["status"] == "degraded"
+        assert "ディレクトリ" in check["db_disk"]["detail"]
+
+    def test_degraded_when_the_db_folder_is_a_dangling_link(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "usb").symlink_to(tmp_path / "unplugged")
+        db = tmp_path / "usb" / "p.db"
+        check = _doctor(tmp_path, monkeypatch, "--db", str(db))["db_disk"]
+        record = CliRunner().invoke(
+            cli, ["record", "--db", str(db), "--duration", "1s"]
+        )
+        assert record.exit_code != 0
+        assert check["status"] == "degraded"
+        assert str(tmp_path / "usb") in check["detail"]
+
+    def test_degraded_when_the_db_is_a_link_to_a_missing_folder(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "p.db").symlink_to(tmp_path / "unplugged" / "p.db")
+        check = _doctor(tmp_path, monkeypatch, "--db", str(tmp_path / "p.db"))
+        assert check["db_disk"]["status"] == "degraded"
+
+    def test_ok_when_the_db_is_a_link_into_an_existing_folder(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "real").mkdir()
+        (tmp_path / "p.db").symlink_to(tmp_path / "real" / "p.db")
+        check = _doctor(tmp_path, monkeypatch, "--db", str(tmp_path / "p.db"))
+        assert check["db_disk"]["status"] == "ok"
+
+    @skip_if_root
+    def test_a_relative_db_path_is_shown_in_full(self, tmp_path, monkeypatch):
+        folder = tmp_path / "ro"
+        folder.mkdir()
+        folder.chmod(0o555)
+        try:
+            monkeypatch.chdir(folder)
+            result = _check_db_disk(ProcdiagConfig(db_path="procdiag.db"))
+        finally:
+            folder.chmod(0o755)
+        assert result.status == "degraded"
+        assert str(folder) in result.detail
+        assert not result.detail.startswith(".")
+
+    @staticmethod
+    def _old_place(tmp_path, monkeypatch) -> tuple[Path, Path]:
+        """``(old DB, config)``: the DB exists only where an older procdiag kept it."""
+        config = tmp_path / "etc" / "config.py"
+        config.parent.mkdir()
+        config.write_text(
+            "from procdiag.config import ProcdiagConfig\n"
+            'config = ProcdiagConfig(db_path="./procdiag.db")\n',
+            encoding="utf-8",
+        )
+        old = tmp_path / "home" / "procdiag.db"
+        old.parent.mkdir()
+        Storage(old).close()
+        monkeypatch.chdir(old.parent)
+        return old, config
+
+    @skip_if_root
+    def test_the_old_place_notice_keeps_the_writability_check(
+        self, tmp_path, monkeypatch
+    ):
+        old, config = self._old_place(tmp_path, monkeypatch)
+        old.parent.chmod(0o555)
+        try:
+            result = CliRunner().invoke(
+                cli, ["doctor", "--config", str(config), "--format", "json"]
+            )
+        finally:
+            old.parent.chmod(0o755)
+        (check,) = [c for c in json.loads(result.stdout) if c["name"] == "db_disk"]
+        assert str(old) in check["detail"]
+        assert "書き込めません" in check["detail"]
+
+    def test_the_old_place_notice_keeps_the_free_space_check(
+        self, tmp_path, monkeypatch
+    ):
+        old, config = self._old_place(tmp_path, monkeypatch)
+        with patch("procdiag.doctor.shutil.disk_usage", return_value=MagicMock(free=1)):
+            result = CliRunner().invoke(
+                cli, ["doctor", "--config", str(config), "--format", "json"]
+            )
+        (check,) = [c for c in json.loads(result.stdout) if c["name"] == "db_disk"]
+        assert check["status"] == "degraded"
+        assert str(old) in check["detail"]
+        assert "逼迫" in check["detail"]
+
 
 # ===========================================================================
 # run_doctor — integration
@@ -470,13 +584,13 @@ class TestCheckDbDisk:
 
 
 class TestRunDoctor:
-    def test_returns_9_checks(self, default_config):
+    def test_returns_10_checks(self, default_config):
         checks = run_doctor(
             default_config,
             proc_root=PROC_TREE,
             cgroup_root=CGROUP_TREE,
         )
-        assert len(checks) == 9
+        assert len(checks) == 10
 
     def test_check_names_in_order(self, default_config):
         checks = run_doctor(
@@ -495,6 +609,7 @@ class TestRunDoctor:
             "sensors",
             "db_disk",
             "config_security",
+            "budget",
         ]
 
     def test_psi_ok_with_proc_tree(self, default_config):
@@ -559,15 +674,15 @@ class TestRunDoctor:
                 proc_root=PROC_TREE,
                 cgroup_root=CGROUP_TREE,
             )
-        assert len(checks) == 9
+        assert len(checks) == 10
         sensors = next(c for c in checks if c.name == "sensors")
         # sensors exceptions are caught → info status.
         assert sensors.status == "info"
 
     def test_smoke_real_machine(self):
-        """Smoke test: run_doctor on the real machine returns 9 checks without exception."""
+        """Smoke test: run_doctor on the real machine returns 10 checks without exception."""
         checks = run_doctor(ProcdiagConfig())
-        assert len(checks) == 9
+        assert len(checks) == 10
         for c in checks:
             assert isinstance(c, DoctorCheck)
             assert c.status in ("ok", "degraded", "info")
@@ -600,7 +715,7 @@ class TestDoctorCli:
         assert result.exit_code in (0, 2)
         data = json.loads(result.output)
         assert isinstance(data, list)
-        assert len(data) == 9
+        assert len(data) == 10
         for item in data:
             assert "name" in item
             assert "label" in item
@@ -772,4 +887,4 @@ class TestCheckConfigSecurity:
             config_path=str(p),
         )
         assert any(c.name == "config_security" for c in checks)
-        assert len(checks) == 9
+        assert len(checks) == 10

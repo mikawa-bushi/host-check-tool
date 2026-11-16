@@ -34,6 +34,8 @@ import psutil
 from . import kernlog
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig, config_trust_problem
 from .core.util import GiB, MiB
+from .output import read_only_filesystem
+from .samplers.thermal import ThermalSampler
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -45,7 +47,7 @@ class DoctorCheck:
     """Result of a single observability check."""
 
     name: str  # "psi", "cgroup_v2", "root", "io_counters", "smaps",
-    #            "journal", "sensors", "db_disk", "config_security"
+    #            "journal", "sensors", "db_disk", "config_security", "budget"
     label: str  # 日本語表示名
     status: str  # "ok" | "degraded" | "info"
     detail: str  # 日本語。降格時は §2.1 の「降格時の挙動」に相当する影響説明
@@ -180,44 +182,65 @@ def _check_journal() -> _Outcome:
 
 @_doctor_check("sensors", "温度センサ", what="温度センサ", on_error="info")
 def _check_sensors() -> _Outcome:
-    """Check whether temperature sensors are available via psutil."""
-    if psutil.sensors_temperatures():
+    """Check whether a CPU temperature can be read, as the thermal sampler reads it.
+
+    A host with only drive, GPU or Wi-Fi sensors has temperatures, but not the
+    CPU's, and records none.
+    """
+    if ThermalSampler._read_temp() is not None:
         return "ok", "温度センサが利用可能です"
     return (
         "info",
-        "温度センサなし — THERMAL-01 (サーマルスロットリング検出) は無効になります",
+        "CPU の温度センサなし — THERMAL-01 (サーマルスロットリング検出) は無効になります",
     )
 
 
-@_doctor_check("db_disk", "記録 DB の置き場", what="DB 置き場")
-def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
-    """Check that ``record`` can write the DB and has room for it.
-
-    Also warns when the DB is not where the config file says, but where an
-    older procdiag kept it (:meth:`ProcdiagConfig.db_path_notice`).
-    """
-    notice = config.db_path_notice()
-    if notice:
-        return "degraded", notice
-    db_path = Path(config.db_path)
-    folder = db_path.parent
-    while not os.path.exists(folder):
-        folder = folder.parent
-
+def _db_place(config: ProcdiagConfig) -> _Outcome:
+    """Judge the folder of ``db_path`` the way ``record`` will meet it."""
+    db_path = Path(os.path.abspath(config.db_path))
     fix = (
         "このままでは record は記録できません。"
         "書き込める場所を --db か config.py の db_path で指定してください"
     )
+    if os.path.isdir(db_path):
+        return (
+            "degraded",
+            f"{db_path} はディレクトリです — DB ファイルのパスを指定してください",
+        )
+    if os.path.islink(db_path) and not os.path.exists(db_path):
+        # SQLite creates the file where the link points, in a folder that must exist.
+        target = Path(os.path.realpath(db_path))
+        if not target.parent.is_dir():
+            return (
+                "degraded",
+                f"{db_path} は {target} を指すリンクですが、そのフォルダがありません — {fix}",
+            )
+        folder = target.parent
+    else:
+        folder = db_path.parent
+        while not os.path.lexists(folder):
+            folder = folder.parent
+        if not folder.is_dir():
+            return (
+                "degraded",
+                f"{folder} はフォルダではありません (切れたリンクなど) — {fix}",
+            )
+
     if not os.access(folder, os.W_OK | os.X_OK):
+        if read_only_filesystem(folder):
+            return (
+                "degraded",
+                f"{folder} は読み取り専用のファイルシステムにあります — {fix}",
+            )
         return "degraded", f"{folder} に書き込めません — {fix}"
-    if db_path.exists() and not os.access(db_path, os.R_OK | os.W_OK):
+    if os.path.exists(db_path) and not os.access(db_path, os.R_OK | os.W_OK):
         return "degraded", f"{db_path} に書き込めません — {fix}"
 
     free = shutil.disk_usage(folder).free
     min_free_mb = config.retention.min_free_disk_mb
 
     db_size_str = ""
-    if db_path.exists():
+    if os.path.exists(db_path):
         db_size_str = f"  (既存 DB サイズ: {db_path.stat().st_size / MiB:.1f} MB)"
 
     if free < min_free_mb * MiB:
@@ -232,6 +255,22 @@ def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
         f"空き {free / GiB:.1f} GB — 記録できます (空きが {min_free_mb:.0f} MB を"
         f"下回ると古い記録から削除します){db_size_str}",
     )
+
+
+@_doctor_check("db_disk", "記録 DB の置き場", what="DB 置き場")
+def _check_db_disk(config: ProcdiagConfig) -> _Outcome:
+    """Check that ``record`` can write the DB and has room for it.
+
+    Also warns when the DB is not where the config file says, but where an
+    older procdiag kept it (:meth:`ProcdiagConfig.db_path_notice`).  That notice
+    comes first and the folder is judged all the same: it is the folder
+    ``record`` will write to.
+    """
+    status, detail = _db_place(config)
+    notice = config.db_path_notice()
+    if notice:
+        return "degraded", f"{notice}。{detail}"
+    return status, detail
 
 
 @_doctor_check(
@@ -252,7 +291,7 @@ def _check_config_security(config_path: Optional[str]) -> _Outcome:
     other checks treat unexpected exceptions.
     """
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
-    if not path.exists():
+    if not os.path.exists(path):
         return "info", f"設定ファイルが見つかりません ({path}) — 既定値で動作します"
     problem = config_trust_problem(path)
     if problem:
@@ -264,6 +303,24 @@ def _check_config_security(config_path: Optional[str]) -> _Outcome:
     return (
         "ok",
         f"{path} は自分 (または root) の所有で、他のユーザーは書き換えられません",
+    )
+
+
+@_doctor_check("budget", "自動減速の設定", what="自動減速の設定")
+def _check_budget(config: ProcdiagConfig) -> _Outcome:
+    """Check that ``budget.throttle_factor`` is used as the config file says.
+
+    A factor below the minimum is raised to it, not refused (an unattended
+    recording must still start), so this is where the user is told.
+    """
+    notice = config.budget.throttle_notice()
+    if notice:
+        return "degraded", notice
+    factor = config.budget.throttle_factor
+    return (
+        "ok",
+        f"throttle_factor = {factor:g} — 自己負荷が予算を超えている間、"
+        f"Tier-2b の間隔を 1 分ごとに {factor:g} 倍ずつ広げます",
     )
 
 
@@ -281,7 +338,7 @@ def run_doctor(
 ) -> list[DoctorCheck]:
     """Run all observability checks and return a list of :class:`DoctorCheck`.
 
-    Always returns exactly 9 items in a fixed order regardless of errors.
+    Always returns exactly 10 items in a fixed order regardless of errors.
     Each check is wrapped so a single failure cannot propagate.
 
     Parameters
@@ -306,4 +363,5 @@ def run_doctor(
         _check_sensors(),
         _check_db_disk(config),
         _check_config_security(config_path),
+        _check_budget(config),
     ]

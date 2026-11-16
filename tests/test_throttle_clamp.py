@@ -1,0 +1,186 @@
+"""A ``budget.throttle_factor`` that is too small is used as the smallest usable one.
+
+procdiag 0.6 accepted any factor above 0.  A refusal now would end ``record`` with
+exit code 4, which the generated unit does not restart (``RestartPreventExitStatus=4``),
+so a config that ran before an upgrade would stop the recording for good.  The
+factor is raised to 1.1 instead, and the user is told where they read about their
+recording: when ``record`` starts, in ``doctor``, and in ``check``.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+from synth import add_sys_baseline, make_db
+
+from procdiag.cli import cli
+from procdiag.config import BudgetConfig, ProcdiagConfig
+from procdiag.diagnosis import Engine
+from procdiag.doctor import run_doctor
+from procdiag.samplers.selfmeter import SelfMeter
+
+
+def _write_config(folder: Path, factor: float) -> Path:
+    path = folder / "config.py"
+    path.write_text(
+        "from procdiag.config import ProcdiagConfig, BudgetConfig\n"
+        f"config = ProcdiagConfig(budget=BudgetConfig(throttle_factor={factor}))\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@dataclass
+class Recording:
+    folder: Path
+    config: Path
+    db: Path
+    recorded: object
+
+
+def _record(folder: Path, factor: float) -> Recording:
+    config = _write_config(folder, factor)
+    db = folder / "r.db"
+    result = CliRunner().invoke(
+        cli,
+        ["record", "--duration", "2s", "--config", str(config), "--db", str(db)],
+    )
+    return Recording(folder, config, db, result)
+
+
+@pytest.fixture(scope="module")
+def clamped(tmp_path_factory) -> Recording:
+    return _record(tmp_path_factory.mktemp("clamped"), 1.05)
+
+
+@pytest.fixture(scope="module")
+def usable(tmp_path_factory) -> Recording:
+    return _record(tmp_path_factory.mktemp("usable"), 1.5)
+
+
+def test_the_recorder_widens_the_interval_by_the_minimum_factor():
+    meter = SelfMeter(BudgetConfig(throttle_factor=1.05), process_interval=10.0)
+    meter.sample = lambda: (50.0, 1024)  # type: ignore[method-assign]
+
+    events = [meter.update(1000.0 + second) for second in range(65)]
+
+    assert "throttle_down" in events
+    assert meter.factor == pytest.approx(1.1)
+
+
+class TestRecord:
+    def test_record_runs_instead_of_exiting_4(self, clamped):
+        assert clamped.recorded.exit_code == 0, clamped.recorded.output
+        assert clamped.db.exists()
+
+    def test_record_says_which_value_it_uses(self, clamped):
+        out = clamped.recorded.output
+        assert "throttle_factor" in out and "1.05" in out and "1.1" in out
+        assert out.startswith("警告: ")
+
+    def test_a_usable_factor_prints_no_warning(self, usable):
+        assert usable.recorded.exit_code == 0, usable.recorded.output
+        assert "throttle_factor" not in usable.recorded.output
+
+    def test_commands_that_only_read_stay_quiet(self, clamped):
+        result = CliRunner().invoke(
+            cli, ["status", "--config", str(clamped.config), "--db", str(clamped.db)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "警告" not in result.output
+
+    def test_quick_says_it_too(self, tmp_path):
+        config = _write_config(tmp_path, 1.05)
+        result = CliRunner().invoke(
+            cli,
+            [
+                "quick",
+                "--duration",
+                "2s",
+                "--config",
+                str(config),
+                "--out",
+                str(tmp_path / "out"),
+            ],
+        )
+        assert result.exit_code in (0, 1, 2, 3), result.output
+        assert "throttle_factor" in result.output and "1.05" in result.output
+
+
+class TestCheck:
+    def test_check_names_the_value_the_recording_used(self, clamped):
+        result = CliRunner().invoke(
+            cli, ["check", "--config", str(clamped.config), "--db", str(clamped.db)]
+        )
+        assert result.exit_code in (0, 1, 2, 3), result.output
+        notes = [line for line in result.output.splitlines() if "備考" in line]
+        assert any("throttle_factor" in n and "1.05" in n and "1.1" in n for n in notes)
+
+    def test_a_usable_factor_adds_no_note(self, usable):
+        result = CliRunner().invoke(
+            cli, ["check", "--config", str(usable.config), "--db", str(usable.db)]
+        )
+        assert result.exit_code in (0, 1, 2, 3), result.output
+        assert "throttle_factor" not in result.output
+
+
+class TestNotesAcrossSessions:
+    """The note names the sessions that overlap the diagnosed period, once."""
+
+    NOTICE = BudgetConfig(throttle_factor=1.05).throttle_notice()
+
+    @staticmethod
+    def _session(store, started_ts, notice=None):
+        store.conn.execute(
+            "INSERT INTO sessions (started_ts, boot_time, hostname, "
+            "procdiag_version, last_alive_ts) VALUES (?, 0, 'h', '0', ?)",
+            (started_ts, started_ts),
+        )
+        if notice:
+            store.conn.execute(
+                "INSERT INTO ops_events (ts, kind, detail) "
+                "VALUES (?, 'config_adjusted', ?)",
+                (started_ts + 1, notice),
+            )
+
+    def _notes(self, tmp_path, sessions):
+        store = make_db(tmp_path, hours=3)
+        add_sys_baseline(store, hours=3)
+        now = time.time()
+        for hours_ago, notice in sessions:
+            self._session(store, now - hours_ago * 3600.0, notice)
+        store.conn.commit()
+        diag = Engine(ProcdiagConfig()).run(store)
+        store.close()
+        return [n for n in diag.quality.notes if "throttle_factor" in n]
+
+    def test_restarts_with_the_same_setting_give_one_note(self, tmp_path):
+        notes = self._notes(
+            tmp_path, [(2.9, self.NOTICE), (2.0, self.NOTICE), (1.0, self.NOTICE)]
+        )
+
+        assert len(notes) == 1
+        assert self.NOTICE in notes[0]
+
+    def test_a_session_that_ran_with_the_written_value_has_no_note(self, tmp_path):
+        assert self._notes(tmp_path, [(2.9, None)]) == []
+
+    def test_a_session_that_ended_before_the_period_has_no_note(self, tmp_path):
+        assert self._notes(tmp_path, [(240.0, self.NOTICE), (4.0, None)]) == []
+
+
+class TestDoctor:
+    def test_doctor_degrades_on_a_clamped_factor(self):
+        config = ProcdiagConfig(budget=BudgetConfig(throttle_factor=1.05))
+        (check,) = [c for c in run_doctor(config) if c.name == "budget"]
+        assert check.status == "degraded"
+        assert "1.05" in check.detail and "1.1" in check.detail
+
+    def test_doctor_is_ok_with_the_default(self):
+        (check,) = [c for c in run_doctor(ProcdiagConfig()) if c.name == "budget"]
+        assert check.status == "ok"
+        assert "1.5" in check.detail

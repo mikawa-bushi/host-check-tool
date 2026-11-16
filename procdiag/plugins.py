@@ -23,6 +23,10 @@ from typing import List, Tuple
 
 ENTRY_POINT_GROUP = "procdiag.rules"
 
+# ``(name, message)`` of each entry point the last ``load_plugins()`` could not
+# load, so the engine can say in its report which rules are missing.
+_failed: List[Tuple[str, str]] = []
+
 
 def load_plugins() -> List[Tuple[str, bool, str]]:
     """Import every registered plugin module via the entry-point group.
@@ -48,7 +52,13 @@ def load_plugins() -> List[Tuple[str, bool, str]]:
         except Exception as e:  # never let a plugin break the tool
             results.append((ep.name, False, str(e)))
 
+    _failed[:] = [(name, message) for name, ok, message in results if not ok]
     return results
+
+
+def plugin_failures() -> List[Tuple[str, str]]:
+    """``(name, message)`` for each entry point the last ``load_plugins()`` failed to load."""
+    return list(_failed)
 
 
 def load_extra_rules(import_paths: List[str]) -> List[Tuple[str, bool, str]]:

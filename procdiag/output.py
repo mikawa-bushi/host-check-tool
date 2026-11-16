@@ -10,6 +10,18 @@ from pathlib import Path
 from typing import IO, Any, Iterator, Union
 
 
+def read_only_filesystem(path: Union[str, Path]) -> bool:
+    """Whether *path* is on a file system mounted read-only.
+
+    ``os.access`` is False both for a missing permission and for such a mount,
+    and only the first can be cured with ``chmod``.
+    """
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
 @contextmanager
 def atomic_output(
     path: Union[str, Path], mode: str = "w", **kwargs: Any

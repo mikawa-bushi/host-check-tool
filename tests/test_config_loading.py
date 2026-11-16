@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 from pydantic import BaseModel
+from synth import add_sys_baseline, make_db
 
 from procdiag import config as config_module
 from procdiag.cli import cli
@@ -391,3 +392,193 @@ def test_config_module_has_no_other_float_model():
         if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel
     ]
     assert {m for m in models if _float_fields(m)} <= set(MODELS)
+
+
+# ---------------------------------------------------------------------------
+# A config file that ends the process, and one whose folder cannot be entered
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["sys.exit(0)", "sys.exit()", 'sys.exit("db が未設定")', "raise SystemExit(5)"],
+)
+@pytest.mark.parametrize("command", [["status"], ["record", "--duration", "1s"]])
+def test_a_config_that_calls_sys_exit_is_a_config_error(tmp_path, command, call):
+    config = tmp_path / "config.py"
+    config.write_text(f"import sys\n{call}\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli, [*command, "--config", str(config), "--db", str(tmp_path / "p.db")]
+    )
+
+    assert result.exit_code == 4, result.output
+    assert "設定ファイル" in result.output
+    assert not (tmp_path / "p.db").exists()
+    if "db が未設定" in call:
+        assert "db が未設定" in result.output
+
+
+def test_load_config_turns_sys_exit_into_a_value_error(tmp_path):
+    config = tmp_path / "config.py"
+    config.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sys.exit"):
+        load_config(config)
+
+
+@NOT_ROOT
+@pytest.mark.parametrize(
+    "command", [["status"], ["doctor"], ["record", "--duration", "1s"]]
+)
+def test_a_db_folder_that_cannot_be_entered_is_not_a_traceback(tmp_path, command):
+    site = tmp_path / "etc"
+    _write_config(site / "config.py", "./sub/procdiag.db")
+    (site / "sub").mkdir()
+    (site / "sub").chmod(0)
+    try:
+        result = CliRunner().invoke(
+            cli, [*command, "--config", str(site / "config.py")]
+        )
+    finally:
+        (site / "sub").chmod(0o755)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+
+
+# ---------------------------------------------------------------------------
+# The database an older procdiag kept in the current folder
+# ---------------------------------------------------------------------------
+
+
+def _old_place(tmp_path, monkeypatch):
+    config = _write_config(tmp_path / "etc" / "config.py", "./procdiag.db")
+    old = tmp_path / "home" / "procdiag.db"
+    old.parent.mkdir()
+    store = make_db(old.parent)
+    add_sys_baseline(store, hours=1)
+    store.close()
+    (old.parent / "synth.db").rename(old)
+    monkeypatch.chdir(old.parent)
+    return config, old
+
+
+@pytest.mark.parametrize("command", [["snapshot"], ["quick", "--duration", "1s"]])
+def test_commands_that_never_open_the_db_do_not_warn_about_it(
+    tmp_path, monkeypatch, command
+):
+    config, _ = _old_place(tmp_path, monkeypatch)
+    monkeypatch.setattr("procdiag.snapshot.run_snapshot", lambda cfg: [])
+
+    result = CliRunner().invoke(cli, [*command, "--config", str(config)])
+
+    assert "以前の版" not in result.output, result.output
+
+
+def test_compare_of_two_given_dbs_does_not_warn_about_the_configs_db(
+    tmp_path, monkeypatch
+):
+    config, old = _old_place(tmp_path, monkeypatch)
+    other = tmp_path / "other.db"
+    other.write_bytes(old.read_bytes())
+
+    result = CliRunner().invoke(
+        cli, ["compare", str(old), str(other), "--config", str(config)]
+    )
+
+    assert "以前の版" not in result.output, result.output
+
+
+def test_doctor_still_checks_the_folder_of_a_db_found_at_the_old_place(
+    tmp_path, monkeypatch
+):
+    config, old = _old_place(tmp_path, monkeypatch)
+    old.parent.chmod(0o555)
+    try:
+        result = CliRunner().invoke(
+            cli, ["doctor", "--config", str(config), "--format", "json"]
+        )
+    finally:
+        old.parent.chmod(0o755)
+
+    (db_check,) = [c for c in json.loads(result.stdout) if c["name"] == "db_disk"]
+    assert str(old) in db_check["detail"]
+    if os.geteuid() != 0:
+        assert "書き込めません" in db_check["detail"]
+
+
+def test_a_report_of_a_db_found_at_the_old_place_names_the_db(tmp_path, monkeypatch):
+    config, old = _old_place(tmp_path, monkeypatch)
+
+    for fmt in ("json", "html", "text"):
+        result = CliRunner().invoke(
+            cli, ["check", "--config", str(config), "--format", fmt, "--no-color"]
+        )
+        assert result.exit_code in (0, 1, 2, 3), result.output
+        assert str(old) in result.stdout, fmt
+
+
+def test_a_report_of_the_db_the_config_names_says_nothing_about_a_fallback(
+    tmp_path, monkeypatch
+):
+    config, old = _old_place(tmp_path, monkeypatch)
+    new = tmp_path / "etc" / "procdiag.db"
+    new.parent.mkdir(exist_ok=True)
+    old.rename(new)
+
+    result = CliRunner().invoke(
+        cli, ["check", "--config", str(config), "--format", "json"]
+    )
+
+    assert "以前の版" not in result.stdout
+
+
+def test_a_directory_at_the_old_place_is_not_a_database(tmp_path, monkeypatch):
+    config = _write_config(tmp_path / "etc" / "config.py", "./procdiag.db")
+    (tmp_path / "home" / "procdiag.db").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "home")
+
+    cfg = load_config(config)
+
+    assert cfg.db_path == str(tmp_path / "etc" / "procdiag.db")
+    assert cfg.db_path_notice() is None
+
+
+@NOT_ROOT
+def test_a_db_folder_that_exists_but_cannot_be_written_stops_record_with_one_line(
+    tmp_path,
+):
+    folder = tmp_path / "mnt"
+    folder.mkdir()
+    folder.chmod(0o555)
+    try:
+        result = CliRunner().invoke(
+            cli,
+            ["record", "--duration", "1s", "--db", str(folder / "procdiag.db")],
+        )
+    finally:
+        folder.chmod(0o755)
+
+    assert result.exit_code == 1, result.output
+    assert len([ln for ln in result.output.splitlines() if ln.strip()]) == 1
+    assert str(folder / "procdiag.db") in result.output
+    assert list(folder.iterdir()) == []
+
+
+def test_the_db_option_drops_the_old_place_warning(tmp_path, monkeypatch):
+    config, old = _old_place(tmp_path, monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["status", "--config", str(config), "--db", str(old)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "以前の版" not in result.output
+
+
+def test_a_config_reached_through_a_link_keeps_the_link_in_db_path(tmp_path):
+    site = tmp_path / "site"
+    _write_config(site / "config.py", "./procdiag.db")
+    (tmp_path / "link").symlink_to(site, target_is_directory=True)
+
+    cfg = load_config(tmp_path / "link" / "config.py")
+
+    assert cfg.db_path == str(tmp_path / "link" / "procdiag.db")

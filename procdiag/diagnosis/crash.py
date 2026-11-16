@@ -192,6 +192,7 @@ class OomKillRule(Rule):
     psi_mem_full_threshold: float = _PSI_MEM_FULL_THRESHOLD
     mem_avail_fraction: float = _MEM_AVAIL_FRACTION
     max_findings: int = _MAX_FINDINGS
+    positive_tunables = ("max_findings",)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run OOM-KILL-01 against the observation window."""
@@ -794,6 +795,7 @@ class KernelErrorRule(Rule):
     ]
 
     max_samples: int = 3
+    positive_tunables = ("max_samples",)
 
     def evaluate(self, store: "Storage", window: Window) -> list[Finding]:
         """Run KERNEL-ERROR-01 against the observation window."""

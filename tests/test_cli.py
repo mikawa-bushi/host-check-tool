@@ -238,14 +238,15 @@ class TestInit:
 
         assert isinstance(cfg, ProcdiagConfig)
 
-    def test_default_dir_is_cwd(self, runner, tmp_path):
+    def test_default_dir_is_cwd(self, runner, tmp_path, monkeypatch):
         """init without DIR argument writes to CWD."""
+        monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             cli, ["init"], catch_exceptions=False, env={"HOME": str(tmp_path)}
         )
-        # Just check it doesn't crash; actual file written to real CWD.
-        # We don't assert file existence here to avoid polluting the repo.
         assert result.exit_code == 0
+        assert (tmp_path / "config.py").is_file()
+        assert (tmp_path / "data").is_dir()
 
 
 # ---------------------------------------------------------------------------

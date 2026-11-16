@@ -23,6 +23,7 @@ import bisect
 import heapq
 import logging
 import math
+import os
 import shutil
 import sqlite3
 import time
@@ -133,7 +134,17 @@ class ProcIdentity(NamedTuple):
 
 
 class StorageVersionError(RuntimeError):
-    """Raised when a DB's schema version is newer than this procdiag supports."""
+    """Raised when a DB cannot be used because of its schema version.
+
+    Its version is newer than this procdiag supports, or it has none that can be
+    read: a SQLite file of other software, or a damaged procdiag DB.
+    """
+
+
+_NOT_PROCDIAG_DB = (
+    "procdiag の DB ではありません (スキーマ版が無い、または数として読めません)。"
+    "他のソフトの SQLite ファイルか、壊れた DB です。--db に別のパスを指定してください"
+)
 
 
 # Samples kept in memory while the DB cannot be written (disk full, I/O error,
@@ -533,6 +544,62 @@ _GUARD_LADDER: Tuple[Tuple[str, str, Optional[str]], ...] = (
 )
 
 
+_WAL_SUFFIXES = ("-wal", "-shm")
+
+
+def wal_files_exist(path: Path) -> bool:
+    """Whether a ``-wal`` or ``-shm`` file lies beside the DB at *path*."""
+    return any(os.path.exists(f"{path}{suffix}") for suffix in _WAL_SUFFIXES)
+
+
+def drop_idle_wal_files(path: Path) -> None:
+    """Remove the ``-wal`` / ``-shm`` that opening *path* read-only created.
+
+    SQLite deletes both when the last connection to a WAL database closes, but a
+    connection that can only read cannot, so every read left a pair that looks
+    like a recording still running.  Opening the DB for writing and closing it
+    lets SQLite do the deleting, and it leaves the files alone while a recorder
+    has the DB open.  Call it only when the files did not exist before the read:
+    a ``-wal`` that holds data is the recording's and is never touched.
+    """
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+
+def _stored_version(conn: sqlite3.Connection) -> Optional[int]:
+    """The schema version of the DB *conn* is open on, ``None`` if it has no tables yet.
+
+    Raises :class:`StorageVersionError` for a file that has tables but no readable
+    version.  procdiag stamps the version in the transaction that creates the
+    tables, so such a file is not one of its own, and nothing must be written to it.
+    """
+    if (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone()
+        is None
+    ):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such" not in str(exc):
+            raise  # busy or failing, not foreign
+        row = None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        raise StorageVersionError(_NOT_PROCDIAG_DB) from None
+
+
 def connect_read_only(path: Path) -> sqlite3.Connection:
     """Open the DB at *path* read-only, also from a directory the reader cannot write.
 
@@ -550,8 +617,10 @@ def connect_read_only(path: Path) -> sqlite3.Connection:
         return conn
     except sqlite3.DatabaseError as exc:
         conn.close()
-        wal = Path(f"{path}-wal")
-        if "readonly" not in str(exc) or (wal.exists() and wal.stat().st_size > 0):
+        wal = f"{path}-wal"
+        if "readonly" not in str(exc) or (
+            os.path.exists(wal) and os.stat(wal).st_size > 0
+        ):
             raise
     return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True)
 
@@ -573,6 +642,9 @@ class Storage:
         self.path = Path(path)
         self._read_only = read_only
 
+        # Files a read-only open leaves are removed again on close; files that
+        # were there already belong to a recording (see drop_idle_wal_files).
+        self._drop_wal_files = read_only and not wal_files_exist(self.path)
         if read_only:
             self.conn = connect_read_only(self.path)
         else:
@@ -587,6 +659,8 @@ class Storage:
         except BaseException:
             # e.g. StorageVersionError: do not leak the connection to the caller.
             self.conn.close()
+            if self._drop_wal_files:
+                drop_idle_wal_files(self.path)
             raise
 
         # In-memory write buffer: table_name -> list[tuple]
@@ -620,6 +694,8 @@ class Storage:
             self._check_read_only_version()
             return
 
+        # Before the pragma below: it would rewrite the header of a foreign file.
+        _stored_version(self.conn)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         # One transaction with the version stamp, so that a kill in between
@@ -676,15 +752,10 @@ class Storage:
         and past migrations only add tables, indexes and columns that reads
         survive without.
         """
-        try:
-            row = self.conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-        except sqlite3.Error:
-            return  # not a procdiag DB / no meta table — let reads fail naturally
-        if row is not None and int(row["value"]) > SCHEMA_VERSION:
+        version = _stored_version(self.conn)
+        if version is not None and version > SCHEMA_VERSION:
             raise StorageVersionError(
-                f"DB のスキーマ版 {int(row['value'])} はこの procdiag "
+                f"DB のスキーマ版 {version} はこの procdiag "
                 f"(版 {SCHEMA_VERSION}) より新しいため読めません。"
             )
 
@@ -1894,6 +1965,8 @@ class Storage:
                 self.flush(reason="close")
         finally:
             self.conn.close()
+            if self._drop_wal_files:
+                drop_idle_wal_files(self.path)
 
     def __enter__(self) -> "Storage":
         return self

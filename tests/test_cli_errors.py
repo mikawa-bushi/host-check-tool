@@ -431,3 +431,73 @@ class TestClosedPipe:
             os.close(write_end)
         assert proc.stderr == b""
         assert proc.returncode in (-13, 141), proc.returncode
+
+
+FOREIGN_DBS = {
+    "other-app-same-table-names": [
+        "CREATE TABLE sessions (x)",
+        "CREATE TABLE meta (foo)",
+    ],
+    "other-app-plain": ["CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)"],
+    "other-app-key-value-meta": [
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+        "INSERT INTO meta VALUES ('app', 'shop')",
+        "CREATE TABLE sys_samples (zzz)",
+    ],
+}
+
+
+def _foreign_db(tmp_path: Path, good_db: Path, kind: str) -> Path:
+    path = tmp_path / f"{kind}.db"
+    if kind == "version-not-a-number":
+        shutil.copy(good_db, path)
+        statements = ["UPDATE meta SET value='abc' WHERE key='schema_version'"]
+    else:
+        statements = FOREIGN_DBS[kind]
+    with sqlite3.connect(path) as conn:
+        for statement in statements:
+            conn.execute(statement)
+    conn.close()
+    return path
+
+
+class TestForeignDb:
+    """A SQLite file that is not a procdiag DB is refused, and left as it was."""
+
+    KINDS = [*FOREIGN_DBS, "version-not-a-number"]
+
+    @pytest.mark.parametrize("kind", KINDS)
+    @pytest.mark.parametrize("command", ["record", "prune"])
+    def test_write_commands_refuse_it_and_do_not_touch_it(
+        self, runner, tmp_path, good_db, command, kind
+    ):
+        db = _foreign_db(tmp_path, good_db, kind)
+        before = db.read_bytes()
+        args = [command, "--db", str(db)]
+        if command == "record":
+            args += ["--duration", "2s"]
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 4, result.output
+        assert isinstance(result.exception, SystemExit), repr(result.exception)
+        assert str(db) in result.output
+        assert "procdiag の DB ではありません" in result.output
+        assert db.read_bytes() == before
+        assert sorted(p.name for p in tmp_path.glob(f"{kind}.db*")) == [db.name]
+
+    @pytest.mark.parametrize("kind", KINDS)
+    @pytest.mark.parametrize("command", ["check", "status", "export"])
+    def test_read_commands_refuse_it(self, runner, tmp_path, good_db, command, kind):
+        db = _foreign_db(tmp_path, good_db, kind)
+        result = runner.invoke(cli, [command, "--db", str(db)])
+        _assert_refused(result)
+        assert "procdiag の DB ではありません" in result.output
+
+    def test_a_db_of_an_older_procdiag_is_still_opened(self, runner, tmp_path):
+        db = tmp_path / "old.db"
+        with Storage(db) as store:
+            store.set_meta("hostname", "x")
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        conn.close()
+        result = runner.invoke(cli, ["record", "--db", str(db), "--duration", "2s"])
+        assert result.exit_code == 0, result.output
