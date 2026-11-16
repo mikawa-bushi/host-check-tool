@@ -95,7 +95,6 @@ class CpuPeriodicRule(Rule):
     ]
 
     tol_sec: float = 120.0
-    positive_tunables = ("tol_sec",)
     min_events: int = 3
     warning_count: int = _CPU_PERIODIC_WARNING_COUNT
 

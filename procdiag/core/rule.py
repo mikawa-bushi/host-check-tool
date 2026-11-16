@@ -73,8 +73,9 @@ class Rule:
     requires_rows: tuple[str, ...] = ()
     requires_observed: tuple[Capability, ...] = ()
     # Tunables for which 0 or less is meaningless: a cap of 0 hides every
-    # finding, a tolerance of 0 divides by zero.  An override of them must be
-    # above 0 (``resolve_overrides``); ``inf`` still means "unbounded".
+    # finding.  An override of 0 or less is not used (``unusable_overrides``):
+    # the rule keeps the default.  It is not refused, because procdiag 0.6 took
+    # it and a refusal at start-up would stop a unit that ran before.
     positive_tunables: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
@@ -107,15 +108,18 @@ class Rule:
         setting in ``config.rules`` overrides this to copy that value first and
         then calls ``super()``, so an explicit override still wins.  Raises
         :class:`ValueError` for an unknown or ill-typed override (nothing is
-        applied in that case).
+        applied in that case).  An override of a ``positive_tunables`` entry
+        that is 0 or less is skipped, and its default stays.
         """
         overrides = config.rules.overrides.get(self.rule_id, {})
         resolved = resolve_overrides(type(self), overrides)
+        unusable = unusable_overrides(type(self), resolved)
         keeps_default = type(self).min_observation_hours == Rule.min_observation_hours
         if keeps_default and "min_observation_hours" not in vars(self):
             self.min_observation_hours = config.rules.min_observation_hours
         for name, value in resolved.items():
-            setattr(self, name, value)
+            if name not in unusable:
+                setattr(self, name, value)
 
     def missing_rows(self, store: "Storage", window: Window) -> tuple[str, ...]:
         """Inputs beyond ``requires_rows`` the window has no rows of.
@@ -247,10 +251,6 @@ def resolve_overrides(
                 f"{cls.rule_id}: '{name}' は調整可能なしきい値ではありません"
                 f" (調整可能: {', '.join(tunables)})"
             )
-        if name in cls.positive_tunables and not value > 0:
-            raise ValueError(
-                f"{cls.rule_id}: '{name}' は 0 より大きい数で指定してください: {value}"
-            )
         if isinstance(tunables[name], int):
             if not float(value).is_integer():
                 raise ValueError(
@@ -262,6 +262,20 @@ def resolve_overrides(
     return resolved
 
 
+def unusable_overrides(
+    cls: Type[Rule], overrides: Mapping[str, float]
+) -> Dict[str, float]:
+    """The *overrides* of ``cls.positive_tunables`` that are 0 or less (or NaN).
+
+    ``inf`` is above 0: it still means "unbounded".
+    """
+    return {
+        name: value
+        for name, value in overrides.items()
+        if name in cls.positive_tunables and not value > 0
+    }
+
+
 _R = TypeVar("_R", bound=Rule)
 
 
@@ -270,14 +284,24 @@ def configure_rule(cls: Type[_R], config: "ProcdiagConfig") -> Tuple[_R, Optiona
 
     An invalid override (the CLI rejects those at start-up, library callers
     may not) leaves the rule at its defaults and is returned as *error* so the
-    caller can say so instead of aborting.
+    caller can say so instead of aborting.  So is a ``positive_tunables``
+    override of 0 or less, which the CLI accepts: only that threshold keeps
+    its default, and the rule's other overrides apply.
     """
     rule = cls()
     try:
         rule.configure(config)
     except ValueError as exc:
         return cls(), str(exc)
-    return rule, None
+    unusable = unusable_overrides(cls, config.rules.overrides.get(cls.rule_id, {}))
+    if not unusable:
+        return rule, None
+    tunables = cls.tunables()
+    return rule, "。".join(
+        f"{cls.rule_id}: {name} = {value:g} は 0 より大きい数ではないため、"
+        f"既定値 {tunables[name]:g} で評価します"
+        for name, value in unusable.items()
+    )
 
 
 def validate_rule_overrides(overrides: Mapping[str, Mapping[str, float]]) -> List[str]:

@@ -314,6 +314,7 @@ class Engine:
         uncovered: list[UncoveredRule] = []
         measurements: dict[str, list[Measurement]] = {}
         unjudged: list[str] = []
+        config_notes: list[str] = []
         coverage_cache: dict[tuple[str, str], bool] = {}
         unobserved = (
             [p for u in store.unobserved_periods() if (p := u.within(window))]
@@ -333,6 +334,7 @@ class Engine:
                 reasoning.append(
                     f"{rule.rule_id}: 設定の適用に失敗 — 既定値で評価: {config_error}"
                 )
+                config_notes.append(config_error)
             eff_min = rule.min_observation_hours
             if not covers(observed_hours, eff_min):
                 reasoning.append(
@@ -443,6 +445,7 @@ class Engine:
             unjudged=unjudged,
         )
         quality.notes[:0] = load_problems
+        quality.notes.extend(config_notes)
 
         # Healthy is a verdict, so it needs data and at least one rule that ran.
         healthy = (
