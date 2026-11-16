@@ -301,6 +301,7 @@ class OomKillRule(Rule):
                 "last_rss_mb": round(last_rss / MiB, 1),
                 "mem_total_mb": round(mem_total / MiB, 1) if mem_total else None,
                 "lifetime_minutes": lifetime_minutes,
+                "min_lifetime_minutes": round(self.min_lifetime_s / 60.0, 1),
                 "gap_to_window_end_s": round(gap, 1),
                 "crisis_indicator": crisis["type"] if crisis else None,
                 "crisis_value": crisis["value"] if crisis else None,
@@ -319,7 +320,9 @@ class OomKillRule(Rule):
                 if lifetime < self.min_lifetime_s:
                     program_minutes = round(program_lifetime / 60.0, 1)
                     evidence["program_lifetime_minutes"] = program_minutes
-                    program_span = f" プログラムとして {program_minutes}分 動作,"
+                    program_span = (
+                        f" 同じプログラムの最初のプロセスから {program_minutes}分,"
+                    )
                 summary = (
                     f"OOM Kill 疑い: {label} が消滅"
                     f" (最終 RSS {evidence['last_rss_mb']:.1f} MB,"
