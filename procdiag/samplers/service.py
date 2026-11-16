@@ -109,7 +109,10 @@ class ServiceSampler(Sampler):
                     else _RESTART_KIND.get(props.get("Restart"), "restart")
                 )
                 if new and kind:
-                    rows.append(self._event(ts, unit, kind, new, result))
+                    clean = kind == "restart_clean"
+                    rows.append(
+                        self._event(ts, unit, kind, new, None if clean else result)
+                    )
                 elif new and _log_level(props) < _WARNING_LEVEL:
                     rows.append(
                         self._event(ts, unit, "restart_maybe_clean", new, result)
