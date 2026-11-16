@@ -94,3 +94,18 @@ def test_cli_bundle(tmp_path, monkeypatch):
     assert "バンドルを作成しました" in result.output
     assert "コマンドラインを削除" in result.output
     assert (tmp_path / "c.tar.gz").exists()
+
+
+def test_the_bundled_report_covers_the_diagnosed_period_only(tmp_path, monkeypatch):
+    import re
+
+    from test_report_output import _long_recording
+
+    monkeypatch.chdir(tmp_path)
+    db = _long_recording(tmp_path)
+    out = tmp_path / "b.tar.gz"
+    create_bundle(ProcdiagConfig(db_path=str(db)), out=out, snapshot_sample_sec=0.05)
+    with tarfile.open(out) as tar:
+        tar.extractall(tmp_path / "x", filter="data")
+    html = (tmp_path / "x" / "b" / "report.html").read_text(encoding="utf-8")
+    assert len(re.findall(r"<tr class='spike-table'>", html)) == 1

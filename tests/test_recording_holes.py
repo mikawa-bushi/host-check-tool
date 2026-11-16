@@ -196,6 +196,28 @@ class TestRecordingHoles:
         assert diag.quality.gap_seconds == pytest.approx(suspended + 4.0)
         assert diag.quality.span_hours == pytest.approx(358 / 60)
 
+    def test_a_suspend_in_the_rollup_only_part_counts_once_in_the_gap_total(
+        self, tmp_path
+    ):
+        now = _minute_now()
+        start, resume = now - 8 * _HOUR, now - 4 * _HOUR
+        store = make_db(tmp_path, hours=8)
+        add_sys_baseline(store, hours=2, start_ts=start)
+        add_sys_baseline(store, hours=4, start_ts=resume)
+        store.conn.execute("DELETE FROM sys_samples WHERE ts < ?", (resume - 1,))
+        suspended = resume - (start + 119 * 60)
+        store.conn.execute(
+            "INSERT INTO ops_events (ts, kind, detail) VALUES (?, 'gap', ?)",
+            (resume - 0.5, f"{suspended - 1:.1f}s ジョブt1_system"),
+        )
+        store.conn.commit()
+        window = Window(*store.system_bounds())
+        diag = Engine(ProcdiagConfig()).run(store, window=window)
+        store.close()
+
+        assert len(diag.window.holes) == 1
+        assert diag.quality.gap_seconds == pytest.approx(suspended)
+
     def test_compare_does_not_resolve_on_two_hours_spread_over_a_day(self, tmp_path):
         now = _minute_now()
         at = now - 25 * _HOUR
