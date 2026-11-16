@@ -271,8 +271,17 @@ class _Filesystem(NamedTuple):
 
 # Bind mounts and the like show one filesystem under several mount points; two
 # are the same when every sample is at the same time with the same size and a
-# usage that differs by no more than a write between two reads.
+# usage and free space that differ by no more than a write between two reads.
+# The free space is part of it: two filesystems of one size and usage with other
+# reserved space are not one, and the fuller one must not hide behind the other.
 _SAME_FILESYSTEM_USED_BYTES = 16 * MiB
+
+
+def _written_between(a: Optional[int], b: Optional[int]) -> bool:
+    """Whether two reads of one value, or its absence, agree to within a write."""
+    if a is None or b is None:
+        return a is b
+    return abs(a - b) <= _SAME_FILESYSTEM_USED_BYTES
 
 
 def _same_filesystem(a: list, b: list) -> bool:
@@ -280,8 +289,8 @@ def _same_filesystem(a: list, b: list) -> bool:
         x["ts"] == y["ts"]
         and x["total"] == y["total"]
         and x["inodes_total"] == y["inodes_total"]
-        and (x["used"] is None) == (y["used"] is None)
-        and abs((x["used"] or 0) - (y["used"] or 0)) <= _SAME_FILESYSTEM_USED_BYTES
+        and _written_between(x["used"], y["used"])
+        and _written_between(_column(x, "avail"), _column(y, "avail"))
         for x, y in zip(a, b)
     )
 
@@ -292,16 +301,21 @@ def _current_filesystems(
     """Each mount's ``disk_samples`` rows of the filesystem it has now.
 
     Only the rows *usable* accepts are looked at.  A mount that shows another
-    mount's filesystem is listed with that one, the shortest mount point.
+    mount's filesystem is listed with that one: a writable mount point if there
+    is one, so that a read-only bind mount does not stand for a filesystem that
+    can still fill up, and the shortest mount point otherwise.
     """
     by_mount: dict[str, list] = {}
     rows = store.rows("disk_samples", since=window.start_ts, until=window.end_ts)
     for row in rows:
         if usable(row):
             by_mount.setdefault(row["mountpoint"], []).append(row)
+    chains = {m: _one_filesystem(mrows, window) for m, mrows in by_mount.items()}
     found: dict[str, _Filesystem] = {}
-    for mount in sorted(by_mount, key=lambda m: (len(m), m)):
-        chain = _one_filesystem(by_mount[mount], window)
+    for mount in sorted(
+        chains, key=lambda m: (bool(_column(chains[m][-1], "read_only")), len(m), m)
+    ):
+        chain = chains[mount]
         twin = next(
             (m for m, fs in found.items() if _same_filesystem(fs.rows, chain)), None
         )
