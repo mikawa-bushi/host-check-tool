@@ -34,6 +34,7 @@ import psutil
 from . import kernlog
 from .config import DEFAULT_CONFIG_PATH, ProcdiagConfig, config_trust_problem
 from .core.util import GiB, MiB
+from .mounts import unmounted_disk
 from .output import read_only_filesystem
 from .samplers.thermal import ThermalSampler
 
@@ -210,6 +211,14 @@ def _db_place(config: ProcdiagConfig) -> _Outcome:
         return (
             "degraded",
             f"{db_path} はディレクトリです — DB ファイルのパスを指定してください",
+        )
+    disk = unmounted_disk(db_path)
+    if disk is not None:
+        return (
+            "degraded",
+            f"{disk} のディスクがまだマウントされていません (/etc/fstab にあるマウントポイント)"
+            " — マウントされるまで record は記録を始めません (終了コード 1。"
+            "systemd のユニットは再起動して待ちます)",
         )
     if os.path.islink(db_path) and not os.path.exists(db_path):
         # SQLite creates the file where the link points, in a folder that must exist.

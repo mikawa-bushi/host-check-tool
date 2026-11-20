@@ -710,6 +710,7 @@ def record(
 ) -> None:
     """CPU・メモリ・ディスクを記録します (フォアグラウンド)。Ctrl-C で安全に停止します。"""
     from .core.util import parse_duration
+    from .mounts import unmounted_disk
     from .recorder import Recorder
 
     cfg = _load_config(config_path, db_path, records=True)
@@ -720,6 +721,17 @@ def record(
             duration_sec = parse_duration(duration)
         except ValueError as exc:
             _fail(str(exc))
+
+    disk = unmounted_disk(cfg.db_path)
+    if disk is not None:
+        # 1, not 4: the unit restarts on 1 and records once the disk is mounted.
+        click.echo(
+            f"エラー: DB の置き場 {disk} のディスクがまだマウントされていません"
+            " (/etc/fstab にあるマウントポイント)。システムのディスクに記録しないよう、"
+            "記録を始めません。systemd のユニットは再起動して、マウントされるのを待ちます",
+            err=True,
+        )
+        sys.exit(1)
 
     with _db_guard(cfg.db_path):
         try:
@@ -733,7 +745,7 @@ def record(
         except (OSError, sqlite3.OperationalError) as exc:
             if os.path.isdir(cfg.db_path):
                 raise
-            # 1, not 4: a DB folder that is missing or read-only now (a disk
+            # 1, not 4: a DB folder that cannot be created or is read-only now (a disk
             # mounted late) can clear up, and the unit restarts on 1.
             if isinstance(exc, OSError):
                 message = f"DB を使えません: {cfg.db_path} ({_reason(exc)})"
