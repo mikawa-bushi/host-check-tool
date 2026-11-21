@@ -42,14 +42,24 @@ def unmounted_disk(db_path: Union[str, os.PathLike]) -> Optional[str]:
     mounted, its mount point is a plain folder on the system disk.  A recorder
     that may write there (root, or a mount point the user owns) would fill the
     system disk with a DB that the mount then hides.  None when nothing is
-    listed above *db_path*, or when the tables cannot be read.  Only *db_path*
-    is resolved (symlinks), so an fstab line that names its mount point through
-    a symlink is not recognised and recording goes on as before.
+    listed above *db_path*, or when the tables cannot be read.
+
+    Symlinks are resolved only on *db_path* and on fstab lines that lie on
+    *db_path* as written (``/mnt/usb`` with ``/mnt -> var/mnt`` on ostree), so
+    nothing is looked up that opening the DB would not touch.  An fstab line
+    written through a symlink while *db_path* is written otherwise is not
+    recognised, and recording goes on as before.
     """
     listed = _mount_points(FSTAB, 1)
     mounted = _mount_points(MOUNTINFO, 4)
     if not listed or not mounted:
         return None
+    written = os.path.abspath(db_path)
+    listed |= {
+        os.path.realpath(point)
+        for point in listed
+        if written.startswith(point.rstrip("/") + "/")
+    }
     folder = os.path.dirname(os.path.realpath(db_path))
     while True:
         if folder in listed and folder not in mounted:

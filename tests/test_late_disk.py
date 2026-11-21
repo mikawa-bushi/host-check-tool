@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,32 @@ class TestUnmountedDisk:
         )
         assert unmounted_disk(usb / "procdiag.db") == str(usb)
         assert unmounted_disk(tmp_path / "data" / "procdiag.db") is None
+
+    def test_mount_point_written_through_a_symlink(self, tables, tmp_path):
+        real = tmp_path / "var" / "mnt" / "usb"
+        real.mkdir(parents=True)
+        (tmp_path / "mnt").symlink_to(tmp_path / "var" / "mnt")
+        written = tmp_path / "mnt" / "usb"
+        tables([written], [])
+        assert unmounted_disk(written / "rec" / "procdiag.db") == str(real)
+        tables([written], [real])
+        assert unmounted_disk(written / "rec" / "procdiag.db") is None
+
+    def test_only_the_db_path_is_looked_up(self, tables, monkeypatch, tmp_path, usb):
+        nas = tmp_path / "nas"
+        nas.mkdir()
+        tables([usb, nas], [nas])
+        seen: list[str] = []
+        for name in ("lstat", "stat"):
+            real = getattr(os, name)
+
+            def spy(path, *args, _real=real, **kwargs):
+                seen.append(os.fsdecode(path))
+                return _real(path, *args, **kwargs)
+
+            monkeypatch.setattr(os, name, spy)
+        assert unmounted_disk(usb / "procdiag.db") == str(usb)
+        assert not [p for p in seen if p == str(nas) or p.startswith(f"{nas}/")]
 
     def test_db_outside_any_listed_disk(self, tables, tmp_path, usb):
         tables([usb], [])
