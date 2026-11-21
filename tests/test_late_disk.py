@@ -22,7 +22,12 @@ def _esc(path: Path) -> str:
 def tables(tmp_path, monkeypatch):
     """Point procdiag at a fake fstab and mount table: tables(listed, mounted)."""
 
-    def write(listed: list[Path], mounted: list[Path], extra: str = "") -> None:
+    def write(
+        listed: list[Path],
+        mounted: list[Path],
+        extra: str = "",
+        mounted_extra: str = "",
+    ) -> None:
         fstab = tmp_path / "fstab"
         fstab.write_text(
             "# /etc/fstab: static file system information.\n"
@@ -37,6 +42,7 @@ def tables(tmp_path, monkeypatch):
                 f"{n} 1 8:{n} / {_esc(p)} rw,relatime shared:{n} - ext4 /dev/sd{n} rw\n"
                 for n, p in enumerate([Path("/"), *mounted], start=20)
             )
+            + mounted_extra
         )
         monkeypatch.setattr(mounts, "FSTAB", str(fstab))
         monkeypatch.setattr(mounts, "MOUNTINFO", str(mountinfo))
@@ -69,6 +75,24 @@ class TestUnmountedDisk:
         assert unmounted_disk(usb / "procdiag.db") is None
         tables([], [], extra=f"  # /dev/sdb1 {usb} ext4 defaults 0 2\n")
         assert unmounted_disk(usb / "procdiag.db") is None
+
+    def test_mount_point_written_with_extra_slashes(self, tables, usb):
+        tables([], [], extra=f"/dev/sdb1 /{usb}/ ext4 defaults,nofail 0 2\n")
+        assert unmounted_disk(usb / "procdiag.db") == str(usb)
+        tables([], [usb], extra=f"/dev/sdb1 /{usb}/ ext4 defaults,nofail 0 2\n")
+        assert unmounted_disk(usb / "procdiag.db") is None
+
+    def test_other_mount_points_are_never_looked_up(self, tables, tmp_path, usb):
+        # A look-up of a hung network mount blocks; a NUL makes any look-up fail.
+        broken = "/mnt/nas\\000share"
+        tables(
+            [usb],
+            [],
+            extra=f"server:/share {broken} nfs4 hard 0 0\n",
+            mounted_extra=f"90 1 0:90 / {broken} rw - nfs4 server:/share rw\n",
+        )
+        assert unmounted_disk(usb / "procdiag.db") == str(usb)
+        assert unmounted_disk(tmp_path / "data" / "procdiag.db") is None
 
     def test_db_outside_any_listed_disk(self, tables, tmp_path, usb):
         tables([usb], [])
